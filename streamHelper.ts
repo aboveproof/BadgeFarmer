@@ -11,11 +11,11 @@ import {
     ChannelStore,
     FluxDispatcher,
     SelectedChannelStore,
-    showToast,
-    Toasts,
     UserStore,
     VoiceStateStore
 } from "@webpack/common";
+
+import { showBadgeToast } from "./toast";
 
 const logger = new Logger("BadgeFarmer:StreamHelper");
 const DATASTORE_KEY_STREAM_TIME = "BadgeFarmer_totalStreamSeconds";
@@ -144,7 +144,7 @@ class StreamHelperManager {
                     this.isStreaming = true;
                     this.streamStartedAt = Date.now();
                     this.sessionDurationSeconds = 0;
-                    showToast("Active stream detected. Logging streaming hours.", Toasts.Type.SUCCESS);
+                    showBadgeToast("Active stream detected. Logging streaming hours.", "success");
                 }
 
                 this.sessionDurationSeconds += 1;
@@ -160,7 +160,7 @@ class StreamHelperManager {
                 this.streamStartedAt = null;
                 this.sessionDurationSeconds = 0;
                 this.persistTime();
-                showToast("Stream ended.", Toasts.Type.MESSAGE);
+                showBadgeToast("Stream ended.", "default");
             }
 
             this.notify();
@@ -183,7 +183,7 @@ class StreamHelperManager {
     public resetStreamTime() {
         this.totalStreamSeconds = 0;
         this.persistTime();
-        showToast("Stream farmed time reset.", Toasts.Type.MESSAGE);
+        showBadgeToast("Stream farmed time reset.", "default");
         this.notify();
     }
 

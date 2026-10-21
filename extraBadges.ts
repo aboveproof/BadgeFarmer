@@ -5,7 +5,9 @@
  */
 
 import { Logger } from "@utils/Logger";
-import { RestAPI, showToast, Toasts } from "@webpack/common";
+import { RestAPI } from "@webpack/common";
+
+import { showBadgeToast } from "./toast";
 
 const logger = new Logger("BadgeFarmer:HypeSquad");
 
@@ -30,11 +32,11 @@ export async function setHypeSquadHouse(house: HypeSquadHouseType): Promise<bool
             body: { house_id: house }
         });
         const details = HYPESQUAD_DETAILS[house];
-        showToast(`Joined ${details.name}. Badge updated.`, Toasts.Type.SUCCESS);
+        showBadgeToast(`Joined ${details.name}. Badge updated.`, "success");
         return true;
     } catch (e) {
         logger.error("Failed to set HypeSquad house", e);
-        showToast("Failed to update HypeSquad house. Try again in a moment.", Toasts.Type.FAILURE);
+        showBadgeToast("Failed to update HypeSquad house. Try again in a moment.", "critical");
         return false;
     }
 }
@@ -44,11 +46,11 @@ export async function leaveHypeSquad(): Promise<boolean> {
         await RestAPI.del({
             url: "/hypesquad/online"
         });
-        showToast("Left HypeSquad.", Toasts.Type.MESSAGE);
+        showBadgeToast("Left HypeSquad.", "default");
         return true;
     } catch (e) {
         logger.error("Failed to leave HypeSquad", e);
-        showToast("Failed to leave HypeSquad.", Toasts.Type.FAILURE);
+        showBadgeToast("Failed to leave HypeSquad.", "critical");
         return false;
     }
 }

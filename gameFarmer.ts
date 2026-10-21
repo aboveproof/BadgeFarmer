@@ -6,7 +6,9 @@
 
 import * as DataStore from "@api/DataStore";
 import { Logger } from "@utils/Logger";
-import { FluxDispatcher, RunningGameStore, showToast, Toasts } from "@webpack/common";
+import { FluxDispatcher, RunningGameStore } from "@webpack/common";
+
+import { showBadgeToast } from "./toast";
 
 import { DETECTABLE_GAMES, DetectableGame, findGameById } from "./games";
 
@@ -425,7 +427,7 @@ class GameFarmerManager {
         this.sessionStartTime = Date.now();
 
         this.startGame(game, false);
-        showToast(`Farming Game Time: ${game.name}`, Toasts.Type.SUCCESS);
+        showBadgeToast(`Farming Game Time: ${game.name}`, "success");
         this.notify();
     }
 
@@ -440,7 +442,7 @@ class GameFarmerManager {
         this.sessionStartTime = Date.now();
         this.currentRotationIndex = 0;
 
-        showToast(`Started Game Variety rotation (${this.rotationIntervalSeconds}s interval)`, Toasts.Type.SUCCESS);
+        showBadgeToast(`Started Game Variety rotation (${this.rotationIntervalSeconds}s interval)`, "success");
         this.scheduleNextRotationStep();
         this.notify();
     }
@@ -453,7 +455,7 @@ class GameFarmerManager {
 
         const currentCount = this.uniqueGamesDispatched.size;
         if (currentCount >= 100) {
-            showToast("100 unique games logged for Game Variety.", Toasts.Type.SUCCESS);
+            showBadgeToast("100 unique games logged for Game Variety.", "success");
         }
 
         this.currentRotationIndex = (this.currentRotationIndex + 1) % DETECTABLE_GAMES.length;
@@ -469,7 +471,7 @@ class GameFarmerManager {
         this.currentRotationIndex = (this.currentRotationIndex + 1) % DETECTABLE_GAMES.length;
         const game = DETECTABLE_GAMES[this.currentRotationIndex];
         this.startGame(game, false);
-        showToast(`Switched to: ${game.name}`, Toasts.Type.SUCCESS);
+        showBadgeToast(`Switched to: ${game.name}`, "success");
         this.notify();
     }
 
@@ -482,7 +484,7 @@ class GameFarmerManager {
         this.persistState();
 
         if (notifyUser) {
-            showToast("Badge farming stopped.", Toasts.Type.MESSAGE);
+            showBadgeToast("Badge farming stopped.", "default");
         }
         this.notify();
     }
@@ -490,14 +492,14 @@ class GameFarmerManager {
     public resetUniqueGames() {
         this.uniqueGamesDispatched.clear();
         this.persistState();
-        showToast("Unique games progress reset.", Toasts.Type.MESSAGE);
+        showBadgeToast("Unique games progress reset.", "default");
         this.notify();
     }
 
     public resetTotalTime() {
         this.totalFarmedSeconds = 0;
         this.persistState();
-        showToast("Total farmed time reset.", Toasts.Type.MESSAGE);
+        showBadgeToast("Total farmed time reset.", "default");
         this.notify();
     }
 
