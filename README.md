@@ -52,6 +52,16 @@ pnpm run build
 
 4. Open User Settings > Plugins > BadgeFarmer to configure and monitor your badges. You can also run the `/badgefarm` slash command in any channel.
 
+## Standalone Console Edition (No Client Mod Required)
+
+To farm badges without installing Equicord or Vencord:
+
+1. Open Discord in your browser or desktop application.
+2. Press `Ctrl + Shift + I` (or `Cmd + Option + I` on macOS) to open Developer Tools.
+3. Switch to the **Console** tab. If Discord prompts with a paste warning, type `allow pasting` and press Enter.
+4. Copy the entire content of [`consoleFarmer.js`](consoleFarmer.js) and paste it into the console. Press Enter.
+5. A floating dark-mode HUD will dock to the top-right corner of your client. You can also run console commands directly via `BadgeFarmer.startVariety()`, `BadgeFarmer.startGameTime()`, `BadgeFarmer.setHypeSquad()`, and `BadgeFarmer.help()`.
+
 ## Technical Implementation
 
 * **Store Patching**: Hooks `RunningGameStore` methods (`getRunningGames`, `getVisibleRunningGames`, `getRunningDiscordApplicationIds`, `getGamesSeen`, `isDetectionEnabled`) to inject mock processes into Discord's native tracking pipeline.
