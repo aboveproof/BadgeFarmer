@@ -7,636 +7,322 @@
 import { Button } from "@components/Button";
 import { Flex } from "@components/Flex";
 import { Heading } from "@components/Heading";
+import { Notice } from "@components/Notice";
 import { Paragraph } from "@components/Paragraph";
-import { React, useEffect, useState } from "@webpack/common";
+import { Logger } from "@utils/Logger";
+import { useForceUpdater } from "@utils/react";
+import { TextInput,useEffect, useMemo, useState } from "@webpack/common";
+import type { JSX } from "react";
 
-import {
-    GameTimeBadge,
-    GameVarietyBadge,
-    HypeSquadBalanceBadge,
-    HypeSquadBraveryBadge,
-    HypeSquadBrillianceBadge,
-    StreamingBadge
-} from "./badgeIcons";
-import {
-    HypeSquadHouse,
-    leaveHypeSquad,
-    setHypeSquadHouse
-} from "./extraBadges";
-import { GameFarmer } from "./gameFarmer";
-import { DETECTABLE_GAMES } from "./games";
-import { StreamHelper } from "./streamHelper";
+import type { DetectableApp } from "./farmer";
+import * as Farmer from "./farmer";
 
-function formatDurationSeconds(sec: number): string {
-    const hours = Math.floor(sec / 3600);
-    const mins = Math.floor((sec % 3600) / 60);
-    const seconds = sec % 60;
-    if (hours > 0) {
-        return `${hours}h ${mins}m`;
-    }
-    if (mins > 0) {
-        return `${mins}m ${seconds}s`;
-    }
-    return `${seconds}s`;
+const cl = (name: string) => `vc-badge-farmer-${name}`;
+
+const DETECTABLE_APPS_URL = "https://discord.com/api/v10/applications/detectable";
+const MAX_RESULTS = 30;
+
+const logger = new Logger("BadgeFarmer:Dashboard");
+
+let cataloguePromise: Promise<DetectableApp[]> | null = null;
+
+export function loadCatalogue(): Promise<DetectableApp[]> {
+    cataloguePromise ??= fetch(DETECTABLE_APPS_URL)
+        .then(response => {
+            if (!response.ok) throw new Error(`Discord returned ${response.status}`);
+            return response.json() as Promise<DetectableApp[]>;
+        })
+        .then(apps => apps.filter(app => app.id != null && app.name != null))
+        .catch(error => {
+            cataloguePromise = null;
+            throw error;
+        });
+
+    return cataloguePromise;
 }
 
-function getGameTimeTier(hours: number): { current: string; next: string; nextHours: number; progress: number } {
-    const tiers = [
-        { name: "Unranked", hours: 0 },
-        { name: "Casual", hours: 1 },
-        { name: "Recreational", hours: 8 },
-        { name: "Dedicated", hours: 20 },
-        { name: "Committed", hours: 78 },
-        { name: "Veteran", hours: 250 },
-        { name: "Elite", hours: 1000 },
-        { name: "Legendary", hours: 2500 },
-        { name: "Eternal (Max)", hours: 5000 }
-    ];
-
-    let currentTier = tiers[0];
-    let nextTier = tiers[1];
-
-    for (let i = 0; i < tiers.length; i++) {
-        if (hours >= tiers[i].hours) {
-            currentTier = tiers[i];
-            nextTier = tiers[i + 1] ?? tiers[i];
-        } else {
-            break;
-        }
-    }
-
-    const range = nextTier.hours - currentTier.hours;
-    const progress = range > 0 ? Math.min(100, Math.round(((hours - currentTier.hours) / range) * 100)) : 100;
-
-    return {
-        current: currentTier.name,
-        next: nextTier.name,
-        nextHours: nextTier.hours,
-        progress
-    };
-}
-
-function getVarietyTier(count: number): { current: string; next: string; nextCount: number; progress: number } {
-    const tiers = [
-        { name: "Locked", count: 0 },
-        { name: "Sampler", count: 2 },
-        { name: "Explorer", count: 10 },
-        { name: "Collector", count: 25 },
-        { name: "Enthusiast", count: 50 },
-        { name: "Connoisseur", count: 75 },
-        { name: "Universalist (Max)", count: 100 }
-    ];
-
-    let currentTier = tiers[0];
-    let nextTier = tiers[1];
-
-    for (let i = 0; i < tiers.length; i++) {
-        if (count >= tiers[i].count) {
-            currentTier = tiers[i];
-            nextTier = tiers[i + 1] ?? tiers[i];
-        } else {
-            break;
-        }
-    }
-
-    const range = nextTier.count - currentTier.count;
-    const progress = range > 0 ? Math.min(100, Math.round(((count - currentTier.count) / range) * 100)) : 100;
-
-    return {
-        current: currentTier.name,
-        next: nextTier.name,
-        nextCount: nextTier.count,
-        progress
-    };
-}
-
-function getStreamingTier(hours: number): { current: string; next: string; nextHours: number; progress: number } {
-    const tiers = [
-        { name: "Novice", hours: 1 },
-        { name: "Fledgling", hours: 10 },
-        { name: "Breakout", hours: 20 },
-        { name: "Performer", hours: 50 },
-        { name: "Broadcaster", hours: 100 },
-        { name: "Star", hours: 500 },
-        { name: "Icon", hours: 1000 },
-        { name: "Legend (Max)", hours: 5000 }
-    ];
-
-    let currentTier = tiers[0];
-    let nextTier = tiers[1];
-
-    for (let i = 0; i < tiers.length; i++) {
-        if (hours >= tiers[i].hours) {
-            currentTier = tiers[i];
-            nextTier = tiers[i + 1] ?? tiers[i];
-        } else {
-            break;
-        }
-    }
-
-    const range = nextTier.hours - currentTier.hours;
-    const progress = range > 0 ? Math.min(100, Math.round(((hours - currentTier.hours) / range) * 100)) : 100;
-
-    return {
-        current: currentTier.name,
-        next: nextTier.name,
-        nextHours: nextTier.hours,
-        progress
-    };
-}
-
-type TabKey = "overview" | "game_farmer" | "streaming" | "hypesquad";
-
-export function BadgeFarmerDashboard() {
-    const [tab, setTab] = useState<TabKey>("overview");
-    const [, setTick] = useState(0);
+function useCatalogue(): { apps: DetectableApp[] | null; error: string | null; } {
+    const [apps, setApps] = useState<DetectableApp[] | null>(null);
+    const [error, setError] = useState<string | null>(null);
 
     useEffect(() => {
-        const unsubFarmer = GameFarmer.subscribe(() => setTick(t => t + 1));
-        const unsubStream = StreamHelper.subscribe(() => setTick(t => t + 1));
-        return () => {
-            unsubFarmer();
-            unsubStream();
-        };
+        let cancelled = false;
+        loadCatalogue().then(
+            loaded => { if (!cancelled) setApps(loaded); },
+            cause => { if (!cancelled) setError(`Could not load the game list: ${cause.message}`); }
+        );
+        return () => { cancelled = true; };
     }, []);
 
-    const totalFarmedHours = Math.round((GameFarmer.totalFarmedSeconds / 3600) * 10) / 10;
-    const gameTimeTier = getGameTimeTier(totalFarmedHours);
+    return { apps, error };
+}
 
-    const uniqueGamesCount = GameFarmer.uniqueGamesDispatched.size;
-    const varietyTier = getVarietyTier(uniqueGamesCount);
+function useFarmerStatus() {
+    const forceUpdate = useForceUpdater();
 
-    const streamInfo = StreamHelper.getInfo();
-    const totalStreamHours = Math.round((streamInfo.totalStreamSeconds / 3600) * 10) / 10;
-    const streamingTier = getStreamingTier(totalStreamHours);
+    useEffect(() => Farmer.subscribe(forceUpdate), []);
+
+    return Farmer.getStatus();
+}
+
+const TIME_TIERS = [
+    { name: "Casual", hours: 1 },
+    { name: "Recreational", hours: 8 },
+    { name: "Dedicated", hours: 20 },
+    { name: "Committed", hours: 78 },
+    { name: "Veteran", hours: 250 },
+    { name: "Elite", hours: 1000 },
+    { name: "Legendary", hours: 2500 },
+    { name: "Eternal", hours: 5000 }
+] as const;
+
+const VARIETY_TIERS = [
+    { name: "Dabbler", games: 3 },
+    { name: "Adventurer", games: 10 },
+    { name: "Explorer", games: 25 },
+    { name: "Connoisseur", games: 50 },
+    { name: "Universalist", games: 100 }
+] as const;
+
+function tierProgress(hours: number, tiers: ReadonlyArray<{ name: string; hours: number; }>): { name: string; next: string | null; pct: number; } {
+    let current = "Unranked";
+    let next: string | null = tiers[0].name;
+    let floor = 0;
+    let ceil = tiers[0].hours;
+
+    for (let index = 0; index < tiers.length; index++) {
+        if (hours >= tiers[index].hours) {
+            current = tiers[index].name;
+            floor = tiers[index].hours;
+            ceil = tiers[index + 1]?.hours ?? tiers[index].hours;
+            next = tiers[index + 1]?.name ?? null;
+        }
+    }
+
+    const pct = ceil === floor ? 100 : Math.min(100, Math.round(((hours - floor) / (ceil - floor)) * 100));
+    return { name: current, next, pct };
+}
+
+function tierProgressGames(count: number, tiers: ReadonlyArray<{ name: string; games: number; }>): { name: string; next: string | null; pct: number; } {
+    let current = "Unranked";
+    let next: string | null = tiers[0].name;
+    let floor = 0;
+    let ceil = tiers[0].games;
+
+    for (let index = 0; index < tiers.length; index++) {
+        if (count >= tiers[index].games) {
+            current = tiers[index].name;
+            floor = tiers[index].games;
+            ceil = tiers[index + 1]?.games ?? tiers[index].games;
+            next = tiers[index + 1]?.name ?? null;
+        }
+    }
+
+    const pct = ceil === floor ? 100 : Math.min(100, Math.round(((count - floor) / (ceil - floor)) * 100));
+    return { name: current, next, pct };
+}
+
+function ProgressBar({ pct }: { pct: number; }) {
+    return (
+        <div className={cl("progress-track")}>
+            <div className={cl("progress-fill")} style={{ width: `${pct}%` }} />
+        </div>
+    );
+}
+
+function TierRow({ label, tier }: { label: string; tier: { name: string; next: string | null; pct: number; }; }) {
+    return (
+        <div className={cl("tier-row")}>
+            <div className={cl("tier-copy")}>
+                <span className={cl("tier-label")}>{label}</span>
+                <span className={cl("tier-value")}>
+                    {tier.name}{tier.next != null && <span className={cl("muted")}> → {tier.next}</span>}
+                </span>
+            </div>
+            <ProgressBar pct={tier.pct} />
+        </div>
+    );
+}
+
+function parseHours(value: string): number | null {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 && parsed <= 5000 ? parsed : null;
+}
+
+function parseMinutes(value: string): number | null {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 1 && parsed <= 1440 ? parsed : null;
+}
+
+function pickVarietyPool(apps: DetectableApp[], count: number): DetectableApp[] {
+    const pool = [...apps];
+    for (let index = 0; index < count && index < pool.length; index++) {
+        const picked = index + Math.floor(Math.random() * (pool.length - index));
+        [pool[index], pool[picked]] = [pool[picked], pool[index]];
+    }
+    return pool.slice(0, count);
+}
+
+export function BadgeFarmerDashboard(): JSX.Element {
+    const { apps, error: catalogueError } = useCatalogue();
+    const status = useFarmerStatus();
+    const [query, setQuery] = useState("");
+    const [selected, setSelected] = useState<DetectableApp | null>(null);
+    const [timeTarget, setTimeTarget] = useState("5000");
+    const [varietyMinutes, setVarietyMinutes] = useState("2");
+    const [streamTarget, setStreamTarget] = useState("5000");
+
+    const results = useMemo(() => {
+        const needle = query.trim().toLowerCase();
+        if (apps == null || needle.length < 2 || selected != null) return [];
+
+        return apps
+            .filter(app => app.name.toLowerCase().includes(needle))
+            .sort((left, right) =>
+                Number(right.name.toLowerCase().startsWith(needle)) - Number(left.name.toLowerCase().startsWith(needle))
+                || left.name.localeCompare(right.name))
+            .slice(0, MAX_RESULTS);
+    }, [apps, query, selected]);
+
+    const parsedTimeTarget = parseHours(timeTarget);
+    const parsedVarietyMinutes = parseMinutes(varietyMinutes);
+    const parsedStreamTarget = parseHours(streamTarget);
+
+    const timeTier = tierProgress(status.hoursCreditedThisRun, TIME_TIERS);
+    const varietyTier = tierProgressGames(status.gamesCreditedThisRun, VARIETY_TIERS);
+    const streamTier = tierProgress(status.streamHoursCreditedThisRun, TIME_TIERS);
+
+    const busy = status.mode !== "IDLE";
+
+    function act(action: () => void | Promise<void>) {
+        void action();
+    }
 
     return (
-        <div className="vc-badgefarm-container">
-            <div className="vc-badgefarm-nav">
-                <button
-                    className={`vc-badgefarm-tab-btn ${tab === "overview" ? "active" : ""}`}
-                    onClick={() => setTab("overview")}
-                >
-                    <GameTimeBadge width={18} height={18} />
-                    All Badges
-                </button>
-                <button
-                    className={`vc-badgefarm-tab-btn ${tab === "game_farmer" ? "active" : ""}`}
-                    onClick={() => setTab("game_farmer")}
-                >
-                    <GameVarietyBadge width={18} height={18} />
-                    Game Badges
-                </button>
-                <button
-                    className={`vc-badgefarm-tab-btn ${tab === "streaming" ? "active" : ""}`}
-                    onClick={() => setTab("streaming")}
-                >
-                    <StreamingBadge width={18} height={18} />
-                    Streaming
-                </button>
-                <button
-                    className={`vc-badgefarm-tab-btn ${tab === "hypesquad" ? "active" : ""}`}
-                    onClick={() => setTab("hypesquad")}
-                >
-                    <HypeSquadBraveryBadge width={18} height={18} />
-                    HypeSquad
-                </button>
+        <div className={cl("dashboard")}>
+            {status.notrackBlocked && (
+                <Notice.Warning>
+                    NoTrack is on and will eat the requests this plugin sends. Turn it off (plus the data sharing
+                    toggles in Discord's privacy settings) until the badges land. You can switch it back after.
+                </Notice.Warning>
+            )}
+
+            {catalogueError != null && <Notice.Danger>{catalogueError}</Notice.Danger>}
+
+            <Heading tag="h3">Badge targets</Heading>
+
+            <TierRow label="Game Time" tier={timeTier} />
+            <TierRow label="Game Variety" tier={varietyTier} />
+            <TierRow label="Streaming" tier={streamTier} />
+
+            {busy && (
+                <Notice.Positive>
+                    <span className={cl("status-line")}>
+                        Running <strong>{status.mode}</strong>
+                        {status.activeGame != null && <> · playing <strong>{status.activeGame.name}</strong></>}
+                    </span>
+                    <span className={cl("status-line")}>
+                        {status.mode === "VARIETY" || status.mode === "MAX_ALL"
+                            ? <>Games credited: {status.gamesCreditedThisRun} / {status.varietyTotal} · </>
+                            : null}
+                        Hours credited: {status.hoursCreditedThisRun}h · Stream hours: {status.streamHoursCreditedThisRun}h
+                        {status.errors > 0 && <> · {status.errors} errors</>}
+                    </span>
+                </Notice.Positive>
+            )}
+
+            <Heading tag="h3">Games</Heading>
+
+                <TextInput
+                    value={query}
+                    onChange={value => {
+                        setQuery(value);
+                        setSelected(null);
+                    }}
+                    disabled={apps == null && catalogueError == null}
+                    placeholder={apps == null ? "Loading game list..." : "Search a game to farm"}
+                />
+
+            {selected == null && results.length > 0 && (
+                <div className={cl("results")}>
+                    {results.map(app => (
+                        <button
+                            key={app.id}
+                            className={cl("result")}
+                            onClick={() => {
+                                setSelected(app);
+                                setQuery(app.name);
+                            }}
+                        >
+                            <span className={cl("result-name")}>{app.name}</span>
+                            <span className={cl("result-meta")}>{Farmer.executableFor(app)} · {app.id}</span>
+                        </button>
+                    ))}
+                </div>
+            )}
+
+            <div className={cl("grid")}>
+                <div className={cl("field")}>
+                    <Heading tag="h5">Game Time hours</Heading>
+                    <TextInput value={timeTarget} onChange={setTimeTarget} />
+                    <span className={cl("muted")}>Target hours, 1–5000.</span>
+                </div>
+                <div className={cl("field")}>
+                    <Heading tag="h5">Variety minutes/game</Heading>
+                    <TextInput value={varietyMinutes} onChange={setVarietyMinutes} />
+                    <span className={cl("muted")}>Minutes per unique game, 1–1440.</span>
+                </div>
+                <div className={cl("field")}>
+                    <Heading tag="h5">Streaming hours</Heading>
+                    <TextInput value={streamTarget} onChange={setStreamTarget} />
+                    <span className={cl("muted")}>Target stream hours, 1–5000.</span>
+                </div>
             </div>
 
-            {tab === "overview" && (
-                <>
-                    <div className="vc-badgefarm-card">
-                        <div className="vc-badgefarm-card-header">
-                            <div className="vc-badgefarm-title-wrap">
-                                <div className="vc-badgefarm-icon">
-                                    <GameTimeBadge width={26} height={26} />
-                                </div>
-                                <div>
-                                    <Heading tag="h3" className="vc-badgefarm-title">Badge Overview</Heading>
-                                    <Paragraph className="vc-badgefarm-subtitle">
-                                        Monitor progression across your Discord profile badges.
-                                    </Paragraph>
-                                </div>
-                            </div>
-                        </div>
+            <Flex className={cl("actions")}>
+                <Button
+                    variant="secondary"
+                    disabled={busy || selected == null || parsedTimeTarget == null}
+                    onClick={() => act(() => Farmer.startGameTime(selected!, parsedTimeTarget!))}
+                >
+                    Farm Game Time
+                </Button>
+                <Button
+                    variant="secondary"
+                    disabled={busy || apps == null || parsedVarietyMinutes == null}
+                    onClick={() => act(() => Farmer.startVariety(pickVarietyPool(apps!, 100), parsedVarietyMinutes!))}
+                >
+                    Farm Variety
+                </Button>
+                <Button
+                    variant="secondary"
+                    disabled={busy || parsedStreamTarget == null}
+                    onClick={() => act(() => Farmer.startStream(parsedStreamTarget!))}
+                >
+                    Farm Streaming
+                </Button>
+            </Flex>
 
-                        <div className="vc-badgefarm-stats-grid">
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Game Time</span>
-                                <span className="vc-badgefarm-stat-value">{formatDurationSeconds(GameFarmer.totalFarmedSeconds)}</span>
-                                <span className="vc-badgefarm-badge-tier">{gameTimeTier.current}</span>
-                            </div>
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Game Variety</span>
-                                <span className="vc-badgefarm-stat-value">{uniqueGamesCount} / 100</span>
-                                <span className="vc-badgefarm-badge-tier">{varietyTier.current}</span>
-                            </div>
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Streamed to Others</span>
-                                <span className="vc-badgefarm-stat-value">{formatDurationSeconds(streamInfo.totalStreamSeconds)}</span>
-                                <span className="vc-badgefarm-badge-tier">{streamingTier.current}</span>
-                            </div>
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Current State</span>
-                                <span className="vc-badgefarm-stat-value">{GameFarmer.currentMode.replace(/_/g, " ")}</span>
-                                <span className="vc-badgefarm-badge-tier">{GameFarmer.activeGame?.name ?? "No Game Active"}</span>
-                            </div>
-                        </div>
-                    </div>
+            <Flex className={cl("actions")}>
+                <Button
+                    disabled={busy || apps == null}
+                    onClick={() => act(() => Farmer.maxAll(apps!))}
+                >
+                    Max All Badges
+                </Button>
+                <Button
+                    variant="dangerSecondary"
+                    disabled={!busy}
+                    onClick={() => act(Farmer.stop)}
+                >
+                    Stop
+                </Button>
+            </Flex>
 
-                    <div className="vc-badgefarm-badge-grid">
-                        <div className="vc-badgefarm-badge-card">
-                            <div className="vc-badgefarm-badge-icon">
-                                <GameTimeBadge width={36} height={36} />
-                            </div>
-                            <span className="vc-badgefarm-badge-name">Game Time</span>
-                            <span className="vc-badgefarm-badge-tier">{gameTimeTier.current}</span>
-                            <div className="vc-badgefarm-progress-bar-bg">
-                                <div className="vc-badgefarm-progress-bar-fill" style={{ width: `${gameTimeTier.progress}%` }} />
-                            </div>
-                            <Button
-                                size="small"
-                                variant={GameFarmer.currentMode === "GAME_TIME" ? "dangerPrimary" : "primary"}
-                                onClick={() => {
-                                    if (GameFarmer.currentMode === "GAME_TIME") GameFarmer.stopAllFarming();
-                                    else GameFarmer.startGameTimeFarm();
-                                }}
-                            >
-                                {GameFarmer.currentMode === "GAME_TIME" ? "Stop Farm" : "Farm Time"}
-                            </Button>
-                        </div>
-
-                        <div className="vc-badgefarm-badge-card">
-                            <div className="vc-badgefarm-badge-icon">
-                                <GameVarietyBadge width={36} height={36} />
-                            </div>
-                            <span className="vc-badgefarm-badge-name">Game Variety</span>
-                            <span className="vc-badgefarm-badge-tier">{varietyTier.current} ({uniqueGamesCount}/100)</span>
-                            <div className="vc-badgefarm-progress-bar-bg">
-                                <div className="vc-badgefarm-progress-bar-fill" style={{ width: `${Math.min(100, uniqueGamesCount)}%` }} />
-                            </div>
-                            <Button
-                                size="small"
-                                variant={GameFarmer.currentMode === "VARIETY_ROTATION" ? "dangerPrimary" : "primary"}
-                                onClick={() => {
-                                    if (GameFarmer.currentMode === "VARIETY_ROTATION") GameFarmer.stopAllFarming();
-                                    else GameFarmer.startVarietyRotation();
-                                }}
-                            >
-                                {GameFarmer.currentMode === "VARIETY_ROTATION" ? "Stop Rotation" : "Rotate Games"}
-                            </Button>
-                        </div>
-
-                        <div className="vc-badgefarm-badge-card">
-                            <div className="vc-badgefarm-badge-icon">
-                                <StreamingBadge width={36} height={36} />
-                            </div>
-                            <span className="vc-badgefarm-badge-name">Streaming</span>
-                            <span className="vc-badgefarm-badge-tier">{streamingTier.current} ({totalStreamHours}h)</span>
-                            <div className="vc-badgefarm-progress-bar-bg">
-                                <div className="vc-badgefarm-progress-bar-fill" style={{ width: `${streamingTier.progress}%` }} />
-                            </div>
-                            <Button
-                                size="small"
-                                variant="secondary"
-                                onClick={() => setTab("streaming")}
-                            >
-                                Stream Assistant
-                            </Button>
-                        </div>
-
-                        <div className="vc-badgefarm-badge-card">
-                            <div className="vc-badgefarm-badge-icon">
-                                <HypeSquadBraveryBadge width={36} height={36} />
-                            </div>
-                            <span className="vc-badgefarm-badge-name">HypeSquad</span>
-                            <span className="vc-badgefarm-badge-tier">Instant Select</span>
-                            <Button
-                                size="small"
-                                variant="secondary"
-                                onClick={() => setTab("hypesquad")}
-                            >
-                                Pick House
-                            </Button>
-                        </div>
-                    </div>
-                </>
-            )}
-
-            {tab === "game_farmer" && (
-                <>
-                    <div className="vc-badgefarm-card">
-                        <div className="vc-badgefarm-card-header">
-                            <div className="vc-badgefarm-title-wrap">
-                                <div className="vc-badgefarm-icon">
-                                    <GameTimeBadge width={26} height={26} />
-                                </div>
-                                <div>
-                                    <Heading tag="h3" className="vc-badgefarm-title">Game Time Badge</Heading>
-                                    <Paragraph className="vc-badgefarm-subtitle">
-                                        Simulate running detectable PC games to accumulate playtime hours toward profile tiers.
-                                    </Paragraph>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div className="vc-badgefarm-stats-grid">
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Active Game</span>
-                                <span className="vc-badgefarm-stat-value">{GameFarmer.activeGame?.name ?? "None"}</span>
-                            </div>
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Current Tier</span>
-                                <span className="vc-badgefarm-stat-value">{gameTimeTier.current}</span>
-                            </div>
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Total Time Farmed</span>
-                                <span className="vc-badgefarm-stat-value">{formatDurationSeconds(GameFarmer.totalFarmedSeconds)}</span>
-                            </div>
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Next Milestone ({gameTimeTier.next})</span>
-                                <span className="vc-badgefarm-stat-value">{gameTimeTier.nextHours} Hours</span>
-                            </div>
-                        </div>
-
-                        <div>
-                            <Flex justifyContent="space-between" style={{ marginBottom: 4 }}>
-                                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>Progress to {gameTimeTier.next}:</span>
-                                <span style={{ fontSize: 12, fontWeight: 600 }}>{gameTimeTier.progress}%</span>
-                            </Flex>
-                            <div className="vc-badgefarm-progress-bar-bg">
-                                <div className="vc-badgefarm-progress-bar-fill" style={{ width: `${gameTimeTier.progress}%` }} />
-                            </div>
-                        </div>
-
-                        <div className="vc-badgefarm-actions">
-                            <select
-                                className="vc-badgefarm-select"
-                                value={GameFarmer.selectedGameId}
-                                onChange={e => {
-                                    GameFarmer.selectedGameId = e.target.value;
-                                    if (GameFarmer.currentMode === "GAME_TIME") {
-                                        GameFarmer.startGameTimeFarm(e.target.value);
-                                    }
-                                    setTick(t => t + 1);
-                                }}
-                            >
-                                {DETECTABLE_GAMES.map(g => (
-                                    <option key={g.id} value={g.id}>
-                                        {g.name}
-                                    </option>
-                                ))}
-                            </select>
-
-                            <Button
-                                variant={GameFarmer.currentMode === "GAME_TIME" ? "dangerPrimary" : "primary"}
-                                onClick={() => {
-                                    if (GameFarmer.currentMode === "GAME_TIME") {
-                                        GameFarmer.stopAllFarming();
-                                    } else {
-                                        GameFarmer.startGameTimeFarm();
-                                    }
-                                }}
-                            >
-                                {GameFarmer.currentMode === "GAME_TIME" ? "Stop Game Time Farm" : "Start Game Time Farm"}
-                            </Button>
-
-                            <Button
-                                variant="secondary"
-                                onClick={() => GameFarmer.resetTotalTime()}
-                            >
-                                Reset Timer
-                            </Button>
-                        </div>
-
-                        <div className="vc-badgefarm-tip">
-                            Discord unlocks the Casual tier after 1 cumulative hour (60 minutes) of active game detection with Discord open. Ensure "Display current activity as a status message" is enabled in User Settings under Activity Privacy.
-                        </div>
-                    </div>
-
-                    <div className="vc-badgefarm-card">
-                        <div className="vc-badgefarm-card-header">
-                            <div className="vc-badgefarm-title-wrap">
-                                <div className="vc-badgefarm-icon">
-                                    <GameVarietyBadge width={26} height={26} />
-                                </div>
-                                <div>
-                                    <Heading tag="h3" className="vc-badgefarm-title">Game Variety Badge</Heading>
-                                    <Paragraph className="vc-badgefarm-subtitle">
-                                        Cycle through detectable games to unlock the Universalist tier.
-                                    </Paragraph>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div className="vc-badgefarm-stats-grid">
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Unique Games Logged</span>
-                                <span className="vc-badgefarm-stat-value">{uniqueGamesCount} / 100</span>
-                            </div>
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Current Tier</span>
-                                <span className="vc-badgefarm-stat-value">{varietyTier.current}</span>
-                            </div>
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Rotation Delay</span>
-                                <span className="vc-badgefarm-stat-value">{GameFarmer.rotationIntervalSeconds}s</span>
-                            </div>
-                            <div className="vc-badgefarm-stat-box">
-                                <span className="vc-badgefarm-stat-label">Game Catalog</span>
-                                <span className="vc-badgefarm-stat-value">{DETECTABLE_GAMES.length} Titles</span>
-                            </div>
-                        </div>
-
-                        <div>
-                            <Flex justifyContent="space-between" style={{ marginBottom: 4 }}>
-                                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>Progress to Universalist (100 Games):</span>
-                                <span style={{ fontSize: 12, fontWeight: 600 }}>{Math.min(100, uniqueGamesCount)}%</span>
-                            </Flex>
-                            <div className="vc-badgefarm-progress-bar-bg">
-                                <div className="vc-badgefarm-progress-bar-fill" style={{ width: `${Math.min(100, uniqueGamesCount)}%` }} />
-                            </div>
-                        </div>
-
-                        <div className="vc-badgefarm-actions">
-                            <select
-                                className="vc-badgefarm-select"
-                                style={{ maxWidth: 200 }}
-                                value={GameFarmer.rotationIntervalSeconds}
-                                onChange={e => {
-                                    const val = parseInt(e.target.value, 10);
-                                    GameFarmer.rotationIntervalSeconds = val;
-                                    setTick(t => t + 1);
-                                }}
-                            >
-                                <option value={60}>60 Seconds per Game</option>
-                                <option value={75}>75 Seconds (Recommended)</option>
-                                <option value={90}>90 Seconds per Game</option>
-                                <option value={120}>120 Seconds per Game</option>
-                            </select>
-
-                            <Button
-                                variant={GameFarmer.currentMode === "VARIETY_ROTATION" ? "dangerPrimary" : "primary"}
-                                onClick={() => {
-                                    if (GameFarmer.currentMode === "VARIETY_ROTATION") {
-                                        GameFarmer.stopAllFarming();
-                                    } else {
-                                        GameFarmer.startVarietyRotation();
-                                    }
-                                }}
-                            >
-                                {GameFarmer.currentMode === "VARIETY_ROTATION" ? "Stop Rotation" : "Start Rotation"}
-                            </Button>
-
-                            <Button
-                                variant="secondary"
-                                onClick={() => GameFarmer.manualNextGame()}
-                            >
-                                Next Game
-                            </Button>
-
-                            <Button
-                                variant="secondary"
-                                onClick={() => GameFarmer.resetUniqueGames()}
-                            >
-                                Reset Counter
-                            </Button>
-                        </div>
-
-                        <div className="vc-badgefarm-tip">
-                            Discord registers unique games only when a session meets the backend dwell threshold (at least 60 to 90 seconds per title). Rapid switching under 60 seconds is dropped by Discord telemetry.
-                        </div>
-                    </div>
-                </>
-            )}
-
-            {tab === "streaming" && (
-                <div className="vc-badgefarm-card">
-                    <div className="vc-badgefarm-card-header">
-                        <div className="vc-badgefarm-title-wrap">
-                            <div className="vc-badgefarm-icon">
-                                <StreamingBadge width={26} height={26} />
-                            </div>
-                            <div>
-                                <Heading tag="h3" className="vc-badgefarm-title">Streaming Badge</Heading>
-                                <Paragraph className="vc-badgefarm-subtitle">
-                                    Monitor your stream and track hours toward the Streamed to Others badge requirement.
-                                </Paragraph>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div className="vc-badgefarm-stats-grid">
-                        <div className="vc-badgefarm-stat-box">
-                            <span className="vc-badgefarm-stat-label">Voice Channel</span>
-                            <span className="vc-badgefarm-stat-value">{streamInfo.channelName ?? "Not in Voice"}</span>
-                        </div>
-                        <div className="vc-badgefarm-stat-box">
-                            <span className="vc-badgefarm-stat-label">Current Tier</span>
-                            <span className="vc-badgefarm-stat-value">{streamingTier.current}</span>
-                        </div>
-                        <div className="vc-badgefarm-stat-box">
-                            <span className="vc-badgefarm-stat-label">Session Duration</span>
-                            <span className="vc-badgefarm-stat-value">{formatDurationSeconds(streamInfo.sessionDurationSeconds)}</span>
-                        </div>
-                        <div className="vc-badgefarm-stat-box">
-                            <span className="vc-badgefarm-stat-label">Total Streamed Hours</span>
-                            <span className="vc-badgefarm-stat-value">{formatDurationSeconds(streamInfo.totalStreamSeconds)}</span>
-                        </div>
-                    </div>
-
-                    <div className="vc-badgefarm-notice-box">
-                        <div className="vc-badgefarm-notice-title">
-                            {streamInfo.hasOtherUsers
-                                ? `Stream duration logging. ${streamInfo.viewerCount} participant(s) in channel.`
-                                : "Channel has no other users."}
-                        </div>
-                        <div className="vc-badgefarm-notice-desc">
-                            {streamInfo.hasOtherUsers
-                                ? "Discord is recording your streaming hours."
-                                : "Discord requires at least one other user in the channel for hours to count. Connect another account to the call."}
-                        </div>
-                    </div>
-
-                    <div>
-                        <Flex justifyContent="space-between" style={{ marginBottom: 4 }}>
-                            <span style={{ fontSize: 12, color: "var(--text-muted)" }}>Progress to {streamingTier.next} ({streamingTier.nextHours}h):</span>
-                            <span style={{ fontSize: 12, fontWeight: 600 }}>{streamingTier.progress}%</span>
-                        </Flex>
-                        <div className="vc-badgefarm-progress-bar-bg">
-                            <div className="vc-badgefarm-progress-bar-fill" style={{ width: `${streamingTier.progress}%` }} />
-                        </div>
-                    </div>
-
-                    <div className="vc-badgefarm-actions">
-                        <Button
-                            variant={StreamHelper.antiAfkEnabled ? "primary" : "secondary"}
-                            onClick={() => StreamHelper.toggleAntiAfk()}
-                        >
-                            {StreamHelper.antiAfkEnabled ? "Anti-AFK: Enabled" : "Anti-AFK: Disabled"}
-                        </Button>
-
-                        <Button
-                            variant="secondary"
-                            onClick={() => StreamHelper.resetStreamTime()}
-                        >
-                            Reset Timer
-                        </Button>
-                    </div>
-
-                    <div className="vc-badgefarm-tip">
-                        Join an empty server voice channel with a secondary account on your phone or browser. Share a window with Anti-AFK enabled. Hours accumulate while Discord remains open.
-                    </div>
-                </div>
-            )}
-
-            {tab === "hypesquad" && (
-                <div className="vc-badgefarm-card">
-                    <div className="vc-badgefarm-card-header">
-                        <div className="vc-badgefarm-title-wrap">
-                            <div className="vc-badgefarm-icon">
-                                <HypeSquadBraveryBadge width={26} height={26} />
-                            </div>
-                            <div>
-                                <Heading tag="h3" className="vc-badgefarm-title">HypeSquad Houses</Heading>
-                                <Paragraph className="vc-badgefarm-subtitle">
-                                    Select your HypeSquad House badge without taking the personality quiz.
-                                </Paragraph>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div className="vc-badgefarm-actions">
-                        <Button
-                            style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
-                            onClick={() => setHypeSquadHouse(HypeSquadHouse.BRAVERY)}
-                        >
-                            <HypeSquadBraveryBadge width={18} height={18} />
-                            House of Bravery
-                        </Button>
-                        <Button
-                            style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
-                            onClick={() => setHypeSquadHouse(HypeSquadHouse.BRILLIANCE)}
-                        >
-                            <HypeSquadBrillianceBadge width={18} height={18} />
-                            House of Brilliance
-                        </Button>
-                        <Button
-                            style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
-                            onClick={() => setHypeSquadHouse(HypeSquadHouse.BALANCE)}
-                        >
-                            <HypeSquadBalanceBadge width={18} height={18} />
-                            House of Balance
-                        </Button>
-                        <Button
-                            variant="dangerPrimary"
-                            onClick={leaveHypeSquad}
-                        >
-                            Leave HypeSquad
-                        </Button>
-                    </div>
-                </div>
-            )}
+            <Paragraph className={cl("muted")}>
+                Sessions go to Discord's science endpoint in chunks, backdated up to 24 hours. Badges move on
+                Discord's daily analytics pass, so check the next day. Keep the client open while a run is going.
+            </Paragraph>
         </div>
     );
 }
