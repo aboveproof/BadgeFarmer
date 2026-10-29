@@ -44,8 +44,8 @@ Then enable it in **Settings → Plugins → BadgeFarmer**. The dashboard lives 
 | --- | --- | --- |
 | **Game Time** | Credits hours for one game you pick, up to 5,000 (Eternal tier) | ~10 min |
 | **Variety** | Credits short sessions across 100 unique detectable games (Universalist tier) | ~5 min |
-| **Streaming** | Credits stream hours, up to 5,000 | ~10 min |
-| **Max All** | All three, back to back | ~25 min |
+| **Streaming** | Credits stream hours, up to 5,000 | ~2.5 h |
+| **Max All** | All three, back to back | ~3 h |
 
 Every mode shows a live progress bar for its badge track, so you can watch the numbers climb in real time.
 
@@ -59,7 +59,7 @@ BadgeFarmer does three things:
 2. Requests your real analytics token from `/users/@me`.
 3. Sends the same `launch_game` + `running_game_heartbeat` pair the real client sends, with the duration filled in. Streaming mode sends the full `media_session_joined` → `video_stream_started` → `video_stream_heartbeat` (one per minute, carrying `duration_tracked_ms`) → `video_stream_ended` chain, which is what the streaming badge pipeline actually reads. Event schemas match [discord-streamer](https://github.com/lawerth/discord-streamer)'s telemetry engine.
 
-Session chunks are backdated up to 24 hours and chained without overlap, so 5,000 hours doesn't need 208 days of wall-clock time. Anything past the 24-hour window gets clamped, which keeps the timestamps inside the range the analytics pipeline accepts.
+Session chunks are backdated up to 24 hours and chained without overlap, so 5,000 hours doesn't need 208 days of wall-clock time. Streaming is the slow one: the badge counts one `video_stream_heartbeat` per minute, so a 24h stream session means ~1,440 events. The plugin paces these in batches of 50 with spacing between posts to stay under Discord's rate limits, which puts a full 5,000-hour run at around two and a half hours of real time. Anything past the 24-hour window gets clamped, which keeps the timestamps inside the range the analytics pipeline accepts.
 
 The game catalog comes straight from Discord's public [detectable applications endpoint](https://discord.com/api/v10/applications/detectable) (about 25,000 titles), so every game you credit is one Discord already knows about.
 

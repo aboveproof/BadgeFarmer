@@ -191,6 +191,8 @@ export interface StreamLocation {
 
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const MAX_EVENTS_PER_POST = 50;
+const BATCH_DELAY_MS = 5_000;
+const RATE_LIMIT_DELAY_MS = 60_000;
 
 function streamBase(location: StreamLocation): Record<string, unknown> {
     return {
@@ -247,11 +249,26 @@ export async function creditStreamTime(durationMs: number, startedAt?: number, l
 
     events.push(event("video_stream_ended", { duration_ms: duration }, start + duration));
 
+    // /science rate-limits hard. Pace batches, back off on 429, and resume
+    // instead of failing the whole 24h session and replaying every batch.
     for (let offset = 0; offset < events.length; offset += MAX_EVENTS_PER_POST) {
-        await RestAPI.post({
-            url: SCIENCE_URL,
-            body: { token, events: events.slice(offset, offset + MAX_EVENTS_PER_POST) }
-        });
+        for (let attempt = 0; ; attempt++) {
+            try {
+                await RestAPI.post({
+                    url: SCIENCE_URL,
+                    body: { token, events: events.slice(offset, offset + MAX_EVENTS_PER_POST) }
+                });
+                break;
+            } catch (error) {
+                if (attempt >= 5) throw error;
+                const wait = attempt === 0 ? RATE_LIMIT_DELAY_MS : RATE_LIMIT_DELAY_MS * (attempt + 1);
+                logger.warn(`Science batch rejected, backing off ${wait / 1000}s`, error);
+                await new Promise(resolve => setTimeout(resolve, wait));
+            }
+        }
+        if (offset + MAX_EVENTS_PER_POST < events.length) {
+            await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+        }
     }
 
     logger.info(`Credited ${Math.round(duration / 60_000)}m of streaming`);
