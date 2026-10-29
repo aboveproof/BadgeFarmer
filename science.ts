@@ -202,7 +202,7 @@ function streamBase(location: StreamLocation): Record<string, unknown> {
     };
 }
 
-export async function creditStreamTime(durationMs: number, startedAt?: number, location?: StreamLocation): Promise<void> {
+export async function creditStreamTime(durationMs: number, startedAt?: number, location?: StreamLocation, onBatch?: (batch: number, total: number) => void): Promise<void> {
     const duration = Math.floor(durationMs);
     if (duration < MIN_DURATION_MS) return;
 
@@ -251,7 +251,8 @@ export async function creditStreamTime(durationMs: number, startedAt?: number, l
 
     // /science rate-limits hard. Pace batches, back off on 429, and resume
     // instead of failing the whole 24h session and replaying every batch.
-    for (let offset = 0; offset < events.length; offset += MAX_EVENTS_PER_POST) {
+    const batches = Math.ceil(events.length / MAX_EVENTS_PER_POST);
+    for (let offset = 0, batch = 1; offset < events.length; offset += MAX_EVENTS_PER_POST, batch++) {
         for (let attempt = 0; ; attempt++) {
             try {
                 await RestAPI.post({
@@ -262,10 +263,11 @@ export async function creditStreamTime(durationMs: number, startedAt?: number, l
             } catch (error) {
                 if (attempt >= 5) throw error;
                 const wait = attempt === 0 ? RATE_LIMIT_DELAY_MS : RATE_LIMIT_DELAY_MS * (attempt + 1);
-                logger.warn(`Science batch rejected, backing off ${wait / 1000}s`, error);
+                logger.warn(`Science batch ${batch}/${batches} rejected, backing off ${wait / 1000}s`, error);
                 await new Promise(resolve => setTimeout(resolve, wait));
             }
         }
+        onBatch?.(batch, batches);
         if (offset + MAX_EVENTS_PER_POST < events.length) {
             await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
         }

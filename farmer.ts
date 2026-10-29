@@ -39,6 +39,8 @@ export interface FarmerStatus {
     gamesCreditedThisRun: number;
     hoursCreditedThisRun: number;
     streamHoursCreditedThisRun: number;
+    streamBatch: number;
+    streamBatches: number;
     errors: number;
     lastError: string | null;
     notrackBlocked: boolean;
@@ -58,6 +60,8 @@ let varietyIndex = 0;
 let gamesCredited = 0;
 let hoursCredited = 0;
 let streamHoursCredited = 0;
+let streamBatch = 0;
+let streamBatches = 0;
 let errors = 0;
 let lastError: string | null = null;
 let running = false;
@@ -84,6 +88,8 @@ export function getStatus(): FarmerStatus {
         gamesCreditedThisRun: gamesCredited,
         hoursCreditedThisRun: hoursCredited,
         streamHoursCreditedThisRun: streamHoursCredited,
+        streamBatch,
+        streamBatches,
         errors,
         lastError,
         notrackBlocked: isPluginEnabled("NoTrack")
@@ -201,8 +207,15 @@ function currentStreamLocation(): StreamLocation {
 
 async function creditStreamChunk(hours: number): Promise<void> {
     const slot = nextSlot(hours * 3_600_000);
-    await creditStreamTime(hours * 3_600_000, slot.start, currentStreamLocation());
+    streamBatch = 0;
+    streamBatches = 0;
+    await creditStreamTime(hours * 3_600_000, slot.start, currentStreamLocation(), (batch, total) => {
+        streamBatch = batch;
+        streamBatches = total;
+        notify();
+    });
     streamHoursCredited += hours;
+    notify();
 }
 
 async function runGameTime(app: { id: string; name: string; exeName: string; }, targetHours: number): Promise<void> {

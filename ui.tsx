@@ -226,9 +226,16 @@ export function BadgeFarmerDashboard(): JSX.Element {
                             ? <>Games credited: {status.gamesCreditedThisRun} / {status.varietyTotal} · </>
                             : null}
                         Hours credited: {status.hoursCreditedThisRun}h · Stream hours: {status.streamHoursCreditedThisRun}h
+                        {status.streamBatches > 0 && <> · batch {status.streamBatch}/{status.streamBatches}</>}
                         {status.errors > 0 && <> · {status.errors} errors</>}
                     </span>
                 </Notice.Positive>
+            )}
+
+            {busy && status.lastError != null && (
+                <Notice.Warning>
+                    <span className={cl("status-line")}>Last error: {status.lastError}</span>
+                </Notice.Warning>
             )}
 
             <Heading tag="h3">Games</Heading>
