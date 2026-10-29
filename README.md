@@ -44,8 +44,8 @@ Then enable it in **Settings → Plugins → BadgeFarmer**. The dashboard lives 
 | --- | --- | --- |
 | **Game Time** | Credits hours for one game you pick, up to 5,000 (Eternal tier) | ~10 min |
 | **Variety** | Credits short sessions across 100 unique detectable games (Universalist tier) | ~5 min |
-| **Streaming** | Credits stream hours, up to 5,000 | ~2.5 h |
-| **Max All** | All three, back to back | ~3 h |
+| **Streaming** | Backdates 24h of sessions, then live-streams one heartbeat per minute until the target | 24h backdated + 1 min per remaining hour |
+| **Max All** | All three, back to back | 24h backdated + live time |
 
 Every mode shows a live progress bar for its badge track, so you can watch the numbers climb in real time.
 

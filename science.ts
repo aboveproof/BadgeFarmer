@@ -160,6 +160,14 @@ function resolveStart(duration: number, startedAt: number | undefined): number {
     return Math.max(startedAt, now - MAX_BACKDATE_MS);
 }
 
+export function backdateWindowEnd(): number {
+    return Date.now();
+}
+
+export function backdateWindowStart(): number {
+    return Date.now() - MAX_BACKDATE_MS + 60_000;
+}
+
 export async function creditPlaytime(game: CreditableGame, durationMs: number, startedAt?: number): Promise<void> {
     const duration = Math.floor(durationMs);
     if (duration < MIN_DURATION_MS) return;
@@ -274,4 +282,104 @@ export async function creditStreamTime(durationMs: number, startedAt?: number, l
     }
 
     logger.info(`Credited ${Math.round(duration / 60_000)}m of streaming`);
+}
+
+export interface LiveStreamHandle {
+    stop(): Promise<void>;
+}
+
+/**
+ * Opens a real-time stream session: joined + started now, then one
+ * video_stream_heartbeat per actual minute until stopped, then ended.
+ * This is the shape Discord's badge pipeline trusts most, because it
+ * matches a genuine live broadcast exactly.
+ */
+export function startLiveStream(
+    location: StreamLocation,
+    shouldContinue: () => boolean,
+    onHour: (totalHours: number) => void
+): LiveStreamHandle {
+    const spot = location;
+    let stopped = false;
+    let resolveEnd: () => void = () => { };
+    const ended = new Promise<void>(resolve => { resolveEnd = resolve; });
+
+    void (async () => {
+        const token = await getAnalyticsToken();
+        const { heartbeatSession, launchSignature } = clientSession();
+        const gameSession = crypto.randomUUID();
+
+        function event(type: string, extra: Record<string, unknown>, at: number): Record<string, unknown> {
+            return {
+                type,
+                properties: {
+                    client_track_timestamp: at,
+                    client_send_timestamp: at,
+                    client_heartbeat_session_id: heartbeatSession,
+                    launch_signature: launchSignature,
+                    event_sequence_number: ++sequence,
+                    client_app_state: "focused",
+                    game_session_id: gameSession,
+                    ...streamBase(spot),
+                    ...extra
+                }
+            };
+        }
+
+        async function post(events: Record<string, unknown>[]): Promise<boolean> {
+            for (let attempt = 0; attempt < 5; attempt++) {
+                try {
+                    await RestAPI.post({ url: SCIENCE_URL, body: { token, events } });
+                    return true;
+                } catch (error) {
+                    if (attempt === 4) {
+                        logger.error("Live stream heartbeat failed 5 times in a row", error);
+                        return false;
+                    }
+                    logger.warn(`Live stream heartbeat rejected, retrying in ${RATE_LIMIT_DELAY_MS / 1000}s`, error);
+                    await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
+                }
+            }
+            return false;
+        }
+
+        const start = Date.now();
+        await post([event("media_session_joined", {}, start), event("video_stream_started", {}, start)]);
+
+        let minutes = 0;
+        let consecutiveFailures = 0;
+        while (!stopped && shouldContinue()) {
+            await new Promise(resolve => setTimeout(resolve, HEARTBEAT_INTERVAL_MS));
+            if (stopped) break;
+
+            minutes++;
+            const ok = await post([event("video_stream_heartbeat", {
+                duration_tracked_ms: HEARTBEAT_INTERVAL_MS,
+                total_duration_ms: minutes * HEARTBEAT_INTERVAL_MS
+            }, Date.now())]);
+
+            if (!ok) {
+                consecutiveFailures++;
+                if (consecutiveFailures >= 10) {
+                    logger.error("Live stream aborted after 10 consecutive failed heartbeats");
+                    break;
+                }
+            } else {
+                consecutiveFailures = 0;
+                if (minutes % 60 === 0) onHour(minutes / 60);
+            }
+        }
+
+        await post([event("video_stream_ended", { duration_ms: minutes * HEARTBEAT_INTERVAL_MS }, Date.now())]);
+        onHour(minutes / 60);
+        logger.info(`Live stream session ended after ${minutes}m`);
+        resolveEnd();
+    })();
+
+    return {
+        stop(): Promise<void> {
+            stopped = true;
+            return ended;
+        }
+    };
 }
