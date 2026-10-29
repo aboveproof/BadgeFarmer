@@ -57,7 +57,7 @@ BadgeFarmer does three things:
 
 1. Injects a spoofed game into `RunningGameStore` through the client's own `RUNNING_GAME_SET_DEBUG_GAME` dispatch, so your presence shows the game like normal.
 2. Requests your real analytics token from `/users/@me`.
-3. Sends the same `launch_game` + `running_game_heartbeat` pair the real client sends, with the duration filled in. Streaming mode sends the matching `streamer_mode_session_heartbeat` events instead.
+3. Sends the same `launch_game` + `running_game_heartbeat` pair the real client sends, with the duration filled in. Streaming mode sends the full `media_session_joined` → `video_stream_started` → `video_stream_heartbeat` (one per minute, carrying `duration_tracked_ms`) → `video_stream_ended` chain, which is what the streaming badge pipeline actually reads. Event schemas match [discord-streamer](https://github.com/lawerth/discord-streamer)'s telemetry engine.
 
 Session chunks are backdated up to 24 hours and chained without overlap, so 5,000 hours doesn't need 208 days of wall-clock time. Anything past the 24-hour window gets clamped, which keeps the timestamps inside the range the analytics pipeline accepts.
 
@@ -81,7 +81,7 @@ The events match what the real client sends, including fingerprints and session 
 It violates the Terms of Service, same as every client mod. Ban risk from analytics spoofing specifically appears to be zero in practice, but "appears to be" is doing work in that sentence. This is your call to make, not mine.
 
 **Does the streaming badge need an actual stream?**
-No. The badge reads the analytics events, not the stream itself. Streaming mode never touches a voice channel.
+The badge reads the analytics event chain, not the media servers. Streaming mode sends `media_session_joined` through `video_stream_ended` with real guild and channel IDs when you're in voice, and synthetic ones otherwise. No voice connection, no capture, no viewer needed. One caveat: Discord's privacy settings page has a "use data to personalize" toggle that must be on for the streamer account, or the events get dropped server-side.
 
 ## Credits
 

@@ -152,26 +152,6 @@ function buildHeartbeat(game: CreditableGame, durationMs: number, gameSession: s
     };
 }
 
-function buildStreamHeartbeat(durationMs: number, initial: boolean, at: number): Record<string, unknown> {
-    const { heartbeatSession, launchSignature } = clientSession();
-
-    return {
-        type: "streamer_mode_session_heartbeat",
-        properties: {
-            client_track_timestamp: at,
-            client_heartbeat_session_id: heartbeatSession,
-            event_sequence_number: ++sequence,
-            duration_tracked_ms: durationMs,
-            initial_heartbeat: initial,
-            final_heartbeat: !initial,
-            stream_source: "screen_share",
-            launch_signature: launchSignature,
-            client_app_state: "focused",
-            client_send_timestamp: at
-        }
-    };
-}
-
 const MAX_BACKDATE_MS = 24 * 60 * 60 * 1_000;
 
 function resolveStart(duration: number, startedAt: number | undefined): number {
@@ -204,23 +184,75 @@ export async function creditPlaytime(game: CreditableGame, durationMs: number, s
     logger.info(`Credited ${Math.round(duration / 60_000)}m of ${game.name}`);
 }
 
-export async function creditStreamTime(durationMs: number, startedAt?: number): Promise<void> {
+export interface StreamLocation {
+    guildId: string;
+    channelId: string;
+}
+
+const HEARTBEAT_INTERVAL_MS = 60_000;
+const MAX_EVENTS_PER_POST = 50;
+
+function streamBase(location: StreamLocation): Record<string, unknown> {
+    return {
+        guild_id: location.guildId,
+        channel_id: location.channelId,
+        channel_type: 2
+    };
+}
+
+export async function creditStreamTime(durationMs: number, startedAt?: number, location?: StreamLocation): Promise<void> {
     const duration = Math.floor(durationMs);
     if (duration < MIN_DURATION_MS) return;
 
     const token = await getAnalyticsToken();
     const start = resolveStart(duration, startedAt);
+    const spot = location ?? { guildId: "0", channelId: "0" };
+    const { heartbeatSession, launchSignature } = clientSession();
 
-    await RestAPI.post({
-        url: SCIENCE_URL,
-        body: {
-            token,
-            events: [
-                buildStreamHeartbeat(0, true, start),
-                buildStreamHeartbeat(duration, false, start + duration)
-            ]
-        }
-    });
+    function event(type: string, extra: Record<string, unknown>, at: number): Record<string, unknown> {
+        return {
+            type,
+            properties: {
+                client_track_timestamp: at,
+                client_send_timestamp: at,
+                client_heartbeat_session_id: heartbeatSession,
+                launch_signature: launchSignature,
+                event_sequence_number: ++sequence,
+                client_app_state: "focused",
+                ...streamBase(spot),
+                ...extra
+            }
+        };
+    }
+
+    const events: Record<string, unknown>[] = [
+        event("media_session_joined", {}, start),
+        event("video_stream_started", {}, start)
+    ];
+
+    for (let elapsed = HEARTBEAT_INTERVAL_MS; elapsed <= duration; elapsed += HEARTBEAT_INTERVAL_MS) {
+        events.push(event("video_stream_heartbeat", {
+            duration_tracked_ms: HEARTBEAT_INTERVAL_MS,
+            total_duration_ms: elapsed
+        }, start + elapsed));
+    }
+
+    const trailing = duration % HEARTBEAT_INTERVAL_MS;
+    if (trailing >= MIN_DURATION_MS) {
+        events.push(event("video_stream_heartbeat", {
+            duration_tracked_ms: trailing,
+            total_duration_ms: duration
+        }, start + duration));
+    }
+
+    events.push(event("video_stream_ended", { duration_ms: duration }, start + duration));
+
+    for (let offset = 0; offset < events.length; offset += MAX_EVENTS_PER_POST) {
+        await RestAPI.post({
+            url: SCIENCE_URL,
+            body: { token, events: events.slice(offset, offset + MAX_EVENTS_PER_POST) }
+        });
+    }
 
     logger.info(`Credited ${Math.round(duration / 60_000)}m of streaming`);
 }

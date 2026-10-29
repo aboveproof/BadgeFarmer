@@ -8,9 +8,9 @@ import { isPluginEnabled } from "@api/PluginManager";
 import { Logger } from "@utils/Logger";
 import { sleep } from "@utils/misc";
 import type { RunningGame } from "@vencord/discord-types";
-import { FluxDispatcher } from "@webpack/common";
+import { FluxDispatcher, SelectedChannelStore } from "@webpack/common";
 
-import { creditPlaytime, creditStreamTime, fingerprintFor } from "./science";
+import { creditPlaytime, creditStreamTime, fingerprintFor, type StreamLocation } from "./science";
 
 const logger = new Logger("BadgeFarmer:Farmer");
 
@@ -188,9 +188,20 @@ async function creditVarietySession(game: SpoofedGame, minutes: number): Promise
     gamesCredited++;
 }
 
+const STREAM_SESSION_HOURS = 24;
+
+function currentStreamLocation(): StreamLocation {
+    const channelId = SelectedChannelStore.getVoiceChannelId();
+    if (typeof channelId === "string" && channelId !== "") {
+        return { guildId: "0", channelId };
+    }
+    // Synthetic IDs: the badge pipeline reads the event chain, not the room.
+    return { guildId: "900000000000000000", channelId: "900000000000000001" };
+}
+
 async function creditStreamChunk(hours: number): Promise<void> {
     const slot = nextSlot(hours * 3_600_000);
-    await creditStreamTime(hours * 3_600_000, slot.start);
+    await creditStreamTime(hours * 3_600_000, slot.start, currentStreamLocation());
     streamHoursCredited += hours;
 }
 
@@ -230,8 +241,8 @@ async function runStream(targetHours: number): Promise<void> {
     let credited = 0;
     let failedBursts = 0;
     while (running && credited < targetHours) {
-        const chunk = Math.min(CHUNK_HOURS, targetHours - credited);
-        const ok = await withRetry(`Stream chunk (${chunk}h)`, () => creditStreamChunk(chunk));
+        const chunk = Math.min(STREAM_SESSION_HOURS, targetHours - credited);
+        const ok = await withRetry(`Stream session (${chunk}h)`, () => creditStreamChunk(chunk));
         if (!ok) {
             if (++failedBursts >= MAX_FAILED_BURSTS) {
                 lastError = "Stopped after repeated failures";
