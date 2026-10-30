@@ -7,17 +7,24 @@
 import { Button } from "@components/Button";
 import { Flex } from "@components/Flex";
 import { Heading } from "@components/Heading";
-import { Notice } from "@components/Notice";
 import { Paragraph } from "@components/Paragraph";
 import { Logger } from "@utils/Logger";
 import { useForceUpdater } from "@utils/react";
-import { TextInput,useEffect, useMemo, useState } from "@webpack/common";
+import { TextInput, useEffect, useMemo, useState } from "@webpack/common";
 import type { JSX } from "react";
 
 import type { DetectableApp } from "./farmer";
 import * as Farmer from "./farmer";
 
 const cl = (name: string) => `vc-badge-farmer-${name}`;
+
+function Notice({ kind, children }: { kind: "positive" | "warning" | "danger"; children: React.ReactNode; }) {
+    return (
+        <div className={cl(`notice-${kind}`)}>
+            {children}
+        </div>
+    );
+}
 
 const DETECTABLE_APPS_URL = "https://discord.com/api/v10/applications/detectable";
 const MAX_RESULTS = 30;
@@ -201,13 +208,13 @@ export function BadgeFarmerDashboard(): JSX.Element {
     return (
         <div className={cl("dashboard")}>
             {status.notrackBlocked && (
-                <Notice.Warning>
+                <Notice kind="warning">
                     NoTrack is on and will eat the requests this plugin sends. Turn it off (plus the data sharing
                     toggles in Discord's privacy settings) until the badges land. You can switch it back after.
-                </Notice.Warning>
+                </Notice>
             )}
 
-            {catalogueError != null && <Notice.Danger>{catalogueError}</Notice.Danger>}
+            {catalogueError != null && <Notice kind="danger">{catalogueError}</Notice>}
 
             <Heading tag="h3">Badge targets</Heading>
 
@@ -216,7 +223,7 @@ export function BadgeFarmerDashboard(): JSX.Element {
             <TierRow label="Streaming" tier={streamTier} />
 
             {busy && (
-                <Notice.Positive>
+                <Notice kind="positive">
                     <span className={cl("status-line")}>
                         Running <strong>{status.mode}</strong>
                         {status.activeGame != null && <> · playing <strong>{status.activeGame.name}</strong></>}
@@ -231,13 +238,13 @@ export function BadgeFarmerDashboard(): JSX.Element {
                             : status.streamBatches > 0 && <> · batch {status.streamBatch}/{status.streamBatches}</>}
                         {status.errors > 0 && <> · {status.errors} errors</>}
                     </span>
-                </Notice.Positive>
+                </Notice>
             )}
 
             {busy && status.lastError != null && (
-                <Notice.Warning>
+                <Notice kind="warning">
                     <span className={cl("status-line")}>Last error: {status.lastError}</span>
-                </Notice.Warning>
+                </Notice>
             )}
 
             <Heading tag="h3">Games</Heading>

@@ -4,6 +4,34 @@
     gap: 12px;
 }
 
+.vc-badge-farmer-notice-positive,
+.vc-badge-farmer-notice-warning,
+.vc-badge-farmer-notice-danger {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-size: 14px;
+    line-height: 20px;
+    color: var(--text-default);
+}
+
+.vc-badge-farmer-notice-positive {
+    background: var(--background-message-positive-hover, rgb(87 241 148 / 10%));
+    border: 1px solid var(--status-positive);
+}
+
+.vc-badge-farmer-notice-warning {
+    background: var(--background-message-warning-hover, rgb(246 177 2 / 10%));
+    border: 1px solid var(--status-warning);
+}
+
+.vc-badge-farmer-notice-danger {
+    background: var(--background-message-danger-hover, rgb(247 66 89 / 10%));
+    border: 1px solid var(--status-danger);
+}
+
 .vc-badge-farmer-tier-row {
     display: flex;
     flex-direction: column;
