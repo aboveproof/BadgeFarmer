@@ -5,7 +5,6 @@
  */
 
 import { Button } from "@components/Button";
-import { Flex } from "@components/Flex";
 import { Heading } from "@components/Heading";
 import { Paragraph } from "@components/Paragraph";
 import { Logger } from "@utils/Logger";
@@ -17,14 +16,6 @@ import type { DetectableApp } from "./farmer";
 import * as Farmer from "./farmer";
 
 const cl = (name: string) => `vc-badge-farmer-${name}`;
-
-function Notice({ kind, children }: { kind: "positive" | "warning" | "danger"; children: React.ReactNode; }) {
-    return (
-        <div className={cl(`notice-${kind}`)}>
-            {children}
-        </div>
-    );
-}
 
 const DETECTABLE_APPS_URL = "https://discord.com/api/v10/applications/detectable";
 const MAX_RESULTS = 30;
@@ -91,62 +82,31 @@ const VARIETY_TIERS = [
     { name: "Universalist", games: 100 }
 ] as const;
 
-function tierProgress(hours: number, tiers: ReadonlyArray<{ name: string; hours: number; }>): { name: string; next: string | null; pct: number; } {
+function tierProgress(value: number, thresholds: ReadonlyArray<{ name: string; at: number; }>): { name: string; next: string | null; nextAt: number | null; pct: number; } {
     let current = "Unranked";
-    let next: string | null = tiers[0].name;
+    let next: string | null = thresholds[0].name;
+    let nextAt: number | null = thresholds[0].at;
     let floor = 0;
-    let ceil = tiers[0].hours;
+    let ceil = thresholds[0].at;
 
-    for (let index = 0; index < tiers.length; index++) {
-        if (hours >= tiers[index].hours) {
-            current = tiers[index].name;
-            floor = tiers[index].hours;
-            ceil = tiers[index + 1]?.hours ?? tiers[index].hours;
-            next = tiers[index + 1]?.name ?? null;
+    for (let index = 0; index < thresholds.length; index++) {
+        if (value >= thresholds[index].at) {
+            current = thresholds[index].name;
+            floor = thresholds[index].at;
+            ceil = thresholds[index + 1]?.at ?? thresholds[index].at;
+            next = thresholds[index + 1]?.name ?? null;
+            nextAt = thresholds[index + 1]?.at ?? null;
         }
     }
 
-    const pct = ceil === floor ? 100 : Math.min(100, Math.round(((hours - floor) / (ceil - floor)) * 100));
-    return { name: current, next, pct };
-}
-
-function tierProgressGames(count: number, tiers: ReadonlyArray<{ name: string; games: number; }>): { name: string; next: string | null; pct: number; } {
-    let current = "Unranked";
-    let next: string | null = tiers[0].name;
-    let floor = 0;
-    let ceil = tiers[0].games;
-
-    for (let index = 0; index < tiers.length; index++) {
-        if (count >= tiers[index].games) {
-            current = tiers[index].name;
-            floor = tiers[index].games;
-            ceil = tiers[index + 1]?.games ?? tiers[index].games;
-            next = tiers[index + 1]?.name ?? null;
-        }
-    }
-
-    const pct = ceil === floor ? 100 : Math.min(100, Math.round(((count - floor) / (ceil - floor)) * 100));
-    return { name: current, next, pct };
+    const pct = ceil === floor ? 100 : Math.min(100, Math.round(((value - floor) / (ceil - floor)) * 100));
+    return { name: current, next, nextAt, pct };
 }
 
 function ProgressBar({ pct }: { pct: number; }) {
     return (
         <div className={cl("progress-track")}>
             <div className={cl("progress-fill")} style={{ width: `${pct}%` }} />
-        </div>
-    );
-}
-
-function TierRow({ label, tier }: { label: string; tier: { name: string; next: string | null; pct: number; }; }) {
-    return (
-        <div className={cl("tier-row")}>
-            <div className={cl("tier-copy")}>
-                <span className={cl("tier-label")}>{label}</span>
-                <span className={cl("tier-value")}>
-                    {tier.name}{tier.next != null && <span className={cl("muted")}> → {tier.next}</span>}
-                </span>
-            </div>
-            <ProgressBar pct={tier.pct} />
         </div>
     );
 }
@@ -168,6 +128,87 @@ function pickVarietyPool(apps: DetectableApp[], count: number): DetectableApp[] 
         [pool[index], pool[picked]] = [pool[picked], pool[index]];
     }
     return pool.slice(0, count);
+}
+
+function formatHours(hours: number): string {
+    return hours >= 10 ? `${Math.round(hours)}h` : `${(Math.round(hours * 10) / 10)}h`;
+}
+
+function StatBlock({ label, value, sub }: { label: string; value: string; sub: string | null; }) {
+    return (
+        <div className={cl("stat")}>
+            <span className={cl("stat-label")}>{label}</span>
+            <span className={cl("stat-value")}>{value}</span>
+            {sub != null && <span className={cl("stat-sub")}>{sub}</span>}
+        </div>
+    );
+}
+
+function ModeCard({
+    title,
+    steps,
+    target,
+    targetPlaceholder,
+    onTargetChange,
+    targetError,
+    buttonLabel,
+    buttonDisabled,
+    onRun,
+    progress
+}: {
+    title: string;
+    steps: string[];
+    target: string | null;
+    targetPlaceholder: string;
+    onTargetChange: (value: string) => void;
+    targetError: string | null;
+    buttonLabel: string;
+    buttonDisabled: boolean;
+    onRun: () => void;
+    progress: { name: string; next: string | null; nextAt: number | null; pct: number; unit: string; credited: string; } | null;
+}) {
+    return (
+        <div className={cl("mode")}>
+            <div className={cl("mode-head")}>
+                <Heading tag="h4">{title}</Heading>
+                {progress != null && (
+                    <span className={cl("mode-tier")}>{progress.name}</span>
+                )}
+            </div>
+
+            {progress != null && (
+                <div className={cl("mode-progress")}>
+                    <ProgressBar pct={progress.pct} />
+                    <span className={cl("mode-progress-copy")}>
+                        {progress.credited} this run
+                        {progress.next != null && progress.nextAt != null && (
+                            <> · next: {progress.next} at {progress.nextAt}{progress.unit}</>
+                        )}
+                    </span>
+                </div>
+            )}
+
+            <ol className={cl("mode-steps")}>
+                {steps.map(step => <li key={step}>{step}</li>)}
+            </ol>
+
+            <div className={cl("mode-run")}>
+                {target != null && (
+                    <div className={cl("mode-field")}>
+                        <TextInput value={target} onChange={onTargetChange} placeholder={targetPlaceholder} />
+                        {targetError != null && <span className={cl("mode-error")}>{targetError}</span>}
+                    </div>
+                )}
+                <Button
+                    variant="secondary"
+                    disabled={buttonDisabled}
+                    onClick={onRun}
+                >
+                    {buttonLabel}
+                </Button>
+            </div>
+        </div>
+    );
 }
 
 export function BadgeFarmerDashboard(): JSX.Element {
@@ -195,150 +236,210 @@ export function BadgeFarmerDashboard(): JSX.Element {
     const parsedVarietyMinutes = parseMinutes(varietyMinutes);
     const parsedStreamTarget = parseHours(streamTarget);
 
-    const timeTier = tierProgress(status.hoursCreditedThisRun, TIME_TIERS);
-    const varietyTier = tierProgressGames(status.gamesCreditedThisRun, VARIETY_TIERS);
-    const streamTier = tierProgress(status.streamHoursCreditedThisRun, TIME_TIERS);
-
     const busy = status.mode !== "IDLE";
+    const catalogueReady = apps != null || catalogueError != null;
+
+    const timeProgress = tierProgress(status.hoursCreditedThisRun, TIME_TIERS.map(t => ({ name: t.name, at: t.hours })));
+    const varietyProgress = tierProgress(status.gamesCreditedThisRun, VARIETY_TIERS.map(t => ({ name: t.name, at: t.games })));
+    const streamProgress = tierProgress(status.streamHoursCreditedThisRun, TIME_TIERS.map(t => ({ name: t.name, at: t.hours })));
+
+    const timeError = parsedTimeTarget == null ? "Enter hours between 1 and 5000." : null;
+    const streamError = parsedStreamTarget == null ? "Enter hours between 1 and 5000." : null;
+    const varietyError = parsedVarietyMinutes == null ? "Enter minutes between 1 and 1440." : null;
 
     function act(action: () => void | Promise<void>) {
         void action();
     }
 
+    function clearSelectedGame() {
+        setSelected(null);
+        setQuery("");
+    }
+
+    const statusLine = busy
+        ? status.mode === "STREAM"
+            ? `Streaming live · ${formatHours(status.streamHoursCreditedThisRun)} credited`
+            : status.mode === "VARIETY"
+                ? `Rotating games · ${status.gamesCreditedThisRun}/${status.varietyTotal} done`
+                : status.mode === "GAME_TIME"
+                    ? `Crediting ${status.activeGame?.name ?? ""} · ${formatHours(status.hoursCreditedThisRun)} done`
+                    : `Max All · ${status.gamesCreditedThisRun}/${status.varietyTotal} games, ${formatHours(status.hoursCreditedThisRun)}h, ${formatHours(status.streamHoursCreditedThisRun)} stream`
+        : null;
+
     return (
         <div className={cl("dashboard")}>
-            {status.notrackBlocked && (
-                <Notice kind="warning">
-                    NoTrack is enabled. Its tracking patch only disables Discord's own analytics batching, and this
-                    plugin posts straight to /science, so farming still works with it on. No action needed.
-                </Notice>
+            {catalogueError != null && (
+                <div className={cl("notice-danger")}>{catalogueError}</div>
             )}
 
-            {catalogueError != null && <Notice kind="danger">{catalogueError}</Notice>}
-
-            <Heading tag="h3">Badge targets</Heading>
-
-            <TierRow label="Game Time" tier={timeTier} />
-            <TierRow label="Game Variety" tier={varietyTier} />
-            <TierRow label="Streaming" tier={streamTier} />
-
-            {busy && (
-                <Notice kind="positive">
-                    <span className={cl("status-line")}>
-                        Running <strong>{status.mode}</strong>
-                        {status.activeGame != null && <> · playing <strong>{status.activeGame.name}</strong></>}
-                    </span>
-                    <span className={cl("status-line")}>
-                        {status.mode === "VARIETY" || status.mode === "MAX_ALL"
-                            ? <>Games credited: {status.gamesCreditedThisRun} / {status.varietyTotal} · </>
-                            : null}
-                        Hours credited: {status.hoursCreditedThisRun}h · Stream hours: {status.streamHoursCreditedThisRun}h
-                        {status.streamBatches === 60
-                            ? <> · LIVE, minute {status.streamBatch}/60</>
-                            : status.streamBatches > 0 && <> · batch {status.streamBatch}/{status.streamBatches}</>}
-                        {status.errors > 0 && <> · {status.errors} errors</>}
-                    </span>
-                </Notice>
-            )}
-
-            {busy && status.lastError != null && (
-                <Notice kind="warning">
-                    <span className={cl("status-line")}>Last error: {status.lastError}</span>
-                </Notice>
-            )}
-
-            <Heading tag="h3">Games</Heading>
-
-                <TextInput
-                    value={query}
-                    onChange={value => {
-                        setQuery(value);
-                        setSelected(null);
-                    }}
-                    disabled={apps == null && catalogueError == null}
-                    placeholder={apps == null ? "Loading game list..." : "Search a game to farm"}
-                />
-
-            {selected == null && results.length > 0 && (
-                <div className={cl("results")}>
-                    {results.map(app => (
-                        <button
-                            key={app.id}
-                            className={cl("result")}
-                            onClick={() => {
-                                setSelected(app);
-                                setQuery(app.name);
-                            }}
+            {busy ? (
+                <div className={cl("run-panel")}>
+                    <div className={cl("run-status")}>
+                        <span className={cl("run-dot")} />
+                        <span>{statusLine}</span>
+                    </div>
+                    {status.streamBatches === 60 && (
+                        <span className={cl("run-live")}>minute {status.streamBatch}/60 of the current hour</span>
+                    )}
+                    {status.lastError != null && (
+                        <span className={cl("run-error")}>{status.lastError}</span>
+                    )}
+                    <div className={cl("run-hint")}>
+                        Leave the client open. Badges land on Discord's nightly pass, so check your profile tomorrow.
+                    </div>
+                    <div>
+                        <Button
+                            variant="dangerSecondary"
+                            onClick={() => act(Farmer.stop)}
                         >
-                            <span className={cl("result-name")}>{app.name}</span>
-                            <span className={cl("result-meta")}>{Farmer.executableFor(app)} · {app.id}</span>
-                        </button>
-                    ))}
+                            Stop
+                        </Button>
+                    </div>
                 </div>
+            ) : (
+                <>
+                    <div className={cl("intro")}>
+                        <Heading tag="h3">How this works</Heading>
+                        <Paragraph>
+                            Pick a mode below, start it, and leave the client open. Sessions report to Discord's
+                            analytics in the same format the real client uses, and your badges move on the next
+                            nightly pass. Game Time and Variety finish in minutes because their hours go out in
+                            backdated chunks. Streaming is different: Discord counts one heartbeat per real minute,
+                            so a stream run takes as long as the hours you want.
+                        </Paragraph>
+                        <Paragraph className={cl("muted")}>
+                            Two things must be on for any of this to count: the "use data to personalize" toggle in
+                            Settings → Privacy &amp; Safety, and the client staying open while a run is live. NoTrack
+                            is fine, farming bypasses it.
+                        </Paragraph>
+                    </div>
+
+                    <ModeCard
+                        title="Game Time badge"
+                        steps={[
+                            "Search for the game you want credited. Any game Discord can detect works.",
+                            "Set how many hours you want, up to 5000 for the Eternal tier.",
+                            "Start the run. Hours post in 2-hour chunks and finish in about ten minutes."
+                        ]}
+                        target={timeTarget}
+                        targetPlaceholder="Hours (1-5000)"
+                        onTargetChange={setTimeTarget}
+                        targetError={timeError}
+                        buttonLabel={selected == null ? "Pick a game first" : `Credit ${selected.name}`}
+                        buttonDisabled={selected == null || parsedTimeTarget == null || !catalogueReady}
+                        onRun={() => {
+                            act(() => Farmer.startGameTime(selected!, parsedTimeTarget!));
+                            clearSelectedGame();
+                        }}
+                        progress={status.hoursCreditedThisRun > 0
+                            ? { ...timeProgress, unit: "h", credited: formatHours(status.hoursCreditedThisRun) }
+                            : null}
+                    />
+
+                    <div className={cl("game-search")}>
+                        <TextInput
+                            value={query}
+                            onChange={value => {
+                                setQuery(value);
+                                setSelected(null);
+                            }}
+                            disabled={!catalogueReady && catalogueError == null}
+                            placeholder={apps == null ? "Loading game list..." : "Search 25,000+ games for the Game Time badge"}
+                        />
+                        {selected != null && (
+                            <div className={cl("game-picked")}>
+                                <span>{selected.name}</span>
+                                <button
+                                    className={cl("game-clear")}
+                                    onClick={clearSelectedGame}
+                                    aria-label="Clear selected game"
+                                >
+                                    Clear
+                                </button>
+                            </div>
+                        )}
+                        {selected == null && results.length > 0 && (
+                            <div className={cl("results")}>
+                                {results.map(app => (
+                                    <button
+                                        key={app.id}
+                                        className={cl("result")}
+                                        onClick={() => {
+                                            setSelected(app);
+                                            setQuery(app.name);
+                                        }}
+                                    >
+                                        <span className={cl("result-name")}>{app.name}</span>
+                                        <span className={cl("result-meta")}>{Farmer.executableFor(app)} · {app.id}</span>
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+
+                    <ModeCard
+                        title="Game Variety badge"
+                        steps={[
+                            "100 random games from Discord's catalog get credited, 2 minutes each.",
+                            "Raise the minutes per game if you want sessions to look longer.",
+                            "Start the run. The full rotation finishes in about five minutes."
+                        ]}
+                        target={varietyMinutes}
+                        targetPlaceholder="Minutes per game"
+                        onTargetChange={setVarietyMinutes}
+                        targetError={varietyError}
+                        buttonLabel="Run variety rotation"
+                        buttonDisabled={parsedVarietyMinutes == null || apps == null}
+                        onRun={() => act(() => Farmer.startVariety(pickVarietyPool(apps!, 100), parsedVarietyMinutes!))}
+                        progress={status.gamesCreditedThisRun > 0
+                            ? { ...varietyProgress, unit: " games", credited: `${status.gamesCreditedThisRun} games` }
+                            : null}
+                    />
+
+                    <ModeCard
+                        title="Streaming badge"
+                        steps={[
+                            "Join a voice channel and go live with any screenshare. A blank 10fps capture is enough.",
+                            "Have someone watching. An alt account in the channel counts. Hours only register when a viewer is present.",
+                            "Start the run. One heartbeat posts per real minute, so 1 hour of badge credit takes 1 hour of runtime."
+                        ]}
+                        target={streamTarget}
+                        targetPlaceholder="Hours (1-5000)"
+                        onTargetChange={setStreamTarget}
+                        targetError={streamError}
+                        buttonLabel="Start streaming telemetry"
+                        buttonDisabled={parsedStreamTarget == null}
+                        onRun={() => act(() => Farmer.startStream(parsedStreamTarget!))}
+                        progress={status.streamHoursCreditedThisRun > 0
+                            ? { ...streamProgress, unit: "h", credited: formatHours(status.streamHoursCreditedThisRun) }
+                            : null}
+                    />
+
+                    <div className={cl("maxall")}>
+                        <div className={cl("maxall-copy")}>
+                            <Heading tag="h4">Run everything</Heading>
+                            <span className={cl("muted")}>
+                                Variety, then Game Time on a random pick, then streaming. The first two finish in
+                                about fifteen minutes, then the stream runs for as long as your target.
+                            </span>
+                        </div>
+                        <Button
+                            disabled={apps == null}
+                            onClick={() => act(() => Farmer.maxAll(apps!))}
+                        >
+                            Max All Badges
+                        </Button>
+                    </div>
+                </>
             )}
 
-            <div className={cl("grid")}>
-                <div className={cl("field")}>
-                    <Heading tag="h5">Game Time hours</Heading>
-                    <TextInput value={timeTarget} onChange={setTimeTarget} />
-                    <span className={cl("muted")}>Target hours, 1–5000.</span>
-                </div>
-                <div className={cl("field")}>
-                    <Heading tag="h5">Variety minutes/game</Heading>
-                    <TextInput value={varietyMinutes} onChange={setVarietyMinutes} />
-                    <span className={cl("muted")}>Minutes per unique game, 1–1440.</span>
-                </div>
-                <div className={cl("field")}>
-                    <Heading tag="h5">Streaming hours</Heading>
-                    <TextInput value={streamTarget} onChange={setStreamTarget} />
-                    <span className={cl("muted")}>Target stream hours, 1–5000.</span>
-                </div>
+            <div className={cl("footer")}>
+                <span className={cl("muted")}>
+                    Streaming telemetry ported from lawerth/discord-streamer. Game time approach from
+                    Accentaro/gameSessionSpoofer. Hours always count; variety only fully registers for games
+                    Discord's telemetry has seen before.
+                </span>
             </div>
-
-            <Flex className={cl("actions")}>
-                <Button
-                    variant="secondary"
-                    disabled={busy || selected == null || parsedTimeTarget == null}
-                    onClick={() => act(() => Farmer.startGameTime(selected!, parsedTimeTarget!))}
-                >
-                    Farm Game Time
-                </Button>
-                <Button
-                    variant="secondary"
-                    disabled={busy || apps == null || parsedVarietyMinutes == null}
-                    onClick={() => act(() => Farmer.startVariety(pickVarietyPool(apps!, 100), parsedVarietyMinutes!))}
-                >
-                    Farm Variety
-                </Button>
-                <Button
-                    variant="secondary"
-                    disabled={busy || parsedStreamTarget == null}
-                    onClick={() => act(() => Farmer.startStream(parsedStreamTarget!))}
-                >
-                    Farm Streaming
-                </Button>
-            </Flex>
-
-            <Flex className={cl("actions")}>
-                <Button
-                    disabled={busy || apps == null}
-                    onClick={() => act(() => Farmer.maxAll(apps!))}
-                >
-                    Max All Badges
-                </Button>
-                <Button
-                    variant="dangerSecondary"
-                    disabled={!busy}
-                    onClick={() => act(Farmer.stop)}
-                >
-                    Stop
-                </Button>
-            </Flex>
-
-            <Paragraph className={cl("muted")}>
-                Sessions go to Discord's science endpoint in chunks, backdated up to 24 hours. Badges move on
-                Discord's daily analytics pass, so check the next day. Keep the client open while a run is going.
-            </Paragraph>
         </div>
     );
 }
