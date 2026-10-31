@@ -44,7 +44,7 @@ Enable it in **Settings → Plugins → BadgeFarmer**. The dashboard lives in th
 | --- | --- | --- |
 | **Game Time** | Credits hours for one game you pick, up to 5,000 (Eternal tier) | ~10 min |
 | **Variety** | Credits short sessions across 100 unique detectable games (Universalist tier) | ~5 min |
-| **Streaming** | Sends one heartbeat per minute of real stream time, exactly like a live broadcast | 1 real minute per hour |
+| **Streaming** | Fires backdated 24h sessions chained backward from now (~1 request each), then streams live for whatever remains | ~5 min if backdating counts, else 1 min per hour |
 | **Max All** | All three, back to back | ~15 min + live stream time |
 
 Game Time and Variety send finished sessions in 2-hour chunks, backdated up to 24 hours and chained without overlap, so 5,000 hours doesn't need 208 days of wall-clock time. Streaming can't be compressed: the badge counts one `video_stream_heartbeat` per actual minute, so the plugin sends one per actual minute. The dashboard shows a live counter while it runs.

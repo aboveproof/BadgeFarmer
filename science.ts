@@ -315,3 +315,63 @@ export function startLiveStream(
         }
     };
 }
+
+/**
+ * Turbo stream credit: backdated sessions shaped exactly like the live ones,
+ * with one heartbeat per simulated hour instead of per minute. Game-time
+ * backdating with multi-hour durations is accepted by the same pipeline, so
+ * hour-granular stream heartbeats are the matching play. Sessions tile the
+ * last 24h contiguously with zero overlap, each carrying its own session ID.
+ *
+ * Each 24h session costs ~26 events (joined, started, 24 hourly heartbeats,
+ * ended) in a single request, so 5,000h is ~210 requests total.
+ */
+export async function creditStreamBackdated(
+    hours: number,
+    sessionStart: number,
+    location: StreamLocation
+): Promise<void> {
+    const token = await getAnalyticsToken();
+    const heartbeatSessionId = crypto.randomUUID();
+    const launchSignature = crypto.randomUUID();
+    const durationMs = hours * 3_600_000;
+
+    const streamProps = {
+        guild_id: location.guildId,
+        channel_id: location.channelId,
+        channel_type: 2
+    };
+
+    function event(type: string, extra: Record<string, unknown>, at: number): Record<string, unknown> {
+        return {
+            type,
+            properties: {
+                client_track_timestamp: at,
+                client_send_timestamp: at,
+                client_heartbeat_session_id: heartbeatSessionId,
+                launch_signature: launchSignature,
+                event_sequence_number: ++sequence,
+                client_app_state: "focused",
+                ...streamProps,
+                ...extra
+            }
+        };
+    }
+
+    const events: Record<string, unknown>[] = [
+        event("media_session_joined", {}, sessionStart),
+        event("video_stream_started", {}, sessionStart)
+    ];
+
+    for (let hour = 1; hour <= hours; hour++) {
+        events.push(event("video_stream_heartbeat", {
+            duration_tracked_ms: 3_600_000,
+            total_duration_ms: hour * 3_600_000
+        }, sessionStart + hour * 3_600_000));
+    }
+
+    events.push(event("video_stream_ended", { duration_ms: durationMs }, sessionStart + durationMs));
+
+    await RestAPI.post({ url: SCIENCE_URL, body: { token, events } });
+    logger.info(`Credited ${hours}h of streaming (backdated)`);
+}

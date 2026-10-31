@@ -317,7 +317,8 @@ export function BadgeFarmerDashboard(): JSX.Element {
                     <div className={cl("intro")}>
                         <span>
                             Pick a mode, start it, leave the client open. Badges land on Discord's nightly pass.
-                            Game Time and Variety finish in minutes; Streaming runs in real time, one hour per hour.
+                            Game Time and Variety finish in minutes. Streaming tries turbo backdating first and
+                            falls back to live streaming if the hours don't register.
                         </span>
                         <span className={cl("muted")}>
                             Requires the "use data to personalize" toggle in Settings → Privacy &amp; Safety. NoTrack
@@ -412,11 +413,12 @@ export function BadgeFarmerDashboard(): JSX.Element {
 
                     <ModeCard
                         title="Streaming"
-                        blurb="Real-time heartbeats, 1 hour of runtime per hour credited."
+                        blurb="Turbo: backdated sessions first, then live for the rest."
                         steps={[
-                            "Join a voice channel and go live with any screenshare. A blank 10fps capture is enough.",
-                            "Have someone watching. An alt account in the channel counts. Hours only register when a viewer is present.",
-                            "Start the run. One heartbeat posts per real minute, so 1 hour of badge credit takes 1 hour of runtime."
+                            "Turbo mode fires backdated 24h sessions chained backward from now, one request each. A 5,000h target posts ~210 requests in under five minutes.",
+                            "If Discord's badge pipeline rejects the backdated hours, the run falls back to live mode automatically: one heartbeat per real minute.",
+                            "For live credit to count, join a voice channel, go live with any capture, and have someone (an alt counts) watching.",
+                            "Check your badge the next day. If turbo hours registered, you're done. If only live hours moved, re-run and let it stream."
                         ]}
                         target={streamTarget}
                         targetPlaceholder="Hours (1-5000)"
