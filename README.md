@@ -69,7 +69,7 @@ Streaming mode works differently, because the streaming badge works differently.
 Discord processes analytics nightly. Expect your badges within 24 hours of a run.
 
 **It's been a day and nothing happened.**
-Check NoTrack (or any request blocker) is off, and that the "share data" toggles in Discord's privacy settings are on. Either one silently kills the analytics requests. The client also needs to stay open for the whole run.
+The "use data to personalize" toggle in Discord's privacy settings must be on, or the events get dropped server-side. The client also needs to stay open for the whole run. NoTrack can stay enabled: its tracking patch only disables Discord's own analytics batching, and this plugin posts straight to `/science`, past that patch.
 
 **Does the streaming badge need an actual stream?**
 Yes. Discord counts stream hours only when someone is watching on the media servers. Join a voice channel, go live with any screenshare (a blank 10fps capture is enough), have an alt or a friend watching it, then start Farm Streaming. The plugin drives the telemetry. Without a viewer registered on the stream, the hours don't count. The "use data to personalize" toggle in privacy settings also needs to be on, or the events get dropped server-side.

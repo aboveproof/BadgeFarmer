@@ -209,8 +209,8 @@ export function BadgeFarmerDashboard(): JSX.Element {
         <div className={cl("dashboard")}>
             {status.notrackBlocked && (
                 <Notice kind="warning">
-                    NoTrack is on and will eat the requests this plugin sends. Turn it off (plus the data sharing
-                    toggles in Discord's privacy settings) until the badges land. You can switch it back after.
+                    NoTrack is enabled. Its tracking patch only disables Discord's own analytics batching, and this
+                    plugin posts straight to /science, so farming still works with it on. No action needed.
                 </Notice>
             )}
 
