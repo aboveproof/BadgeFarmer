@@ -222,11 +222,12 @@ async function runStream(targetHours: number): Promise<void> {
     let turboHours = 0;
     let failedBursts = 0;
 
-    while (running && turboHours + TURBO_SESSION_HOURS <= targetHours) {
+    while (running && turboHours < targetHours) {
+        const sessionHours = Math.min(TURBO_SESSION_HOURS, targetHours - turboHours);
         const sessionEnd = firstSessionEnd - turboHours * 3_600_000;
-        const sessionStart = sessionEnd - TURBO_SESSION_HOURS * 3_600_000;
-        const ok = await withRetry(`Turbo stream session (${TURBO_SESSION_HOURS}h)`, async () => {
-            await creditStreamBackdated(TURBO_SESSION_HOURS, sessionStart, location);
+        const sessionStart = sessionEnd - sessionHours * 3_600_000;
+        const ok = await withRetry(`Turbo stream session (${sessionHours}h)`, async () => {
+            await creditStreamBackdated(sessionHours, sessionStart, location);
         });
         if (!ok) {
             if (++failedBursts >= MAX_FAILED_BURSTS) {
@@ -237,7 +238,7 @@ async function runStream(targetHours: number): Promise<void> {
             continue;
         }
         failedBursts = 0;
-        turboHours += TURBO_SESSION_HOURS;
+        turboHours += sessionHours;
         streamHoursCredited = turboHours;
         notify();
         await sleep(REQUEST_DELAY_MS);
