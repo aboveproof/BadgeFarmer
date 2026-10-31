@@ -1,26 +1,45 @@
 .vc-badge-farmer-dashboard {
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 10px;
+}
+
+.vc-badge-farmer-btn-wrap {
+    white-space: normal;
+    min-width: 0;
 }
 
 .vc-badge-farmer-intro {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    padding: 16px;
+    gap: 4px;
+    padding: 10px 12px;
     border: 1px solid var(--border-subtle);
-    border-radius: 10px;
+    border-radius: 8px;
     background: var(--background-secondary);
+    font-size: 13px;
+    line-height: 18px;
+}
+
+.vc-badge-farmer-modes {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 10px;
 }
 
 .vc-badge-farmer-mode {
     display: flex;
     flex-direction: column;
-    gap: 10px;
-    padding: 16px;
+    gap: 8px;
+    padding: 12px;
     border: 1px solid var(--border-subtle);
-    border-radius: 10px;
+    border-radius: 8px;
+}
+
+.vc-badge-farmer-mode-blurb {
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 16px;
 }
 
 .vc-badge-farmer-mode-head {
@@ -32,34 +51,34 @@
 
 .vc-badge-farmer-mode-tier {
     flex: 0 0 auto;
-    padding: 2px 8px;
+    padding: 1px 7px;
     border-radius: 999px;
     border: 1px solid var(--border-strong);
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 600;
 }
 
 .vc-badge-farmer-mode-progress {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 3px;
 }
 
 .vc-badge-farmer-mode-progress-copy {
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: 11px;
 }
 
 .vc-badge-farmer-mode-steps {
     margin: 0;
-    padding-left: 20px;
+    padding-left: 18px;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 3px;
     color: var(--text-default);
-    font-size: 14px;
-    line-height: 20px;
+    font-size: 13px;
+    line-height: 18px;
 }
 
 .vc-badge-farmer-mode-run {
@@ -72,17 +91,32 @@
 .vc-badge-farmer-mode-field {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    width: 180px;
+    gap: 3px;
+    flex: 1 1 100px;
+    min-width: 0;
 }
 
 .vc-badge-farmer-mode-error {
     color: var(--text-danger);
+    font-size: 11px;
+}
+
+.vc-badge-farmer-mode-toggle {
+    align-self: flex-start;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text-link);
     font-size: 12px;
+    cursor: pointer;
+}
+
+.vc-badge-farmer-mode-toggle:hover {
+    text-decoration: underline;
 }
 
 .vc-badge-farmer-progress-track {
-    height: 6px;
+    height: 5px;
     border-radius: 3px;
     background: var(--background-secondary-alt);
     overflow: hidden;
@@ -98,17 +132,19 @@
 .vc-badge-farmer-game-search {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 6px;
 }
 
 .vc-badge-farmer-game-picked {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 8px;
-    padding: 8px 12px;
+    padding: 6px 10px;
     border: 1px solid var(--border-subtle);
-    border-radius: 8px;
+    border-radius: 6px;
     font-weight: 600;
+    font-size: 13px;
 }
 
 .vc-badge-farmer-game-clear {
@@ -129,7 +165,7 @@
 .vc-badge-farmer-results {
     display: flex;
     flex-direction: column;
-    max-height: 220px;
+    max-height: 180px;
     overflow-y: auto;
     border: 1px solid var(--border-subtle);
     border-radius: 8px;
@@ -156,9 +192,9 @@
 .vc-badge-farmer-result {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 1px;
     min-width: 0;
-    padding: 8px 12px;
+    padding: 6px 10px;
     border: 0;
     color: var(--text-default);
     text-align: left;
@@ -172,6 +208,7 @@
 
 .vc-badge-farmer-result-name {
     font-weight: 600;
+    font-size: 13px;
 }
 
 .vc-badge-farmer-result-meta {
@@ -179,16 +216,16 @@
     color: var(--text-muted);
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 12px;
+    font-size: 11px;
 }
 
 .vc-badge-farmer-run-panel {
     display: flex;
     flex-direction: column;
-    gap: 10px;
-    padding: 16px;
+    gap: 8px;
+    padding: 14px;
     border: 1px solid var(--status-positive);
-    border-radius: 10px;
+    border-radius: 8px;
     background: var(--background-secondary);
 }
 
@@ -203,6 +240,7 @@
 .vc-badge-farmer-run-dot {
     width: 8px;
     height: 8px;
+    flex: 0 0 auto;
     border-radius: 50%;
     background: var(--text-positive);
     animation: vc-badge-farmer-pulse 2s ease-in-out infinite;
@@ -239,16 +277,10 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    padding: 16px;
+    padding: 10px 12px;
     border: 1px solid var(--border-strong);
-    border-radius: 10px;
-}
-
-.vc-badge-farmer-maxall-copy {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-width: 0;
+    border-radius: 8px;
+    font-size: 13px;
 }
 
 .vc-badge-farmer-muted {
@@ -258,5 +290,5 @@
 }
 
 .vc-badge-farmer-footer {
-    padding-top: 4px;
+    padding-top: 2px;
 }

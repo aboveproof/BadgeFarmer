@@ -6,7 +6,6 @@
 
 import { Button } from "@components/Button";
 import { Heading } from "@components/Heading";
-import { Paragraph } from "@components/Paragraph";
 import { Logger } from "@utils/Logger";
 import { useForceUpdater } from "@utils/react";
 import { TextInput, useEffect, useMemo, useState } from "@webpack/common";
@@ -146,6 +145,7 @@ function StatBlock({ label, value, sub }: { label: string; value: string; sub: s
 
 function ModeCard({
     title,
+    blurb,
     steps,
     target,
     targetPlaceholder,
@@ -157,6 +157,7 @@ function ModeCard({
     progress
 }: {
     title: string;
+    blurb: string;
     steps: string[];
     target: string | null;
     targetPlaceholder: string;
@@ -167,6 +168,8 @@ function ModeCard({
     onRun: () => void;
     progress: { name: string; next: string | null; nextAt: number | null; pct: number; unit: string; credited: string; } | null;
 }) {
+    const [showSteps, setShowSteps] = useState(false);
+
     return (
         <div className={cl("mode")}>
             <div className={cl("mode-head")}>
@@ -175,6 +178,8 @@ function ModeCard({
                     <span className={cl("mode-tier")}>{progress.name}</span>
                 )}
             </div>
+
+            <span className={cl("mode-blurb")}>{blurb}</span>
 
             {progress != null && (
                 <div className={cl("mode-progress")}>
@@ -188,10 +193,6 @@ function ModeCard({
                 </div>
             )}
 
-            <ol className={cl("mode-steps")}>
-                {steps.map(step => <li key={step}>{step}</li>)}
-            </ol>
-
             <div className={cl("mode-run")}>
                 {target != null && (
                     <div className={cl("mode-field")}>
@@ -201,12 +202,27 @@ function ModeCard({
                 )}
                 <Button
                     variant="secondary"
+                    className={cl("btn-wrap")}
                     disabled={buttonDisabled}
                     onClick={onRun}
                 >
                     {buttonLabel}
                 </Button>
             </div>
+
+            <button
+                className={cl("mode-toggle")}
+                onClick={() => setShowSteps(open => !open)}
+                aria-expanded={showSteps}
+            >
+                {showSteps ? "Hide steps" : "How does it work?"}
+            </button>
+
+            {showSteps && (
+                <ol className={cl("mode-steps")}>
+                    {steps.map(step => <li key={step}>{step}</li>)}
+                </ol>
+            )}
         </div>
     );
 }
@@ -299,42 +315,15 @@ export function BadgeFarmerDashboard(): JSX.Element {
             ) : (
                 <>
                     <div className={cl("intro")}>
-                        <Heading tag="h3">How this works</Heading>
-                        <Paragraph>
-                            Pick a mode below, start it, and leave the client open. Sessions report to Discord's
-                            analytics in the same format the real client uses, and your badges move on the next
-                            nightly pass. Game Time and Variety finish in minutes because their hours go out in
-                            backdated chunks. Streaming is different: Discord counts one heartbeat per real minute,
-                            so a stream run takes as long as the hours you want.
-                        </Paragraph>
-                        <Paragraph className={cl("muted")}>
-                            Two things must be on for any of this to count: the "use data to personalize" toggle in
-                            Settings → Privacy &amp; Safety, and the client staying open while a run is live. NoTrack
+                        <span>
+                            Pick a mode, start it, leave the client open. Badges land on Discord's nightly pass.
+                            Game Time and Variety finish in minutes; Streaming runs in real time, one hour per hour.
+                        </span>
+                        <span className={cl("muted")}>
+                            Requires the "use data to personalize" toggle in Settings → Privacy &amp; Safety. NoTrack
                             is fine, farming bypasses it.
-                        </Paragraph>
+                        </span>
                     </div>
-
-                    <ModeCard
-                        title="Game Time badge"
-                        steps={[
-                            "Search for the game you want credited. Any game Discord can detect works.",
-                            "Set how many hours you want, up to 5000 for the Eternal tier.",
-                            "Start the run. Hours post in 2-hour chunks and finish in about ten minutes."
-                        ]}
-                        target={timeTarget}
-                        targetPlaceholder="Hours (1-5000)"
-                        onTargetChange={setTimeTarget}
-                        targetError={timeError}
-                        buttonLabel={selected == null ? "Pick a game first" : `Credit ${selected.name}`}
-                        buttonDisabled={selected == null || parsedTimeTarget == null || !catalogueReady}
-                        onRun={() => {
-                            act(() => Farmer.startGameTime(selected!, parsedTimeTarget!));
-                            clearSelectedGame();
-                        }}
-                        progress={status.hoursCreditedThisRun > 0
-                            ? { ...timeProgress, unit: "h", credited: formatHours(status.hoursCreditedThisRun) }
-                            : null}
-                    />
 
                     <div className={cl("game-search")}>
                         <TextInput
@@ -344,7 +333,7 @@ export function BadgeFarmerDashboard(): JSX.Element {
                                 setSelected(null);
                             }}
                             disabled={!catalogueReady && catalogueError == null}
-                            placeholder={apps == null ? "Loading game list..." : "Search 25,000+ games for the Game Time badge"}
+                            placeholder={apps == null ? "Loading game list..." : "Search a game for the Game Time badge"}
                         />
                         {selected != null && (
                             <div className={cl("game-picked")}>
@@ -377,8 +366,33 @@ export function BadgeFarmerDashboard(): JSX.Element {
                         )}
                     </div>
 
+                    <div className={cl("modes")}>
                     <ModeCard
-                        title="Game Variety badge"
+                        title="Game Time"
+                        blurb="Credit hours for one game, up to 5000 (Eternal)."
+                        steps={[
+                            "Search for the game you want credited. Any game Discord can detect works.",
+                            "Set how many hours you want, up to 5000 for the Eternal tier.",
+                            "Start the run. Hours post in 2-hour chunks and finish in about ten minutes."
+                        ]}
+                        target={timeTarget}
+                        targetPlaceholder="Hours (1-5000)"
+                        onTargetChange={setTimeTarget}
+                        targetError={timeError}
+                        buttonLabel={selected == null ? "Pick a game first" : `Credit ${selected.name}`}
+                        buttonDisabled={selected == null || parsedTimeTarget == null || !catalogueReady}
+                        onRun={() => {
+                            act(() => Farmer.startGameTime(selected!, parsedTimeTarget!));
+                            clearSelectedGame();
+                        }}
+                        progress={status.hoursCreditedThisRun > 0
+                            ? { ...timeProgress, unit: "h", credited: formatHours(status.hoursCreditedThisRun) }
+                            : null}
+                    />
+
+                    <ModeCard
+                        title="Game Variety"
+                        blurb="Credit 100 random games. Universalist tier in ~5 min."
                         steps={[
                             "100 random games from Discord's catalog get credited, 2 minutes each.",
                             "Raise the minutes per game if you want sessions to look longer.",
@@ -397,7 +411,8 @@ export function BadgeFarmerDashboard(): JSX.Element {
                     />
 
                     <ModeCard
-                        title="Streaming badge"
+                        title="Streaming"
+                        blurb="Real-time heartbeats, 1 hour of runtime per hour credited."
                         steps={[
                             "Join a voice channel and go live with any screenshare. A blank 10fps capture is enough.",
                             "Have someone watching. An alt account in the channel counts. Hours only register when a viewer is present.",
@@ -414,16 +429,14 @@ export function BadgeFarmerDashboard(): JSX.Element {
                             ? { ...streamProgress, unit: "h", credited: formatHours(status.streamHoursCreditedThisRun) }
                             : null}
                     />
+                    </div>
 
                     <div className={cl("maxall")}>
-                        <div className={cl("maxall-copy")}>
-                            <Heading tag="h4">Run everything</Heading>
-                            <span className={cl("muted")}>
-                                Variety, then Game Time on a random pick, then streaming. The first two finish in
-                                about fifteen minutes, then the stream runs for as long as your target.
-                            </span>
-                        </div>
+                        <span className={cl("muted")}>
+                            Variety, Game Time, then streaming. First two done in ~15 min.
+                        </span>
                         <Button
+                            className={cl("btn-wrap")}
                             disabled={apps == null}
                             onClick={() => act(() => Farmer.maxAll(apps!))}
                         >
