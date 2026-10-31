@@ -10,7 +10,7 @@ import { sleep } from "@utils/misc";
 import type { RunningGame } from "@vencord/discord-types";
 import { FluxDispatcher, SelectedChannelStore } from "@webpack/common";
 
-import { backdateWindowStart, creditPlaytime, creditStreamTime, fingerprintFor, startLiveStream, type StreamLocation } from "./science";
+import { creditPlaytime, fingerprintFor, startLiveStream, type StreamLocation } from "./science";
 
 const logger = new Logger("BadgeFarmer:Farmer");
 
@@ -60,9 +60,9 @@ let varietyIndex = 0;
 let gamesCredited = 0;
 let hoursCredited = 0;
 let streamHoursCredited = 0;
+let streamMinutesCredited = 0;
 let streamBatch = 0;
 let streamBatches = 0;
-let streamCursor = 0;
 let liveSession: ReturnType<typeof startLiveStream> | null = null;
 let liveSessionDone: (() => void) | null = null;
 let errors = 0;
@@ -197,34 +197,39 @@ async function creditVarietySession(game: SpoofedGame, minutes: number): Promise
     gamesCredited++;
 }
 
-const STREAM_SESSION_HOURS = 24;
-
 function currentStreamLocation(): StreamLocation {
     const channelId = SelectedChannelStore.getVoiceChannelId();
     if (typeof channelId === "string" && channelId !== "") {
         return { guildId: "0", channelId };
     }
-    // Synthetic IDs: the badge pipeline reads the event chain, not the room.
+    // Fallback when not in voice. Badge hours count best with a real channel
+    // someone is watching; the event chain still goes out regardless.
     return { guildId: "900000000000000000", channelId: "900000000000000001" };
 }
 
-async function creditStreamChunk(hours: number): Promise<void> {
-    // Tile backward from the cursor, clamped to the backdate window start.
-    const duration = hours * 3_600_000;
-    const windowStart = backdateWindowStart();
-    const end = streamCursor;
-    const start = Math.max(end - duration, windowStart);
-    if (end - start < 60_000) throw new Error("Backdate window exhausted");
-    streamCursor = start;
-    streamBatch = 0;
-    streamBatches = 0;
-    await creditStreamTime(end - start, start, currentStreamLocation(), (batch, total) => {
-        streamBatch = batch;
-        streamBatches = total;
-        notify();
-    });
-    streamHoursCredited += (end - start) / 3_600_000;
-    notify();
+async function runStream(targetHours: number): Promise<void> {
+    // lawerth-style: one live session, one heartbeat per real minute.
+    // No backdating — the badge pipeline counts per-heartbeat minutes.
+    const targetMinutes = Math.round(targetHours * 60);
+    let liveDone: (() => void) | null = null;
+
+    liveSession = startLiveStream(
+        currentStreamLocation(),
+        () => running && streamMinutesCredited < targetMinutes,
+        totalMinutes => {
+            streamMinutesCredited = Math.min(totalMinutes, targetMinutes);
+            streamHoursCredited = streamMinutesCredited / 60;
+            streamBatch = streamMinutesCredited % 60;
+            streamBatches = 60;
+            notify();
+        }
+    );
+    liveSessionDone = () => liveDone?.();
+
+    await new Promise<void>(resolve => { liveDone = resolve; });
+    await liveSession.stop();
+    liveSession = null;
+    liveSessionDone = null;
 }
 
 async function runGameTime(app: { id: string; name: string; exeName: string; }, targetHours: number): Promise<void> {
@@ -259,60 +264,6 @@ async function runVariety(list: SpoofedGame[], minutesPerGame: number): Promise<
     }
 }
 
-async function runStream(targetHours: number): Promise<void> {
-    // Phase 1: tile the last 24h with contiguous backdated sessions.
-    // Sessions chain backward from (now - small offset) in SESSION_HOURS
-    // blocks until the window is exhausted or the target is met.
-    const windowStart = backdateWindowStart();
-    const windowEnd = Date.now() - 5 * 60_000;
-    const windowHours = Math.floor((windowEnd - windowStart) / 3_600_000);
-
-    let credited = 0;
-    let failedBursts = 0;
-
-    const backdateHours = Math.min(windowHours, targetHours);
-    while (running && credited < backdateHours) {
-        const chunk = Math.min(STREAM_SESSION_HOURS, backdateHours - credited);
-        const ok = await withRetry(`Stream session (${chunk}h backdated)`, () => creditStreamChunk(chunk));
-        if (!ok) {
-            if (++failedBursts >= MAX_FAILED_BURSTS) {
-                lastError = "Stopped after repeated failures";
-                return;
-            }
-            continue;
-        }
-        failedBursts = 0;
-        credited += chunk;
-        notify();
-        await sleep(REQUEST_DELAY_MS);
-    }
-
-    if (!running || credited >= targetHours) return;
-
-    // Phase 2: live session. One heartbeat per real minute, exactly like a
-    // genuine broadcast, until the remaining target is met or stopped.
-    const remainingHours = targetHours - credited;
-    let liveDone: () => void = () => { };
-    const done = new Promise<void>(resolve => { liveDone = resolve; });
-
-    liveSession = startLiveStream(
-        currentStreamLocation(),
-        () => running && streamHoursCredited < credited + remainingHours,
-        totalHours => {
-            streamHoursCredited = credited + Math.min(totalHours, remainingHours);
-            streamBatch = Math.round((totalHours % 1) * 60);
-            streamBatches = 60;
-            notify();
-        }
-    );
-    liveSessionDone = liveDone;
-
-    await done;
-    await liveSession.stop();
-    liveSession = null;
-    liveSessionDone = null;
-}
-
 function begin(nextMode: FarmerMode): boolean {
     if (running) return false;
     running = true;
@@ -320,9 +271,9 @@ function begin(nextMode: FarmerMode): boolean {
     gamesCredited = 0;
     hoursCredited = 0;
     streamHoursCredited = 0;
+    streamMinutesCredited = 0;
     streamBatch = 0;
     streamBatches = 0;
-    streamCursor = Date.now() - 5 * 60_000;
     errors = 0;
     lastError = null;
     cursor = Date.now();

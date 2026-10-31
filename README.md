@@ -85,7 +85,8 @@ The badge reads the analytics event chain, not the media servers. Streaming mode
 
 ## Credits
 
-- [Accentaro/gameSessionSpoofer](https://github.com/Accentaro/gameSessionSpoofer) — the science endpoint approach and event schemas this is built on
+- [lawerth/discord-streamer](https://github.com/lawerth/discord-streamer) — the streaming badge telemetry engine this plugin's stream mode is ported from, 1:1. Their research into `media_session_joined` / `video_stream_started` / `video_stream_heartbeat` / `video_stream_ended` event schemas is what makes stream farming work at all. MIT licensed.
+- [Accentaro/gameSessionSpoofer](https://github.com/Accentaro/gameSessionSpoofer) — the science endpoint approach and event schemas for game time
 - [Equicord](https://github.com/Equicord/Equicord) / [Vencord](https://github.com/Vendicated/Vencord) — the platform
 
 ## License

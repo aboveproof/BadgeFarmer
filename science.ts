@@ -160,14 +160,6 @@ function resolveStart(duration: number, startedAt: number | undefined): number {
     return Math.max(startedAt, now - MAX_BACKDATE_MS);
 }
 
-export function backdateWindowEnd(): number {
-    return Date.now();
-}
-
-export function backdateWindowStart(): number {
-    return Date.now() - MAX_BACKDATE_MS + 60_000;
-}
-
 export async function creditPlaytime(game: CreditableGame, durationMs: number, startedAt?: number): Promise<void> {
     const duration = Math.floor(durationMs);
     if (duration < MIN_DURATION_MS) return;
@@ -197,181 +189,120 @@ export interface StreamLocation {
     channelId: string;
 }
 
-const HEARTBEAT_INTERVAL_MS = 60_000;
-const MAX_EVENTS_PER_POST = 50;
-const BATCH_DELAY_MS = 5_000;
-const RATE_LIMIT_DELAY_MS = 60_000;
-
-function streamBase(location: StreamLocation): Record<string, unknown> {
-    return {
-        guild_id: location.guildId,
-        channel_id: location.channelId,
-        channel_type: 2
-    };
-}
-
-export async function creditStreamTime(durationMs: number, startedAt?: number, location?: StreamLocation, onBatch?: (batch: number, total: number) => void): Promise<void> {
-    const duration = Math.floor(durationMs);
-    if (duration < MIN_DURATION_MS) return;
-
-    const token = await getAnalyticsToken();
-    const start = resolveStart(duration, startedAt);
-    const spot = location ?? { guildId: "0", channelId: "0" };
-    const { heartbeatSession, launchSignature } = clientSession();
-
-    function event(type: string, extra: Record<string, unknown>, at: number): Record<string, unknown> {
-        return {
-            type,
-            properties: {
-                client_track_timestamp: at,
-                client_send_timestamp: at,
-                client_heartbeat_session_id: heartbeatSession,
-                launch_signature: launchSignature,
-                event_sequence_number: ++sequence,
-                client_app_state: "focused",
-                ...streamBase(spot),
-                ...extra
-            }
-        };
-    }
-
-    const events: Record<string, unknown>[] = [
-        event("media_session_joined", {}, start),
-        event("video_stream_started", {}, start)
-    ];
-
-    for (let elapsed = HEARTBEAT_INTERVAL_MS; elapsed <= duration; elapsed += HEARTBEAT_INTERVAL_MS) {
-        events.push(event("video_stream_heartbeat", {
-            duration_tracked_ms: HEARTBEAT_INTERVAL_MS,
-            total_duration_ms: elapsed
-        }, start + elapsed));
-    }
-
-    const trailing = duration % HEARTBEAT_INTERVAL_MS;
-    if (trailing >= MIN_DURATION_MS) {
-        events.push(event("video_stream_heartbeat", {
-            duration_tracked_ms: trailing,
-            total_duration_ms: duration
-        }, start + duration));
-    }
-
-    events.push(event("video_stream_ended", { duration_ms: duration }, start + duration));
-
-    // /science rate-limits hard. Pace batches, back off on 429, and resume
-    // instead of failing the whole 24h session and replaying every batch.
-    const batches = Math.ceil(events.length / MAX_EVENTS_PER_POST);
-    for (let offset = 0, batch = 1; offset < events.length; offset += MAX_EVENTS_PER_POST, batch++) {
-        for (let attempt = 0; ; attempt++) {
-            try {
-                await RestAPI.post({
-                    url: SCIENCE_URL,
-                    body: { token, events: events.slice(offset, offset + MAX_EVENTS_PER_POST) }
-                });
-                break;
-            } catch (error) {
-                if (attempt >= 5) throw error;
-                const wait = attempt === 0 ? RATE_LIMIT_DELAY_MS : RATE_LIMIT_DELAY_MS * (attempt + 1);
-                logger.warn(`Science batch ${batch}/${batches} rejected, backing off ${wait / 1000}s`, error);
-                await new Promise(resolve => setTimeout(resolve, wait));
-            }
-        }
-        onBatch?.(batch, batches);
-        if (offset + MAX_EVENTS_PER_POST < events.length) {
-            await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
-        }
-    }
-
-    logger.info(`Credited ${Math.round(duration / 60_000)}m of streaming`);
-}
-
 export interface LiveStreamHandle {
     stop(): Promise<void>;
 }
 
 /**
- * Opens a real-time stream session: joined + started now, then one
- * video_stream_heartbeat per actual minute until stopped, then ended.
- * This is the shape Discord's badge pipeline trusts most, because it
- * matches a genuine live broadcast exactly.
+ * Real-time streaming telemetry, ported 1:1 from lawerth/discord-streamer's
+ * TelemetryService (MIT, https://github.com/lawerth/discord-streamer).
+ * One video_stream_heartbeat per actual minute with a fixed
+ * duration_tracked_ms of 60000, a fresh heartbeat session per stream, and
+ * media_session_joined / video_stream_started / video_stream_ended framing
+ * events. No backdating: the badge pipeline counts per-heartbeat minutes that
+ * arrive in real time, exactly like a genuine broadcast.
+ *
+ * Discord only credits hours when a viewer is registered on the stream, so
+ * pair this with a real voice channel someone (an alt works) is watching.
  */
 export function startLiveStream(
     location: StreamLocation,
     shouldContinue: () => boolean,
-    onHour: (totalHours: number) => void
+    onMinutes: (totalMinutes: number) => void
 ): LiveStreamHandle {
-    const spot = location;
     let stopped = false;
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     let resolveEnd: () => void = () => { };
     const ended = new Promise<void>(resolve => { resolveEnd = resolve; });
 
     void (async () => {
         const token = await getAnalyticsToken();
-        const { heartbeatSession, launchSignature } = clientSession();
-        const gameSession = crypto.randomUUID();
+        const heartbeatSessionId = crypto.randomUUID();
+        const launchSignature = crypto.randomUUID();
+        const streamStartTime = Date.now();
 
-        function event(type: string, extra: Record<string, unknown>, at: number): Record<string, unknown> {
-            return {
-                type,
-                properties: {
-                    client_track_timestamp: at,
-                    client_send_timestamp: at,
-                    client_heartbeat_session_id: heartbeatSession,
-                    launch_signature: launchSignature,
-                    event_sequence_number: ++sequence,
-                    client_app_state: "focused",
-                    game_session_id: gameSession,
-                    ...streamBase(spot),
-                    ...extra
-                }
-            };
-        }
-
-        async function post(events: Record<string, unknown>[]): Promise<boolean> {
-            for (let attempt = 0; attempt < 5; attempt++) {
-                try {
-                    await RestAPI.post({ url: SCIENCE_URL, body: { token, events } });
-                    return true;
-                } catch (error) {
-                    if (attempt === 4) {
-                        logger.error("Live stream heartbeat failed 5 times in a row", error);
-                        return false;
+        async function postScienceEvents(events: Array<{ type: string; properties: Record<string, unknown>; }>): Promise<boolean> {
+            try {
+                await RestAPI.post({
+                    url: SCIENCE_URL,
+                    body: {
+                        token,
+                        events: events.map(ev => ({
+                            type: ev.type,
+                            properties: {
+                                client_track_timestamp: Date.now(),
+                                client_send_timestamp: Date.now(),
+                                client_heartbeat_session_id: heartbeatSessionId,
+                                launch_signature: launchSignature,
+                                event_sequence_number: ++sequence,
+                                client_app_state: "focused",
+                                ...ev.properties
+                            }
+                        }))
                     }
-                    logger.warn(`Live stream heartbeat rejected, retrying in ${RATE_LIMIT_DELAY_MS / 1000}s`, error);
-                    await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
-                }
+                });
+                return true;
+            } catch (error) {
+                logger.warn("Science post rejected", error);
+                return false;
             }
-            return false;
         }
 
-        const start = Date.now();
-        await post([event("media_session_joined", {}, start), event("video_stream_started", {}, start)]);
+        const streamProps = {
+            guild_id: location.guildId,
+            channel_id: location.channelId,
+            channel_type: 2
+        };
+
+        await postScienceEvents([
+            { type: "media_session_joined", properties: { ...streamProps } },
+            { type: "video_stream_started", properties: { ...streamProps } }
+        ]);
 
         let minutes = 0;
         let consecutiveFailures = 0;
-        while (!stopped && shouldContinue()) {
-            await new Promise(resolve => setTimeout(resolve, HEARTBEAT_INTERVAL_MS));
-            if (stopped) break;
 
-            minutes++;
-            const ok = await post([event("video_stream_heartbeat", {
-                duration_tracked_ms: HEARTBEAT_INTERVAL_MS,
-                total_duration_ms: minutes * HEARTBEAT_INTERVAL_MS
-            }, Date.now())]);
-
-            if (!ok) {
-                consecutiveFailures++;
-                if (consecutiveFailures >= 10) {
-                    logger.error("Live stream aborted after 10 consecutive failed heartbeats");
-                    break;
-                }
-            } else {
-                consecutiveFailures = 0;
-                if (minutes % 60 === 0) onHour(minutes / 60);
+        heartbeatTimer = setInterval(async () => {
+            if (stopped) return;
+            if (!shouldContinue()) {
+                resolveEnd();
+                return;
             }
-        }
 
-        await post([event("video_stream_ended", { duration_ms: minutes * HEARTBEAT_INTERVAL_MS }, Date.now())]);
-        onHour(minutes / 60);
+            const totalDurationMs = Date.now() - streamStartTime;
+            const ok = await postScienceEvents([
+                {
+                    type: "video_stream_heartbeat",
+                    properties: {
+                        ...streamProps,
+                        duration_tracked_ms: 60000,
+                        total_duration_ms: totalDurationMs
+                    }
+                }
+            ]);
+
+            if (ok) {
+                consecutiveFailures = 0;
+                minutes++;
+                onMinutes(minutes);
+            } else if (++consecutiveFailures >= 10) {
+                logger.error("Live stream aborted after 10 consecutive failed heartbeats");
+                resolveEnd();
+            }
+        }, 60000);
+
+        await ended;
+
+        if (heartbeatTimer != null) clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+
+        const durationMs = stopped || !shouldContinue() ? Date.now() - streamStartTime : 0;
+        await postScienceEvents([
+            {
+                type: "video_stream_ended",
+                properties: { ...streamProps, duration_ms: durationMs }
+            }
+        ]);
         logger.info(`Live stream session ended after ${minutes}m`);
         resolveEnd();
     })();
@@ -379,6 +310,7 @@ export function startLiveStream(
     return {
         stop(): Promise<void> {
             stopped = true;
+            resolveEnd();
             return ended;
         }
     };
