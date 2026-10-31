@@ -15,15 +15,15 @@
 
 ---
 
-Discord hands out three activity badges now: one for hours played, one for how many different games you've played, and one for hours streamed. The top tier of each sits at 5,000 hours and 100 unique games. Do the math on that and you're looking at a year of your life, minimum, for pixels next to your name.
+Discord hands out three activity badges: one for hours played, one for how many different games you've played, one for hours streamed. The top tier of each sits at 5,000 hours and 100 unique games. Do the math and you're trading a year of your life for pixels next to your name.
 
-This plugin reports finished game sessions to Discord's own analytics endpoint, using the same event format the real client sends when it detects a running game. Hours land on your profile through the normal nightly pipeline. You pick a game, pick a target, click once, and go do something else.
+This plugin reports sessions to Discord's own analytics endpoint, in the same event format the real client uses. Hours land on your profile through the nightly pipeline. You pick a game, pick a target, click once, and go do something else.
 
-Built on the session-spoofing approach from [gameSessionSpoofer](https://github.com/Accentaro/gameSessionSpoofer), pushed to its logical conclusion.
+The game-time engine builds on [gameSessionSpoofer](https://github.com/Accentaro/gameSessionSpoofer). The streaming engine is a 1:1 port of [lawerth/discord-streamer](https://github.com/lawerth/discord-streamer)'s telemetry service.
 
 ## Install
 
-**The short version:** drop the `BadgeFarmer` folder in your userplugins directory, rebuild, restart.
+Drop the `BadgeFarmer` folder into your userplugins directory, rebuild, restart:
 
 ```bash
 # from your Equicord/Vencord clone
@@ -34,7 +34,7 @@ git clone https://github.com/aboveproof/BadgeFarmer.git
 pnpm build
 ```
 
-Then enable it in **Settings → Plugins → BadgeFarmer**. The dashboard lives in the plugin settings.
+Enable it in **Settings → Plugins → BadgeFarmer**. The dashboard lives in the plugin settings.
 
 > Using Vencord instead of Equicord? Same steps. The plugin only touches APIs both forks share.
 
@@ -44,24 +44,24 @@ Then enable it in **Settings → Plugins → BadgeFarmer**. The dashboard lives 
 | --- | --- | --- |
 | **Game Time** | Credits hours for one game you pick, up to 5,000 (Eternal tier) | ~10 min |
 | **Variety** | Credits short sessions across 100 unique detectable games (Universalist tier) | ~5 min |
-| **Streaming** | Backdates 24h of sessions, then live-streams one heartbeat per minute until the target | 24h backdated + 1 min per remaining hour |
-| **Max All** | All three, back to back | 24h backdated + live time |
+| **Streaming** | Sends one heartbeat per minute of real stream time, exactly like a live broadcast | 1 real minute per hour |
+| **Max All** | All three, back to back | ~15 min + live stream time |
 
-Every mode shows a live progress bar for its badge track, so you can watch the numbers climb in real time.
+Game Time and Variety send finished sessions in 2-hour chunks, backdated up to 24 hours and chained without overlap, so 5,000 hours doesn't need 208 days of wall-clock time. Streaming can't be compressed: the badge counts one `video_stream_heartbeat` per actual minute, so the plugin sends one per actual minute. The dashboard shows a live counter while it runs.
+
+The game catalog comes from Discord's public [detectable applications endpoint](https://discord.com/api/v10/applications/detectable) (about 25,000 titles), so every game you credit is one Discord already knows about.
 
 ## How it works
 
-Discord's desktop client tracks detected games through a `RunningGameStore`. When it spots one, it starts sending `launch_game` and `running_game_heartbeat` events to the `/science` analytics endpoint, tagged with a session ID and a duration. The badge pipeline reads those heartbeats nightly and adds the duration to your totals.
+Discord's desktop client tracks detected games through a `RunningGameStore`. When it spots one, it sends `launch_game` and `running_game_heartbeat` events to the `/science` analytics endpoint, tagged with a session ID and a duration. The badge pipeline reads those heartbeats nightly and adds the duration to your totals.
 
 BadgeFarmer does three things:
 
-1. Injects a spoofed game into `RunningGameStore` through the client's own `RUNNING_GAME_SET_DEBUG_GAME` dispatch, so your presence shows the game like normal.
+1. Injects a spoofed game into `RunningGameStore` through the client's own `RUNNING_GAME_SET_DEBUG_GAME` dispatch, so your presence shows the game.
 2. Requests your real analytics token from `/users/@me`.
-3. Sends the same `launch_game` + `running_game_heartbeat` pair the real client sends, with the duration filled in. Streaming mode sends the full `media_session_joined` → `video_stream_started` → `video_stream_heartbeat` (one per minute, carrying `duration_tracked_ms`) → `video_stream_ended` chain, which is what the streaming badge pipeline actually reads. Event schemas match [discord-streamer](https://github.com/lawerth/discord-streamer)'s telemetry engine.
+3. Sends the same `launch_game` + `running_game_heartbeat` pair the real client sends, duration filled in.
 
-Session chunks are backdated up to 24 hours and chained without overlap, so 5,000 hours doesn't need 208 days of wall-clock time. Streaming is the slow one: the badge counts one `video_stream_heartbeat` per minute, so a 24h stream session means ~1,440 events. The plugin paces these in batches of 50 with spacing between posts to stay under Discord's rate limits, which puts a full 5,000-hour run at around two and a half hours of real time. Anything past the 24-hour window gets clamped, which keeps the timestamps inside the range the analytics pipeline accepts.
-
-The game catalog comes straight from Discord's public [detectable applications endpoint](https://discord.com/api/v10/applications/detectable) (about 25,000 titles), so every game you credit is one Discord already knows about.
+Streaming mode works differently, because the streaming badge works differently. It opens a session with `media_session_joined` and `video_stream_started`, then sends one `video_stream_heartbeat` every 60 seconds carrying `duration_tracked_ms: 60000`, then closes with `video_stream_ended`. That cadence matches a genuine broadcast, and the event schemas come straight from [discord-streamer](https://github.com/lawerth/discord-streamer)'s telemetry engine.
 
 ## FAQ
 
@@ -69,25 +69,25 @@ The game catalog comes straight from Discord's public [detectable applications e
 Discord processes analytics nightly. Expect your badges within 24 hours of a run.
 
 **It's been a day and nothing happened.**
-Check three things: NoTrack (or any request blocker) is off, the "share data" toggles in Discord's privacy settings are on, and the client stayed open for the whole run. Any of those three will silently kill the analytics requests.
-
-**Can I pick which games get credited for variety?**
-Variety mode pulls 100 random titles from Discord's catalog. The shuffle is the point, a uniform-looking spread reads far more natural than 100 hand-picked favorites.
-
-**Is this detectable?**
-The events match what the real client sends, including fingerprints and session IDs. With that said, you're sending 5,000 hours of playtime in ten minutes, which no human produces. Discord hasn't acted on this pattern so far. Past performance is not a promise.
-
-**Will this get my account banned?**
-It violates the Terms of Service, same as every client mod. Ban risk from analytics spoofing specifically appears to be zero in practice, but "appears to be" is doing work in that sentence. This is your call to make, not mine.
+Check NoTrack (or any request blocker) is off, and that the "share data" toggles in Discord's privacy settings are on. Either one silently kills the analytics requests. The client also needs to stay open for the whole run.
 
 **Does the streaming badge need an actual stream?**
-The badge reads the analytics event chain, not the media servers. Streaming mode sends `media_session_joined` through `video_stream_ended` with real guild and channel IDs when you're in voice, and synthetic ones otherwise. No voice connection, no capture, no viewer needed. One caveat: Discord's privacy settings page has a "use data to personalize" toggle that must be on for the streamer account, or the events get dropped server-side.
+Yes. Discord counts stream hours only when someone is watching on the media servers. Join a voice channel, go live with any screenshare (a blank 10fps capture is enough), have an alt or a friend watching it, then start Farm Streaming. The plugin drives the telemetry. Without a viewer registered on the stream, the hours don't count. The "use data to personalize" toggle in privacy settings also needs to be on, or the events get dropped server-side.
+
+**Can I pick which games get credited for variety?**
+Variety mode pulls 100 random titles from Discord's catalog. The shuffle is the point. A uniform spread reads more natural than 100 hand-picked favorites.
+
+**Is this detectable?**
+The events match what the real client sends, fingerprints and session IDs included. You're still sending 5,000 hours of playtime in ten minutes, which no human produces. Discord hasn't acted on this pattern so far. Past performance is not a promise.
+
+**Will this get my account banned?**
+It violates the Terms of Service, same as every client mod. Ban risk from analytics spoofing appears to be zero in practice, and "appears to be" is doing work in that sentence. Your call, not mine.
 
 ## Credits
 
-- [lawerth/discord-streamer](https://github.com/lawerth/discord-streamer) — the streaming badge telemetry engine this plugin's stream mode is ported from, 1:1. Their research into `media_session_joined` / `video_stream_started` / `video_stream_heartbeat` / `video_stream_ended` event schemas is what makes stream farming work at all. MIT licensed.
-- [Accentaro/gameSessionSpoofer](https://github.com/Accentaro/gameSessionSpoofer) — the science endpoint approach and event schemas for game time
-- [Equicord](https://github.com/Equicord/Equicord) / [Vencord](https://github.com/Vendicated/Vencord) — the platform
+- [lawerth/discord-streamer](https://github.com/lawerth/discord-streamer) — the streaming telemetry engine, ported 1:1. Their research into the `media_session_joined` / `video_stream_started` / `video_stream_heartbeat` / `video_stream_ended` chain is what makes stream farming work. MIT licensed.
+- [Accentaro/gameSessionSpoofer](https://github.com/Accentaro/gameSessionSpoofer) — the science endpoint approach and game-time event schemas.
+- [Equicord](https://github.com/Equicord/Equicord) / [Vencord](https://github.com/Vendicated/Vencord) — the platform.
 
 ## License
 
