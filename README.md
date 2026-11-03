@@ -17,7 +17,7 @@
 
 Discord hands out three activity badges: one for hours played, one for how many different games you've played, one for hours streamed. The top tier of each sits at 5,000 hours and 100 unique games. Do the math and you're trading a year of your life for pixels next to your name.
 
-This plugin reports sessions to Discord's own analytics endpoint, in the same event format the real client uses. Hours land on your profile through the nightly pipeline. You pick a game, pick a target, click once, and go do something else.
+This plugin reports sessions to Discord's analytics endpoint, in the same event format the real client uses. Hours land on your profile through the nightly pipeline. You pick a game, pick a target, click once, and go do something else.
 
 The game-time engine builds on [gameSessionSpoofer](https://github.com/Accentaro/gameSessionSpoofer). The streaming engine is a 1:1 port of [lawerth/discord-streamer](https://github.com/lawerth/discord-streamer)'s telemetry service.
 
@@ -44,10 +44,14 @@ Enable it in **Settings → Plugins → BadgeFarmer**. The dashboard lives in th
 | --- | --- | --- |
 | **Game Time** | Credits hours for one game you pick, up to 5,000 (Eternal tier) | ~10 min |
 | **Variety** | Credits short sessions across 100 unique detectable games (Universalist tier) | ~5 min |
-| **Streaming** | One heartbeat per minute of real stream time, exactly like a live broadcast | 1 real minute per hour |
-| **Max All** | All three, back to back | ~15 min + live stream time |
+| **Streaming** | Rides your live stream and credits 10h per minute of runtime | 5,000h in ~9 min live |
+| **Max All** | All three, back to back | ~25 min total |
 
-Game Time and Variety send finished sessions in 2-hour chunks, backdated up to 24 hours and chained without overlap, so 5,000 hours doesn't need 208 days of wall-clock time. Streaming can't be compressed: the badge counts one `video_stream_heartbeat` per actual minute, so the plugin sends one per actual minute. The dashboard shows a live counter while it runs.
+Game Time and Variety send finished sessions in 2-hour chunks, backdated up to 24 hours and chained without overlap, so 5,000 hours doesn't need 208 days of wall-clock time.
+
+Streaming works differently, because the streaming badge works differently. Plain fabricated sessions never register: we tested that thoroughly, the requests succeed and the badge ignores every hour. Discord's pipeline validates stream hours against real live sessions on their media servers. So stream mode attaches to an actual live stream. Join a voice channel, go live with any screenshare, have someone watching (an alt account counts), start the run, and each minute of real runtime posts a heartbeat claiming 10 hours against your genuine session. A 5,000h target is 9 minutes of being live.
+
+If you're not live when you start, the run says so and falls back to honest per-minute mode automatically.
 
 The game catalog comes from Discord's public [detectable applications endpoint](https://discord.com/api/v10/applications/detectable) (about 25,000 titles), so every game you credit is one Discord already knows about.
 
@@ -61,18 +65,20 @@ BadgeFarmer does three things:
 2. Requests your real analytics token from `/users/@me`.
 3. Sends the same `launch_game` + `running_game_heartbeat` pair the real client sends, duration filled in.
 
-Streaming mode works differently, because the streaming badge works differently. It opens a session with `media_session_joined` and `video_stream_started`, then sends one `video_stream_heartbeat` every 60 seconds carrying `duration_tracked_ms: 60000`, then closes with `video_stream_ended`. That cadence matches a genuine broadcast, and the event schemas come straight from [discord-streamer](https://github.com/lawerth/discord-streamer)'s telemetry engine.
+For streaming, the plugin reads your actual live stream from `ApplicationStreamingStore` (real guild and channel IDs, real viewer count) and posts `media_session_joined` / `video_stream_started` / `video_stream_heartbeat` / `video_stream_ended` events against it, using the event schemas from [discord-streamer](https://github.com/lawerth/discord-streamer)'s telemetry engine.
+
+When a run hits its target, it stops itself and tells you it finished.
 
 ## FAQ
 
 **How long until badges appear?**
-Discord processes analytics nightly. Expect your badges within 24 hours of a run.
+Discord processes analytics nightly. Expect your badges within 24 hours of a run. Sometimes it takes two or three days.
 
-**It's been a day and nothing happened.**
+**It's been days and nothing happened.**
 The "use data to personalize" toggle in Discord's privacy settings must be on, or the events get dropped server-side. The client also needs to stay open for the whole run. NoTrack can stay enabled: its tracking patch only disables Discord's own analytics batching, and this plugin posts straight to `/science`, past that patch.
 
 **Does the streaming badge need an actual stream?**
-Yes, and it can't be faked with telemetry alone. We tested backdated stream sessions extensively: they post without errors, but the hours never reach the badge. Discord validates streaming against real live media sessions, so the plugin streams for real — voice channel, screenshare, viewer — and sends one heartbeat per actual minute. Join a voice channel, go live with any capture (a blank 10fps loop is enough), have an alt or a friend watching, then start Farm Streaming. The "use data to personalize" toggle in privacy settings also needs to be on, or the events get dropped server-side.
+Yes. Fabricated sessions with no stream behind them never register, no matter what shape you send them in. Go live in a voice channel with any screenshare (a blank 10fps loop is enough) and have a viewer. An alt account in the channel watching the stream counts. Start the run while live and it does the rest.
 
 **Can I pick which games get credited for variety?**
 Variety mode pulls 100 random titles from Discord's catalog. The shuffle is the point. A uniform spread reads more natural than 100 hand-picked favorites.

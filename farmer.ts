@@ -8,7 +8,7 @@ import { isPluginEnabled } from "@api/PluginManager";
 import { Logger } from "@utils/Logger";
 import { sleep } from "@utils/misc";
 import type { RunningGame } from "@vencord/discord-types";
-import { ApplicationStreamingStore,FluxDispatcher, SelectedChannelStore } from "@webpack/common";
+import { ApplicationStreamingStore, FluxDispatcher, SelectedChannelStore, showToast, Toasts } from "@webpack/common";
 
 import { creditPlaytime, fingerprintFor, startLiveStream, startTurboLiveStream, type StreamLocation } from "./science";
 
@@ -44,6 +44,7 @@ export interface FarmerStatus {
     errors: number;
     lastError: string | null;
     notrackBlocked: boolean;
+    finishedMessage: string | null;
 }
 
 export const MAX_TIME_HOURS = 5000;
@@ -67,6 +68,7 @@ let liveSession: ReturnType<typeof startLiveStream> | null = null;
 let liveSessionDone: (() => void) | null = null;
 let errors = 0;
 let lastError: string | null = null;
+let finishedMessage: string | null = null;
 let running = false;
 let abortToken = 0;
 let cursor = 0;
@@ -95,7 +97,8 @@ export function getStatus(): FarmerStatus {
         streamBatches,
         errors,
         lastError,
-        notrackBlocked: isPluginEnabled("NoTrack")
+        notrackBlocked: isPluginEnabled("NoTrack"),
+        finishedMessage
     };
 }
 
@@ -339,10 +342,16 @@ function begin(nextMode: FarmerMode): boolean {
     streamBatches = 0;
     errors = 0;
     lastError = null;
+    finishedMessage = null;
     cursor = Date.now();
     abortToken++;
     notify();
     return true;
+}
+
+function markFinished(message: string): void {
+    finishedMessage = message;
+    showToast(message, Toasts.Type.SUCCESS);
 }
 
 type GameSpec = { id: string; name: string; exeName: string; };
@@ -353,6 +362,9 @@ export async function startGameTime(app: DetectableApp, hours = MAX_TIME_HOURS):
     const token = abortToken;
     try {
         await runGameTime(spec, hours);
+        if (running && hoursCredited >= hours) {
+            markFinished(`Game Time done. ${Math.round(hoursCredited)}h credited to ${spec.name}. Badge updates on the next nightly pass.`);
+        }
     } finally {
         if (token === abortToken) finish();
     }
@@ -365,6 +377,9 @@ export async function startVariety(apps: DetectableApp[], minutesPerGame = DEFAU
     const token = abortToken;
     try {
         await runVariety(varietyList, minutesPerGame);
+        if (running && gamesCredited >= varietyList.length) {
+            markFinished(`Variety done. ${gamesCredited} games credited. Badge updates on the next nightly pass.`);
+        }
     } finally {
         if (token === abortToken) finish();
     }
@@ -375,6 +390,9 @@ export async function startStream(hours = MAX_TIME_HOURS): Promise<void> {
     const token = abortToken;
     try {
         await runStream(hours);
+        if (running && streamHoursCredited >= hours) {
+            markFinished(`Streaming done. ${Math.round(streamHoursCredited)}h credited. Badge updates on the next nightly pass.`);
+        }
     } finally {
         if (token === abortToken) finish();
     }
@@ -394,6 +412,10 @@ export async function maxAll(apps: DetectableApp[]): Promise<void> {
 
         if (running) {
             await runStream(MAX_TIME_HOURS);
+        }
+
+        if (running && gamesCredited >= varietyList.length && hoursCredited >= MAX_TIME_HOURS && streamHoursCredited >= MAX_TIME_HOURS) {
+            markFinished(`All badges done. ${gamesCredited} games, ${Math.round(hoursCredited)}h game time, ${Math.round(streamHoursCredited)}h streaming. Badge updates on the next nightly pass.`);
         }
     } finally {
         if (token === abortToken) finish();

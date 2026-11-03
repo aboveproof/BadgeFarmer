@@ -288,6 +288,13 @@ export function BadgeFarmerDashboard(): JSX.Element {
                 <div className={cl("notice-danger")}>{catalogueError}</div>
             )}
 
+            {!busy && status.finishedMessage != null && (
+                <div className={cl("done-panel")}>
+                    <span className={cl("done-check")}>&#10003;</span>
+                    <span>{status.finishedMessage}</span>
+                </div>
+            )}
+
             {busy && (
                 <div className={cl("run-panel")}>
                     <div className={cl("run-status")}>
