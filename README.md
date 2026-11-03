@@ -44,7 +44,7 @@ Enable it in **Settings → Plugins → BadgeFarmer**. The dashboard lives in th
 | --- | --- | --- |
 | **Game Time** | Credits hours for one game you pick, up to 5,000 (Eternal tier) | ~10 min |
 | **Variety** | Credits short sessions across 100 unique detectable games (Universalist tier) | ~5 min |
-| **Streaming** | Fires backdated 24h sessions chained backward from now (~1 request each), then streams live for whatever remains | ~5 min if backdating counts, else 1 min per hour |
+| **Streaming** | One heartbeat per minute of real stream time, exactly like a live broadcast | 1 real minute per hour |
 | **Max All** | All three, back to back | ~15 min + live stream time |
 
 Game Time and Variety send finished sessions in 2-hour chunks, backdated up to 24 hours and chained without overlap, so 5,000 hours doesn't need 208 days of wall-clock time. Streaming can't be compressed: the badge counts one `video_stream_heartbeat` per actual minute, so the plugin sends one per actual minute. The dashboard shows a live counter while it runs.
@@ -72,7 +72,7 @@ Discord processes analytics nightly. Expect your badges within 24 hours of a run
 The "use data to personalize" toggle in Discord's privacy settings must be on, or the events get dropped server-side. The client also needs to stay open for the whole run. NoTrack can stay enabled: its tracking patch only disables Discord's own analytics batching, and this plugin posts straight to `/science`, past that patch.
 
 **Does the streaming badge need an actual stream?**
-Yes. Discord counts stream hours only when someone is watching on the media servers. Join a voice channel, go live with any screenshare (a blank 10fps capture is enough), have an alt or a friend watching it, then start Farm Streaming. The plugin drives the telemetry. Without a viewer registered on the stream, the hours don't count. The "use data to personalize" toggle in privacy settings also needs to be on, or the events get dropped server-side.
+Yes, and it can't be faked with telemetry alone. We tested backdated stream sessions extensively: they post without errors, but the hours never reach the badge. Discord validates streaming against real live media sessions, so the plugin streams for real — voice channel, screenshare, viewer — and sends one heartbeat per actual minute. Join a voice channel, go live with any capture (a blank 10fps loop is enough), have an alt or a friend watching, then start Farm Streaming. The "use data to personalize" toggle in privacy settings also needs to be on, or the events get dropped server-side.
 
 **Can I pick which games get credited for variety?**
 Variety mode pulls 100 random titles from Discord's catalog. The shuffle is the point. A uniform spread reads more natural than 100 hand-picked favorites.

@@ -317,8 +317,8 @@ export function BadgeFarmerDashboard(): JSX.Element {
                     <div className={cl("intro")}>
                         <span>
                             Pick a mode, start it, leave the client open. Badges land on Discord's nightly pass.
-                            Game Time and Variety finish in minutes. Streaming tries turbo backdating first and
-                            falls back to live streaming if the hours don't register.
+                            Game Time and Variety finish in minutes. Streaming runs in real time and cannot be
+                            sped up: Discord validates it against live media sessions.
                         </span>
                         <span className={cl("muted")}>
                             Requires the "use data to personalize" toggle in Settings → Privacy &amp; Safety. NoTrack
@@ -413,12 +413,12 @@ export function BadgeFarmerDashboard(): JSX.Element {
 
                     <ModeCard
                         title="Streaming"
-                        blurb="Turbo: backdated sessions first, then live for the rest."
+                        blurb="Real time only. Discord validates streams server-side."
                         steps={[
-                            "Turbo mode fires backdated 24h sessions chained backward from now, one request each. A 5,000h target posts ~210 requests in under five minutes.",
-                            "If Discord's badge pipeline rejects the backdated hours, the run falls back to live mode automatically: one heartbeat per real minute.",
-                            "For live credit to count, join a voice channel, go live with any capture, and have someone (an alt counts) watching.",
-                            "Check your badge the next day. If turbo hours registered, you're done. If only live hours moved, re-run and let it stream."
+                            "Backdating was tried and does not work: sessions post fine but the hours never register. The badge counts minutes from real live streams only.",
+                            "Join a voice channel and go live with any screenshare. A blank 10fps capture is enough.",
+                            "Have someone watching. An alt account in the channel counts. Hours only register when a viewer is present.",
+                            "Start the run and leave it going. One heartbeat posts per real minute: 1 hour of badge credit per hour of runtime."
                         ]}
                         target={streamTarget}
                         targetPlaceholder="Hours (1-5000)"

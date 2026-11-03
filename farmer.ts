@@ -10,7 +10,7 @@ import { sleep } from "@utils/misc";
 import type { RunningGame } from "@vencord/discord-types";
 import { FluxDispatcher, SelectedChannelStore } from "@webpack/common";
 
-import { creditPlaytime, creditStreamBackdated, fingerprintFor, startLiveStream, type StreamLocation } from "./science";
+import { creditPlaytime, fingerprintFor, startLiveStream, type StreamLocation } from "./science";
 
 const logger = new Logger("BadgeFarmer:Farmer");
 
@@ -207,57 +207,22 @@ function currentStreamLocation(): StreamLocation {
     return { guildId: "900000000000000000", channelId: "900000000000000001" };
 }
 
-const TURBO_SESSION_HOURS = 24;
-
 async function runStream(targetHours: number): Promise<void> {
-    // Turbo phase: backdated 24h sessions chained backward from now, same
-    // event shapes the live engine sends, one hourly heartbeat each. The
-    // game-time engine credits multi-hour backdated sessions on this pipeline
-    // without a 24h cap, so stream sessions ride the same freedom. 5,000h is
-    // ~210 single requests, done in under five minutes. If Discord's badge
-    // pipeline turns out to reject them, hours stay flat and the live phase
-    // still delivers real credit.
-    const location = currentStreamLocation();
-    const firstSessionEnd = Date.now() - 60_000;
-    let turboHours = 0;
-    let failedBursts = 0;
-
-    while (running && turboHours < targetHours) {
-        const sessionHours = Math.min(TURBO_SESSION_HOURS, targetHours - turboHours);
-        const sessionEnd = firstSessionEnd - turboHours * 3_600_000;
-        const sessionStart = sessionEnd - sessionHours * 3_600_000;
-        const ok = await withRetry(`Turbo stream session (${sessionHours}h)`, async () => {
-            await creditStreamBackdated(sessionHours, sessionStart, location);
-        });
-        if (!ok) {
-            if (++failedBursts >= MAX_FAILED_BURSTS) {
-                lastError = "Turbo backdating rejected. Falling back to live streaming.";
-                logger.warn(lastError);
-                break;
-            }
-            continue;
-        }
-        failedBursts = 0;
-        turboHours += sessionHours;
-        streamHoursCredited = turboHours;
-        notify();
-        await sleep(REQUEST_DELAY_MS);
-    }
-
-    const remainingHours = targetHours - turboHours;
-    if (!running || remainingHours <= 0) return;
-
-    // Live phase: lawerth engine, one heartbeat per real minute, for whatever
-    // is left (partial sessions under 24h, or everything if turbo was rejected).
-    const targetMinutes = Math.round(remainingHours * 60);
+    // Live streaming only. Tested empirically: backdated stream sessions
+    // (minute-granular and hour-granular heartbeats, both) post successfully
+    // but never register on the badge. The streaming pipeline validates
+    // against real media sessions server-side, so the only hours that count
+    // are the ones with a genuine live stream behind them. One heartbeat per
+    // real minute, lawerth engine.
+    const targetMinutes = Math.round(targetHours * 60);
     let liveDone: (() => void) | null = null;
 
     liveSession = startLiveStream(
-        location,
+        currentStreamLocation(),
         () => running && streamMinutesCredited < targetMinutes,
         totalMinutes => {
             streamMinutesCredited = Math.min(totalMinutes, targetMinutes);
-            streamHoursCredited = turboHours + streamMinutesCredited / 60;
+            streamHoursCredited = streamMinutesCredited / 60;
             streamBatch = streamMinutesCredited % 60;
             streamBatches = 60;
             notify();
