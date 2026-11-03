@@ -390,7 +390,7 @@ export function startTurboLiveStream(
         let creditedHours = 0;
         let consecutiveFailures = 0;
 
-        heartbeatTimer = setInterval(async () => {
+        async function tick(): Promise<void> {
             if (stopped) return;
             if (!shouldContinue() || creditedHours >= targetHours) {
                 resolveEnd();
@@ -417,7 +417,12 @@ export function startTurboLiveStream(
                 logger.error("Turbo live aborted after 10 consecutive failed heartbeats");
                 resolveEnd();
             }
-        }, 60_000);
+        }
+
+        // First claim fires immediately so progress is visible right away,
+        // then every 60s after.
+        await tick();
+        heartbeatTimer = setInterval(() => void tick(), 60_000);
 
         await ended;
 
