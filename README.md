@@ -91,4 +91,4 @@ It violates the Terms of Service, same as every client mod. Ban risk from analyt
 
 ## License
 
-GPL-3.0. Do whatever, share it around.
+MIT License
