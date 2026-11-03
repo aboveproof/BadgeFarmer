@@ -207,23 +207,21 @@ function currentStreamLocation(): StreamLocation {
 
 /**
  * Reads the user's actual live stream from ApplicationStreamingStore.
- * Returns the real guild/channel IDs and the viewer count, or null when
- * not currently live.
+ * Stream objects carry channelId/guildId directly. Returns the location and
+ * viewer count, or null when not currently live.
  */
 function activeLiveStream(): { location: StreamLocation; viewers: number; } | null {
     try {
         const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
         if (stream == null) return null;
 
-        const raw = (stream as { streamKey?: string; }).streamKey;
-        if (typeof raw !== "string") return null;
+        const { channelId } = (stream as { channelId?: string; });
+        if (typeof channelId !== "string" || channelId === "") return null;
 
-        // streamKey format: "guild:<guildId>:<channelId>:<userId>"
-        const parts = raw.split(":");
-        if (parts.length < 4) return null;
+        const { guildId } = (stream as { guildId?: string | null; });
 
         const viewers = ApplicationStreamingStore.getViewerIds(stream).length;
-        return { location: { guildId: parts[1], channelId: parts[2] }, viewers };
+        return { location: { guildId: guildId ?? "0", channelId }, viewers };
     } catch (error) {
         logger.warn("Could not read active stream", error);
         return null;
@@ -243,7 +241,7 @@ async function runStream(targetHours: number): Promise<void> {
         logger.info(`Turbo live: real stream with ${live.viewers} viewer(s) detected`);
         let turboDone: (() => void) | null = null;
 
-        liveSession = startTurboLiveStream(
+        const session = startTurboLiveStream(
             live.location,
             targetHours,
             () => running,
@@ -255,17 +253,18 @@ async function runStream(targetHours: number): Promise<void> {
                 notify();
             }
         );
+        liveSession = session;
         liveSessionDone = () => turboDone?.();
 
         await new Promise<void>(resolve => { turboDone = resolve; });
-        await liveSession.stop();
+        await session.stop();
         liveSession = null;
         liveSessionDone = null;
         return;
     }
 
     if (live != null && live.viewers === 0) {
-        lastError = "You are live but nobody is watching. Hours only count with a viewer. Waiting 60s, then falling back to per-minute mode.";
+        lastError = "You are live but nobody is watching. Hours only count with a viewer. Falling back to per-minute mode.";
         logger.warn(lastError);
     } else {
         lastError = "No live stream detected. Turbo requires a real stream. Falling back to per-minute mode.";
@@ -276,7 +275,7 @@ async function runStream(targetHours: number): Promise<void> {
     const targetMinutes = Math.round(targetHours * 60);
     let liveDone: (() => void) | null = null;
 
-    liveSession = startLiveStream(
+    const session = startLiveStream(
         currentStreamLocation(),
         () => running && streamMinutesCredited < targetMinutes,
         totalMinutes => {
@@ -287,10 +286,11 @@ async function runStream(targetHours: number): Promise<void> {
             notify();
         }
     );
+    liveSession = session;
     liveSessionDone = () => liveDone?.();
 
     await new Promise<void>(resolve => { liveDone = resolve; });
-    await liveSession.stop();
+    await session.stop();
     liveSession = null;
     liveSessionDone = null;
 }
