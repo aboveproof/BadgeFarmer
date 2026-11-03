@@ -288,7 +288,7 @@ export function BadgeFarmerDashboard(): JSX.Element {
                 <div className={cl("notice-danger")}>{catalogueError}</div>
             )}
 
-            {busy ? (
+            {busy && (
                 <div className={cl("run-panel")}>
                     <div className={cl("run-status")}>
                         <span className={cl("run-dot")} />
@@ -312,141 +312,139 @@ export function BadgeFarmerDashboard(): JSX.Element {
                         </Button>
                     </div>
                 </div>
-            ) : (
-                <>
-                    <div className={cl("intro")}>
-                        <span>
-                            Pick a mode, start it, leave the client open. Badges land on Discord's nightly pass.
-                            Game Time and Variety finish in minutes. Streaming runs in real time and cannot be
-                            sped up: Discord validates it against live media sessions.
-                        </span>
-                        <span className={cl("muted")}>
-                            Requires the "use data to personalize" toggle in Settings → Privacy &amp; Safety. NoTrack
-                            is fine, farming bypasses it.
-                        </span>
-                    </div>
-
-                    <div className={cl("game-search")}>
-                        <TextInput
-                            value={query}
-                            onChange={value => {
-                                setQuery(value);
-                                setSelected(null);
-                            }}
-                            disabled={!catalogueReady && catalogueError == null}
-                            placeholder={apps == null ? "Loading game list..." : "Search a game for the Game Time badge"}
-                        />
-                        {selected != null && (
-                            <div className={cl("game-picked")}>
-                                <span>{selected.name}</span>
-                                <button
-                                    className={cl("game-clear")}
-                                    onClick={clearSelectedGame}
-                                    aria-label="Clear selected game"
-                                >
-                                    Clear
-                                </button>
-                            </div>
-                        )}
-                        {selected == null && results.length > 0 && (
-                            <div className={cl("results")}>
-                                {results.map(app => (
-                                    <button
-                                        key={app.id}
-                                        className={cl("result")}
-                                        onClick={() => {
-                                            setSelected(app);
-                                            setQuery(app.name);
-                                        }}
-                                    >
-                                        <span className={cl("result-name")}>{app.name}</span>
-                                        <span className={cl("result-meta")}>{Farmer.executableFor(app)} · {app.id}</span>
-                                    </button>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-
-                    <div className={cl("modes")}>
-                    <ModeCard
-                        title="Game Time"
-                        blurb="Credit hours for one game, up to 5000 (Eternal)."
-                        steps={[
-                            "Search for the game you want credited. Any game Discord can detect works.",
-                            "Set how many hours you want, up to 5000 for the Eternal tier.",
-                            "Start the run. Hours post in 2-hour chunks and finish in about ten minutes."
-                        ]}
-                        target={timeTarget}
-                        targetPlaceholder="Hours (1-5000)"
-                        onTargetChange={setTimeTarget}
-                        targetError={timeError}
-                        buttonLabel={selected == null ? "Pick a game first" : `Credit ${selected.name}`}
-                        buttonDisabled={selected == null || parsedTimeTarget == null || !catalogueReady}
-                        onRun={() => {
-                            act(() => Farmer.startGameTime(selected!, parsedTimeTarget!));
-                            clearSelectedGame();
-                        }}
-                        progress={status.hoursCreditedThisRun > 0
-                            ? { ...timeProgress, unit: "h", credited: formatHours(status.hoursCreditedThisRun) }
-                            : null}
-                    />
-
-                    <ModeCard
-                        title="Game Variety"
-                        blurb="Credit 100 random games. Universalist tier in ~5 min."
-                        steps={[
-                            "100 random games from Discord's catalog get credited, 2 minutes each.",
-                            "Raise the minutes per game if you want sessions to look longer.",
-                            "Start the run. The full rotation finishes in about five minutes."
-                        ]}
-                        target={varietyMinutes}
-                        targetPlaceholder="Minutes per game"
-                        onTargetChange={setVarietyMinutes}
-                        targetError={varietyError}
-                        buttonLabel="Run variety rotation"
-                        buttonDisabled={parsedVarietyMinutes == null || apps == null}
-                        onRun={() => act(() => Farmer.startVariety(pickVarietyPool(apps!, 100), parsedVarietyMinutes!))}
-                        progress={status.gamesCreditedThisRun > 0
-                            ? { ...varietyProgress, unit: " games", credited: `${status.gamesCreditedThisRun} games` }
-                            : null}
-                    />
-
-                    <ModeCard
-                        title="Streaming"
-                        blurb="Real time only. Discord validates streams server-side."
-                        steps={[
-                            "Backdating was tried and does not work: sessions post fine but the hours never register. The badge counts minutes from real live streams only.",
-                            "Join a voice channel and go live with any screenshare. A blank 10fps capture is enough.",
-                            "Have someone watching. An alt account in the channel counts. Hours only register when a viewer is present.",
-                            "Start the run and leave it going. One heartbeat posts per real minute: 1 hour of badge credit per hour of runtime."
-                        ]}
-                        target={streamTarget}
-                        targetPlaceholder="Hours (1-5000)"
-                        onTargetChange={setStreamTarget}
-                        targetError={streamError}
-                        buttonLabel="Start streaming telemetry"
-                        buttonDisabled={parsedStreamTarget == null}
-                        onRun={() => act(() => Farmer.startStream(parsedStreamTarget!))}
-                        progress={status.streamHoursCreditedThisRun > 0
-                            ? { ...streamProgress, unit: "h", credited: formatHours(status.streamHoursCreditedThisRun) }
-                            : null}
-                    />
-                    </div>
-
-                    <div className={cl("maxall")}>
-                        <span className={cl("muted")}>
-                            Variety, Game Time, then streaming. First two done in ~15 min.
-                        </span>
-                        <Button
-                            className={cl("btn-wrap")}
-                            disabled={apps == null}
-                            onClick={() => act(() => Farmer.maxAll(apps!))}
-                        >
-                            Max All Badges
-                        </Button>
-                    </div>
-                </>
             )}
+
+            <div className={cl("intro")}>
+                <span>
+                    Pick a mode, start it, leave the client open. Badges land on Discord's nightly pass.
+                    Game Time and Variety finish in minutes. Streaming runs in real time and cannot be
+                    sped up: Discord validates it against live media sessions.
+                </span>
+                <span className={cl("muted")}>
+                    Requires the "use data to personalize" toggle in Settings → Privacy &amp; Safety. NoTrack
+                    is fine, farming bypasses it.
+                </span>
+            </div>
+
+            <div className={cl("game-search")}>
+                <TextInput
+                    value={query}
+                    onChange={value => {
+                        setQuery(value);
+                        setSelected(null);
+                    }}
+                    disabled={busy || !catalogueReady && catalogueError == null}
+                    placeholder={apps == null ? "Loading game list..." : "Search a game for the Game Time badge"}
+                />
+                {selected != null && (
+                    <div className={cl("game-picked")}>
+                        <span>{selected.name}</span>
+                        <button
+                            className={cl("game-clear")}
+                            onClick={clearSelectedGame}
+                            aria-label="Clear selected game"
+                        >
+                            Clear
+                        </button>
+                    </div>
+                )}
+                {selected == null && results.length > 0 && (
+                    <div className={cl("results")}>
+                        {results.map(app => (
+                            <button
+                                key={app.id}
+                                className={cl("result")}
+                                onClick={() => {
+                                    setSelected(app);
+                                    setQuery(app.name);
+                                }}
+                            >
+                                <span className={cl("result-name")}>{app.name}</span>
+                                <span className={cl("result-meta")}>{Farmer.executableFor(app)} · {app.id}</span>
+                            </button>
+                        ))}
+                    </div>
+                )}
+            </div>
+
+            <div className={cl("modes")}>
+                <ModeCard
+                    title="Game Time"
+                    blurb="Credit hours for one game, up to 5000 (Eternal)."
+                    steps={[
+                        "Search for the game you want credited. Any game Discord can detect works.",
+                        "Set how many hours you want, up to 5000 for the Eternal tier.",
+                        "Start the run. Hours post in 2-hour chunks and finish in about ten minutes."
+                    ]}
+                    target={timeTarget}
+                    targetPlaceholder="Hours (1-5000)"
+                    onTargetChange={setTimeTarget}
+                    targetError={timeError}
+                    buttonLabel={selected == null ? "Pick a game first" : `Credit ${selected.name}`}
+                    buttonDisabled={busy || selected == null || parsedTimeTarget == null || !catalogueReady}
+                    onRun={() => {
+                        act(() => Farmer.startGameTime(selected!, parsedTimeTarget!));
+                        clearSelectedGame();
+                    }}
+                    progress={status.hoursCreditedThisRun > 0
+                        ? { ...timeProgress, unit: "h", credited: formatHours(status.hoursCreditedThisRun) }
+                        : null}
+                />
+
+                <ModeCard
+                    title="Game Variety"
+                    blurb="Credit 100 random games. Universalist tier in ~5 min."
+                    steps={[
+                        "100 random games from Discord's catalog get credited, 2 minutes each.",
+                        "Raise the minutes per game if you want sessions to look longer.",
+                        "Start the run. The full rotation finishes in about five minutes."
+                    ]}
+                    target={varietyMinutes}
+                    targetPlaceholder="Minutes per game"
+                    onTargetChange={setVarietyMinutes}
+                    targetError={varietyError}
+                    buttonLabel="Run variety rotation"
+                    buttonDisabled={busy || parsedVarietyMinutes == null || apps == null}
+                    onRun={() => act(() => Farmer.startVariety(pickVarietyPool(apps!, 100), parsedVarietyMinutes!))}
+                    progress={status.gamesCreditedThisRun > 0
+                        ? { ...varietyProgress, unit: " games", credited: `${status.gamesCreditedThisRun} games` }
+                        : null}
+                />
+
+                <ModeCard
+                    title="Streaming"
+                    blurb="Real time only. Discord validates streams server-side."
+                    steps={[
+                        "Backdating was tried and does not work: sessions post fine but the hours never register. The badge counts minutes from real live streams only.",
+                        "Join a voice channel and go live with any screenshare. A blank 10fps capture is enough.",
+                        "Have someone watching. An alt account in the channel counts. Hours only register when a viewer is present.",
+                        "Start the run and leave it going. One heartbeat posts per real minute: 1 hour of badge credit per hour of runtime."
+                    ]}
+                    target={streamTarget}
+                    targetPlaceholder="Hours (1-5000)"
+                    onTargetChange={setStreamTarget}
+                    targetError={streamError}
+                    buttonLabel="Start streaming telemetry"
+                    buttonDisabled={busy || parsedStreamTarget == null}
+                    onRun={() => act(() => Farmer.startStream(parsedStreamTarget!))}
+                    progress={status.streamHoursCreditedThisRun > 0
+                        ? { ...streamProgress, unit: "h", credited: formatHours(status.streamHoursCreditedThisRun) }
+                        : null}
+                />
+            </div>
+
+            <div className={cl("maxall")}>
+                <span className={cl("muted")}>
+                    Variety, Game Time, then streaming. First two done in ~15 min.
+                </span>
+                <Button
+                    className={cl("btn-wrap")}
+                    disabled={busy || apps == null}
+                    onClick={() => act(() => Farmer.maxAll(apps!))}
+                >
+                    Max All Badges
+                </Button>
+            </div>
 
             <div className={cl("footer")}>
                 <span className={cl("muted")}>
