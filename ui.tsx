@@ -413,12 +413,12 @@ export function BadgeFarmerDashboard(): JSX.Element {
 
                 <ModeCard
                     title="Streaming"
-                    blurb="Real time only. Discord validates streams server-side."
+                    blurb="Go live with a viewer: 5,000h claims in ~9 min (test it first)."
                     steps={[
-                        "Backdating was tried and does not work: sessions post fine but the hours never register. The badge counts minutes from real live streams only.",
-                        "Join a voice channel and go live with any screenshare. A blank 10fps capture is enough.",
-                        "Have someone watching. An alt account in the channel counts. Hours only register when a viewer is present.",
-                        "Start the run and leave it going. One heartbeat posts per real minute: 1 hour of badge credit per hour of runtime."
+                        "Join a voice channel, go live with any screenshare, have someone (an alt counts) watching it.",
+                        "Start the run while live. Each real minute posts a heartbeat claiming 10 hours against your genuine stream, so 5,000h takes ~9 minutes of being live.",
+                        "This is the last untested bypass. Backdating without a real stream never registered. Verify with a 100h target first and check your badge tomorrow before running a big number.",
+                        "Not live or no viewer? The run falls back to honest per-minute mode automatically: 1h of runtime per hour credited."
                     ]}
                     target={streamTarget}
                     targetPlaceholder="Hours (1-5000)"

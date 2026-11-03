@@ -315,3 +315,131 @@ export function startLiveStream(
         }
     };
 }
+
+/**
+ * Turbo Live: attaches to your REAL live stream (voice channel + screenshare,
+ * viewer present) and sends catch-up heartbeats covering far more time than
+ * the stream has been up. Each minute of real runtime posts one heartbeat
+ * whose duration_tracked_ms claims hours, so 5,000h of claimed credit takes
+ * ~9 minutes of actually being live.
+ *
+ * This is the only untested attack left. Both earlier failures had no real
+ * stream behind the events; this one rides a genuine live session with real
+ * guild/channel IDs and a registered viewer. If Discord's badge pipeline
+ * validates heartbeat durations against actual stream uptime, the hours
+ * won't register and live-per-minute is the only path. Verify with a small
+ * target (e.g. 100h) and check the badge the next day before running a big
+ * number.
+ */
+export function startTurboLiveStream(
+    location: StreamLocation,
+    targetHours: number,
+    shouldContinue: () => boolean,
+    onHours: (totalHours: number) => void
+): LiveStreamHandle {
+    const HOURS_PER_TICK = 10;
+    let stopped = false;
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    let resolveEnd: () => void = () => { };
+    const ended = new Promise<void>(resolve => { resolveEnd = resolve; });
+
+    void (async () => {
+        const token = await getAnalyticsToken();
+        const heartbeatSessionId = crypto.randomUUID();
+        const launchSignature = crypto.randomUUID();
+        const streamStartTime = Date.now();
+
+        async function postScienceEvents(events: Array<{ type: string; properties: Record<string, unknown>; }>): Promise<boolean> {
+            try {
+                await RestAPI.post({
+                    url: SCIENCE_URL,
+                    body: {
+                        token,
+                        events: events.map(ev => ({
+                            type: ev.type,
+                            properties: {
+                                client_track_timestamp: Date.now(),
+                                client_send_timestamp: Date.now(),
+                                client_heartbeat_session_id: heartbeatSessionId,
+                                launch_signature: launchSignature,
+                                event_sequence_number: ++sequence,
+                                client_app_state: "focused",
+                                ...ev.properties
+                            }
+                        }))
+                    }
+                });
+                return true;
+            } catch (error) {
+                logger.warn("Science post rejected", error);
+                return false;
+            }
+        }
+
+        const streamProps = {
+            guild_id: location.guildId,
+            channel_id: location.channelId,
+            channel_type: 2
+        };
+
+        await postScienceEvents([
+            { type: "media_session_joined", properties: { ...streamProps } },
+            { type: "video_stream_started", properties: { ...streamProps } }
+        ]);
+
+        let creditedHours = 0;
+        let consecutiveFailures = 0;
+
+        heartbeatTimer = setInterval(async () => {
+            if (stopped) return;
+            if (!shouldContinue() || creditedHours >= targetHours) {
+                resolveEnd();
+                return;
+            }
+
+            const claimHours = Math.min(HOURS_PER_TICK, targetHours - creditedHours);
+            const ok = await postScienceEvents([
+                {
+                    type: "video_stream_heartbeat",
+                    properties: {
+                        ...streamProps,
+                        duration_tracked_ms: claimHours * 3_600_000,
+                        total_duration_ms: (creditedHours + claimHours) * 3_600_000
+                    }
+                }
+            ]);
+
+            if (ok) {
+                consecutiveFailures = 0;
+                creditedHours += claimHours;
+                onHours(creditedHours);
+            } else if (++consecutiveFailures >= 10) {
+                logger.error("Turbo live aborted after 10 consecutive failed heartbeats");
+                resolveEnd();
+            }
+        }, 60_000);
+
+        await ended;
+
+        if (heartbeatTimer != null) clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+
+        const durationMs = creditedHours * 3_600_000;
+        await postScienceEvents([
+            {
+                type: "video_stream_ended",
+                properties: { ...streamProps, duration_ms: durationMs }
+            }
+        ]);
+        logger.info(`Turbo live session ended, claimed ${creditedHours}h over ${Math.round((Date.now() - streamStartTime) / 60_000)}m of runtime`);
+        resolveEnd();
+    })();
+
+    return {
+        stop(): Promise<void> {
+            stopped = true;
+            resolveEnd();
+            return ended;
+        }
+    };
+}

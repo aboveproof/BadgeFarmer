@@ -8,9 +8,9 @@ import { isPluginEnabled } from "@api/PluginManager";
 import { Logger } from "@utils/Logger";
 import { sleep } from "@utils/misc";
 import type { RunningGame } from "@vencord/discord-types";
-import { FluxDispatcher, SelectedChannelStore } from "@webpack/common";
+import { ApplicationStreamingStore,FluxDispatcher, SelectedChannelStore } from "@webpack/common";
 
-import { creditPlaytime, fingerprintFor, startLiveStream, type StreamLocation } from "./science";
+import { creditPlaytime, fingerprintFor, startLiveStream, startTurboLiveStream, type StreamLocation } from "./science";
 
 const logger = new Logger("BadgeFarmer:Farmer");
 
@@ -202,18 +202,77 @@ function currentStreamLocation(): StreamLocation {
     if (typeof channelId === "string" && channelId !== "") {
         return { guildId: "0", channelId };
     }
-    // Fallback when not in voice. Badge hours count best with a real channel
-    // someone is watching; the event chain still goes out regardless.
     return { guildId: "900000000000000000", channelId: "900000000000000001" };
 }
 
+/**
+ * Reads the user's actual live stream from ApplicationStreamingStore.
+ * Returns the real guild/channel IDs and the viewer count, or null when
+ * not currently live.
+ */
+function activeLiveStream(): { location: StreamLocation; viewers: number; } | null {
+    try {
+        const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
+        if (stream == null) return null;
+
+        const raw = (stream as { streamKey?: string; }).streamKey;
+        if (typeof raw !== "string") return null;
+
+        // streamKey format: "guild:<guildId>:<channelId>:<userId>"
+        const parts = raw.split(":");
+        if (parts.length < 4) return null;
+
+        const viewers = ApplicationStreamingStore.getViewerIds(stream).length;
+        return { location: { guildId: parts[1], channelId: parts[2] }, viewers };
+    } catch (error) {
+        logger.warn("Could not read active stream", error);
+        return null;
+    }
+}
+
 async function runStream(targetHours: number): Promise<void> {
-    // Live streaming only. Tested empirically: backdated stream sessions
-    // (minute-granular and hour-granular heartbeats, both) post successfully
-    // but never register on the badge. The streaming pipeline validates
-    // against real media sessions server-side, so the only hours that count
-    // are the ones with a genuine live stream behind them. One heartbeat per
-    // real minute, lawerth engine.
+    // Turbo Live: requires a REAL live stream (voice channel + screenshare).
+    // When live, heartbeats claim 10h per real minute against the genuine
+    // session's real guild/channel IDs, so 5,000h needs ~9 minutes of being
+    // live. This is the last untested bypass: both earlier failures had no
+    // real stream behind the events. Verify with a small target first.
+    // Not live (or live with no viewer): honest per-minute live engine.
+    const live = activeLiveStream();
+
+    if (live != null && live.viewers > 0) {
+        logger.info(`Turbo live: real stream with ${live.viewers} viewer(s) detected`);
+        let turboDone: (() => void) | null = null;
+
+        liveSession = startTurboLiveStream(
+            live.location,
+            targetHours,
+            () => running,
+            totalHours => {
+                streamHoursCredited = totalHours;
+                streamMinutesCredited = totalHours * 60;
+                streamBatch = Math.round(totalHours) % 60;
+                streamBatches = 60;
+                notify();
+            }
+        );
+        liveSessionDone = () => turboDone?.();
+
+        await new Promise<void>(resolve => { turboDone = resolve; });
+        await liveSession.stop();
+        liveSession = null;
+        liveSessionDone = null;
+        return;
+    }
+
+    if (live != null && live.viewers === 0) {
+        lastError = "You are live but nobody is watching. Hours only count with a viewer. Waiting 60s, then falling back to per-minute mode.";
+        logger.warn(lastError);
+    } else {
+        lastError = "No live stream detected. Turbo requires a real stream. Falling back to per-minute mode.";
+        logger.warn(lastError);
+    }
+    notify();
+
     const targetMinutes = Math.round(targetHours * 60);
     let liveDone: (() => void) | null = null;
 
