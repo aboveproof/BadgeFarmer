@@ -112,12 +112,17 @@ function ProgressBar({ pct }: { pct: number; }) {
 
 function parseHours(value: string): number | null {
     const parsed = Number(value);
-    return Number.isFinite(parsed) && parsed > 0 && parsed <= 5000 ? parsed : null;
+    return Number.isFinite(parsed) && parsed > 0 && parsed <= 100000 ? parsed : null;
 }
 
 function parseMinutes(value: string): number | null {
     const parsed = Number(value);
     return Number.isFinite(parsed) && parsed >= 1 && parsed <= 1440 ? parsed : null;
+}
+
+function parseGameCount(value: string): number | null {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed >= 1 && parsed <= 1000 ? parsed : null;
 }
 
 function pickVarietyPool(apps: DetectableApp[], count: number): DetectableApp[] {
@@ -151,6 +156,10 @@ function ModeCard({
     targetPlaceholder,
     onTargetChange,
     targetError,
+    extraTarget,
+    extraTargetPlaceholder,
+    onExtraTargetChange,
+    extraTargetError,
     buttonLabel,
     buttonDisabled,
     onRun,
@@ -163,6 +172,10 @@ function ModeCard({
     targetPlaceholder: string;
     onTargetChange: (value: string) => void;
     targetError: string | null;
+    extraTarget?: string | null;
+    extraTargetPlaceholder?: string;
+    onExtraTargetChange?: (value: string) => void;
+    extraTargetError?: string | null;
     buttonLabel: string;
     buttonDisabled: boolean;
     onRun: () => void;
@@ -200,6 +213,12 @@ function ModeCard({
                         {targetError != null && <span className={cl("mode-error")}>{targetError}</span>}
                     </div>
                 )}
+                {extraTarget != null && extraTargetPlaceholder != null && onExtraTargetChange != null && (
+                    <div className={cl("mode-field")}>
+                        <TextInput value={extraTarget} onChange={onExtraTargetChange} placeholder={extraTargetPlaceholder} />
+                        {extraTargetError != null && <span className={cl("mode-error")}>{extraTargetError}</span>}
+                    </div>
+                )}
                 <Button
                     variant="secondary"
                     className={cl("btn-wrap")}
@@ -234,6 +253,7 @@ export function BadgeFarmerDashboard(): JSX.Element {
     const [selected, setSelected] = useState<DetectableApp | null>(null);
     const [timeTarget, setTimeTarget] = useState("5000");
     const [varietyMinutes, setVarietyMinutes] = useState("2");
+    const [varietyCount, setVarietyCount] = useState("100");
     const [streamTarget, setStreamTarget] = useState("5000");
 
     const results = useMemo(() => {
@@ -250,6 +270,7 @@ export function BadgeFarmerDashboard(): JSX.Element {
 
     const parsedTimeTarget = parseHours(timeTarget);
     const parsedVarietyMinutes = parseMinutes(varietyMinutes);
+    const parsedVarietyCount = parseGameCount(varietyCount);
     const parsedStreamTarget = parseHours(streamTarget);
 
     const busy = status.mode !== "IDLE";
@@ -259,9 +280,10 @@ export function BadgeFarmerDashboard(): JSX.Element {
     const varietyProgress = tierProgress(status.gamesCreditedThisRun, VARIETY_TIERS.map(t => ({ name: t.name, at: t.games })));
     const streamProgress = tierProgress(status.streamHoursCreditedThisRun, TIME_TIERS.map(t => ({ name: t.name, at: t.hours })));
 
-    const timeError = parsedTimeTarget == null ? "Enter hours between 1 and 5000." : null;
-    const streamError = parsedStreamTarget == null ? "Enter hours between 1 and 5000." : null;
+    const timeError = parsedTimeTarget == null ? "Enter hours between 1 and 100000." : null;
+    const streamError = parsedStreamTarget == null ? "Enter hours between 1 and 100000." : null;
     const varietyError = parsedVarietyMinutes == null ? "Enter minutes between 1 and 1440." : null;
+    const varietyCountError = parsedVarietyCount == null ? "Enter a game count between 1 and 1000." : null;
 
     function act(action: () => void | Promise<void>) {
         void action();
@@ -377,14 +399,14 @@ export function BadgeFarmerDashboard(): JSX.Element {
             <div className={cl("modes")}>
                 <ModeCard
                     title="Game Time"
-                    blurb="Credit hours for one game, up to 5000 (Eternal)."
+                    blurb="Credit hours for one game. Any target, Eternal is 5000."
                     steps={[
                         "Search for the game you want credited. Any game Discord can detect works.",
-                        "Set how many hours you want, up to 5000 for the Eternal tier.",
-                        "Start the run. Hours post in 2-hour chunks and finish in about ten minutes."
+                        "Set how many hours you want. 5000 is the Eternal tier, higher works too.",
+                        "Start the run. Hours post in 2-hour chunks, roughly 10 minutes per 5000."
                     ]}
                     target={timeTarget}
-                    targetPlaceholder="Hours (1-5000)"
+                    targetPlaceholder="Hours"
                     onTargetChange={setTimeTarget}
                     targetError={timeError}
                     buttonLabel={selected == null ? "Pick a game first" : `Credit ${selected.name}`}
@@ -400,19 +422,23 @@ export function BadgeFarmerDashboard(): JSX.Element {
 
                 <ModeCard
                     title="Game Variety"
-                    blurb="Credit 100 random games. Universalist tier in ~5 min."
+                    blurb="Credit random games. 100 gets Universalist, go higher if you want."
                     steps={[
-                        "100 random games from Discord's catalog get credited, 2 minutes each.",
-                        "Raise the minutes per game if you want sessions to look longer.",
-                        "Start the run. The full rotation finishes in about five minutes."
+                        "Random games from Discord's catalog get credited, one short session each.",
+                        "Set how many games and how long each session claims. 2 minutes each is the sweet spot.",
+                        "100 games finishes in about five minutes. More games, more time."
                     ]}
                     target={varietyMinutes}
                     targetPlaceholder="Minutes per game"
                     onTargetChange={setVarietyMinutes}
                     targetError={varietyError}
+                    extraTarget={varietyCount}
+                    extraTargetPlaceholder="Games"
+                    onExtraTargetChange={setVarietyCount}
+                    extraTargetError={varietyCountError}
                     buttonLabel="Run variety rotation"
-                    buttonDisabled={busy || parsedVarietyMinutes == null || apps == null}
-                    onRun={() => act(() => Farmer.startVariety(pickVarietyPool(apps!, 100), parsedVarietyMinutes!))}
+                    buttonDisabled={busy || parsedVarietyMinutes == null || parsedVarietyCount == null || apps == null}
+                    onRun={() => act(() => Farmer.startVariety(pickVarietyPool(apps!, parsedVarietyCount!), parsedVarietyMinutes!))}
                     progress={status.gamesCreditedThisRun > 0
                         ? { ...varietyProgress, unit: " games", credited: `${status.gamesCreditedThisRun} games` }
                         : null}
@@ -428,7 +454,7 @@ export function BadgeFarmerDashboard(): JSX.Element {
                         "Not live or no viewer? The run falls back to honest per-minute mode automatically: 1h of runtime per hour credited."
                     ]}
                     target={streamTarget}
-                    targetPlaceholder="Hours (1-5000)"
+                    targetPlaceholder="Hours"
                     onTargetChange={setStreamTarget}
                     targetError={streamError}
                     buttonLabel="Start streaming telemetry"
