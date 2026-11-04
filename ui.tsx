@@ -112,7 +112,12 @@ function ProgressBar({ pct }: { pct: number; }) {
 
 function parseHours(value: string): number | null {
     const parsed = Number(value);
-    return Number.isFinite(parsed) && parsed > 0 && parsed <= 100000 ? parsed : null;
+    return Number.isFinite(parsed) && parsed > 0 && parsed <= 1000000 ? parsed : null;
+}
+
+function parseChunkHours(value: string): number | null {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed >= 1 && parsed <= 500 ? parsed : null;
 }
 
 function parseMinutes(value: string): number | null {
@@ -252,6 +257,7 @@ export function BadgeFarmerDashboard(): JSX.Element {
     const [query, setQuery] = useState("");
     const [selected, setSelected] = useState<DetectableApp | null>(null);
     const [timeTarget, setTimeTarget] = useState("5000");
+    const [chunkHours, setChunkHours] = useState("24");
     const [varietyMinutes, setVarietyMinutes] = useState("2");
     const [varietyCount, setVarietyCount] = useState("100");
     const [streamTarget, setStreamTarget] = useState("5000");
@@ -269,6 +275,7 @@ export function BadgeFarmerDashboard(): JSX.Element {
     }, [apps, query, selected]);
 
     const parsedTimeTarget = parseHours(timeTarget);
+    const parsedChunkHours = parseChunkHours(chunkHours);
     const parsedVarietyMinutes = parseMinutes(varietyMinutes);
     const parsedVarietyCount = parseGameCount(varietyCount);
     const parsedStreamTarget = parseHours(streamTarget);
@@ -280,8 +287,9 @@ export function BadgeFarmerDashboard(): JSX.Element {
     const varietyProgress = tierProgress(status.gamesCreditedThisRun, VARIETY_TIERS.map(t => ({ name: t.name, at: t.games })));
     const streamProgress = tierProgress(status.streamHoursCreditedThisRun, TIME_TIERS.map(t => ({ name: t.name, at: t.hours })));
 
-    const timeError = parsedTimeTarget == null ? "Enter hours between 1 and 100000." : null;
-    const streamError = parsedStreamTarget == null ? "Enter hours between 1 and 100000." : null;
+    const timeError = parsedTimeTarget == null ? "Enter hours between 1 and 1000000." : null;
+    const chunkError = parsedChunkHours == null ? "Enter chunk hours between 1 and 500." : null;
+    const streamError = parsedStreamTarget == null ? "Enter hours between 1 and 1000000." : null;
     const varietyError = parsedVarietyMinutes == null ? "Enter minutes between 1 and 1440." : null;
     const varietyCountError = parsedVarietyCount == null ? "Enter a game count between 1 and 1000." : null;
 
@@ -399,20 +407,24 @@ export function BadgeFarmerDashboard(): JSX.Element {
             <div className={cl("modes")}>
                 <ModeCard
                     title="Game Time"
-                    blurb="Credit hours for one game. Any target, Eternal is 5000."
+                    blurb="Credit hours for one game. Any target, no known ceiling."
                     steps={[
                         "Search for the game you want credited. Any game Discord can detect works.",
-                        "Set how many hours you want. 5000 is the Eternal tier, higher works too.",
-                        "Start the run. Hours post in 2-hour chunks, roughly 10 minutes per 5000."
+                        "Set how many hours and how big each chunk claims. People run totals past a million, so the pipeline doesn't hard-reject big numbers.",
+                        "24h chunks finish 5,000h in about four minutes. Smaller chunks look more like real play sessions, bigger ones post faster."
                     ]}
                     target={timeTarget}
                     targetPlaceholder="Hours"
                     onTargetChange={setTimeTarget}
                     targetError={timeError}
+                    extraTarget={chunkHours}
+                    extraTargetPlaceholder="Chunk hours"
+                    onExtraTargetChange={setChunkHours}
+                    extraTargetError={chunkError}
                     buttonLabel={selected == null ? "Pick a game first" : `Credit ${selected.name}`}
-                    buttonDisabled={busy || selected == null || parsedTimeTarget == null || !catalogueReady}
+                    buttonDisabled={busy || selected == null || parsedTimeTarget == null || parsedChunkHours == null || !catalogueReady}
                     onRun={() => {
-                        act(() => Farmer.startGameTime(selected!, parsedTimeTarget!));
+                        act(() => Farmer.startGameTime(selected!, parsedTimeTarget!, parsedChunkHours!));
                         clearSelectedGame();
                     }}
                     progress={status.hoursCreditedThisRun > 0

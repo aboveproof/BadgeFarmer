@@ -47,10 +47,11 @@ export interface FarmerStatus {
     finishedMessage: string | null;
 }
 
-export const MAX_TIME_HOURS = 5000;
+export const MAX_TIME_HOURS = 1000000;
 export const MAX_VARIETY_GAMES = 100;
 export const DEFAULT_VARIETY_MINUTES = 2;
-const CHUNK_HOURS = 2;
+export const DEFAULT_CHUNK_HOURS = 24;
+const MAX_CHUNK_HOURS = 500;
 const REQUEST_DELAY_MS = 600;
 const RETRY_DELAY_MS = 3_000;
 
@@ -298,11 +299,12 @@ async function runStream(targetHours: number): Promise<void> {
     liveSessionDone = null;
 }
 
-async function runGameTime(app: { id: string; name: string; exeName: string; }, targetHours: number): Promise<void> {
+async function runGameTime(app: { id: string; name: string; exeName: string; }, targetHours: number, chunkHours = DEFAULT_CHUNK_HOURS): Promise<void> {
     let credited = 0;
     let failedBursts = 0;
+    const chunkSize = Math.min(Math.max(1, chunkHours), MAX_CHUNK_HOURS);
     while (running && credited < targetHours) {
-        const chunk = Math.min(CHUNK_HOURS, targetHours - credited);
+        const chunk = Math.min(chunkSize, targetHours - credited);
         const game = activeGame ?? buildGame(app, cursor);
         showGame(game);
         const ok = await withRetry(`Game time chunk (${chunk}h ${game.name})`, () => creditGameChunk(game, chunk));
@@ -356,12 +358,12 @@ function markFinished(message: string): void {
 
 type GameSpec = { id: string; name: string; exeName: string; };
 
-export async function startGameTime(app: DetectableApp, hours = MAX_TIME_HOURS): Promise<void> {
+export async function startGameTime(app: DetectableApp, hours = MAX_TIME_HOURS, chunkHours = DEFAULT_CHUNK_HOURS): Promise<void> {
     const spec: GameSpec = { id: app.id, name: app.name, exeName: executableFor(app) };
     if (!begin("GAME_TIME")) return;
     const token = abortToken;
     try {
-        await runGameTime(spec, hours);
+        await runGameTime(spec, hours, chunkHours);
         if (running && hoursCredited >= hours) {
             markFinished(`Game Time done. ${Math.round(hoursCredited)}h credited to ${spec.name}. Badge updates on the next nightly pass.`);
         }
