@@ -6,7 +6,8 @@
 
 [![Equicord userplugin](https://img.shields.io/badge/Equicord-userplugin-5865F2?logo=discord&logoColor=white)](https://github.com/Equicord/Equicord)
 [![Vencord compatible](https://img.shields.io/badge/Vencord-userplugin-ED4245?logo=vencord&logoColor=white)](https://github.com/Vendicated/Vencord)
-[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+[![Mobile](https://img.shields.io/badge/Mobile-console%20edition-34C759?logo=ios&logoColor=white)](#mobile)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](../../pulls)
 
 [Install](#install) · [How it works](#how-it-works) · [Modes](#modes) · [FAQ](#faq)
@@ -37,6 +38,21 @@ pnpm build
 Enable it in **Settings → Plugins → BadgeFarmer**. The dashboard lives in the plugin settings.
 
 > Using Vencord instead of Equicord? Same steps. The plugin only touches APIs both forks share.
+
+## Mobile
+
+There's no native Kettu or Snowcord plugin here, and that's deliberate: those mods use a completely different plugin API (Bunny-family manifests, metro module access) from Vencord's webpack layer, so the Equicord plugin can't just be dropped in. What works instead is [`console.js`](console.js), a self-contained script that runs in any client with a JavaScript console — Kettu's eval command, Revenge/Bunny dev tools, or desktop DevTools. It finds the session token on its own, falls back to a manual `BadgeFarmer.token = "..."` if it can't, and drives the same three engines:
+
+```js
+BadgeFarmer.gameTime("Dota 2", 5000)  // game time, backdated chunks
+BadgeFarmer.variety()                 // 100 random games
+BadgeFarmer.stream(100)               // live heartbeats, go live with a viewer first
+BadgeFarmer.maxAll()
+BadgeFarmer.stop()
+BadgeFarmer.status
+```
+
+Everything runs in the foreground of that client, so on iOS keep the app open while it works.
 
 ## Modes
 
