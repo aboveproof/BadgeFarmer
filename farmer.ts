@@ -8,7 +8,7 @@ import { isPluginEnabled } from "@api/PluginManager";
 import { Logger } from "@utils/Logger";
 import { sleep } from "@utils/misc";
 import type { RunningGame } from "@vencord/discord-types";
-import { ApplicationStreamingStore, FluxDispatcher, SelectedChannelStore, showToast, Toasts } from "@webpack/common";
+import { ApplicationStreamingStore, FluxDispatcher, SelectedChannelStore, showToast } from "@webpack/common";
 
 import { creditPlaytime, fingerprintFor, startLiveStream, startTurboLiveStream, type StreamLocation } from "./science";
 
@@ -353,7 +353,10 @@ function begin(nextMode: FarmerMode): boolean {
 
 function markFinished(message: string): void {
     finishedMessage = message;
-    showToast(message, Toasts.Type.SUCCESS);
+    // Vencord mainline and Equicord both take an options object; older
+    // Vencord forks take (message, type). Pass the object, which current
+    // builds on both forks accept.
+    showToast({ text: message, variant: "success" });
 }
 
 type GameSpec = { id: string; name: string; exeName: string; };
