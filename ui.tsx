@@ -6,7 +6,6 @@
 
 import { Button } from "@components/Button";
 import { Heading } from "@components/Heading";
-import { Logger } from "@utils/Logger";
 import { useForceUpdater } from "@utils/react";
 import { TextInput, useEffect, useMemo, useState } from "@webpack/common";
 import type { JSX } from "react";
@@ -18,8 +17,6 @@ const cl = (name: string) => `vc-badge-farmer-${name}`;
 
 const DETECTABLE_APPS_URL = "https://discord.com/api/v10/applications/detectable";
 const MAX_RESULTS = 30;
-
-const logger = new Logger("BadgeFarmer:Dashboard");
 
 let cataloguePromise: Promise<DetectableApp[]> | null = null;
 
@@ -141,16 +138,6 @@ function pickVarietyPool(apps: DetectableApp[], count: number): DetectableApp[] 
 
 function formatHours(hours: number): string {
     return hours >= 10 ? `${Math.round(hours)}h` : `${(Math.round(hours * 10) / 10)}h`;
-}
-
-function StatBlock({ label, value, sub }: { label: string; value: string; sub: string | null; }) {
-    return (
-        <div className={cl("stat")}>
-            <span className={cl("stat-label")}>{label}</span>
-            <span className={cl("stat-value")}>{value}</span>
-            {sub != null && <span className={cl("stat-sub")}>{sub}</span>}
-        </div>
-    );
 }
 
 function ModeCard({
@@ -304,7 +291,7 @@ export function BadgeFarmerDashboard(): JSX.Element {
 
     const statusLine = busy
         ? status.mode === "STREAM"
-            ? `Streaming live · ${formatHours(status.streamHoursCreditedThisRun)} credited`
+            ? `Streaming live · ${formatHours(status.streamHoursCreditedThisRun)} streamed`
             : status.mode === "VARIETY"
                 ? `Rotating games · ${status.gamesCreditedThisRun}/${status.varietyTotal} done`
                 : status.mode === "GAME_TIME"
@@ -458,12 +445,12 @@ export function BadgeFarmerDashboard(): JSX.Element {
 
                 <ModeCard
                     title="Streaming"
-                    blurb="Go live with a viewer: 5,000h claims in ~9 min (test it first)."
+                    blurb="Real Go Live through Discord's own media engine, hour by hour."
                     steps={[
-                        "Join a voice channel, go live with any screenshare, have someone (an alt counts) watching it.",
-                        "Start the run while live. Each real minute posts a heartbeat claiming 10 hours against your genuine stream, so 5,000h takes ~9 minutes of being live.",
-                        "This is the last untested bypass. Backdating without a real stream never registered. Verify with a 100h target first and check your badge tomorrow before running a big number.",
-                        "Not live or no viewer? The run falls back to honest per-minute mode automatically: 1h of runtime per hour credited."
+                        "Join a voice channel first, then start the run. The plugin clicks Go Live for you using the client's own stream pipeline, so the broadcast is 100% real to Discord's servers.",
+                        "Bring a viewer. An alt account sitting in the channel counts. Hours do not register without one, Discord checks.",
+                        "Runs hour by hour in real time: 1h of badge credit per hour live. The plugin auto-rotates the stream every 4 hours before Discord's 5 hour cutoff.",
+                        "Keep the client open the whole time. Badge progress syncs within 24 to 48 hours."
                     ]}
                     target={streamTarget}
                     targetPlaceholder="Hours"
