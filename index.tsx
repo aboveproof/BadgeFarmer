@@ -6,13 +6,16 @@
 
 import "./styles.css";
 
+import { HeaderBarButton } from "@api/HeaderBar";
 import { definePluginSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
+import { useForceUpdater } from "@utils/react";
 import definePlugin, { OptionType } from "@utils/types";
 import { onceReady } from "@webpack";
+import { useEffect } from "@webpack/common";
 
-import { maxAll, stop as stopFarmer } from "./farmer";
-import { BadgeFarmerDashboard, loadCatalogue } from "./ui";
+import { getStatus, maxAll, stop as stopFarmer, subscribe } from "./farmer";
+import { BadgeFarmerDashboard, BadgeIcon, loadCatalogue, openBadgeFarmerModal } from "./ui";
 
 const logger = new Logger("BadgeFarmer");
 
@@ -22,7 +25,12 @@ const settings = definePluginSettings({
     dashboard: {
         type: OptionType.COMPONENT,
         description: "Badge Farmer dashboard",
-        component: BadgeFarmerDashboard
+        component: () => <BadgeFarmerDashboard />
+    },
+    headerButton: {
+        type: OptionType.BOOLEAN,
+        description: "Show a badge button in the top right header bar",
+        default: true
     },
     autoStartMaxAll: {
         type: OptionType.BOOLEAN,
@@ -30,6 +38,26 @@ const settings = definePluginSettings({
         default: false
     }
 });
+
+function HeaderBadgeButton() {
+    const { headerButton } = settings.use(["headerButton"]);
+    const forceUpdate = useForceUpdater();
+    useEffect(() => subscribe(forceUpdate), [forceUpdate]);
+    const status = getStatus();
+    const busy = status.mode !== "IDLE";
+
+    if (!headerButton) return null;
+
+    return (
+        <HeaderBarButton
+            className="vc-badge-farmer-header-btn"
+            onClick={() => void openBadgeFarmerModal()}
+            tooltip={busy ? "Badge Farmer (Running)" : "Badge Farmer"}
+            icon={BadgeIcon}
+            selected={busy}
+        />
+    );
+}
 
 export default definePlugin({
     name: "BadgeFarmer",
@@ -40,7 +68,14 @@ export default definePlugin({
     }],
     tags: ["Activity", "Customisation", "Utility"],
     searchTerms: ["badges", "farm", "game time", "game variety", "streaming"],
+    dependencies: ["HeaderBarAPI"],
     settings,
+
+    headerBarButton: {
+        icon: BadgeIcon,
+        render: HeaderBadgeButton,
+        priority: 50
+    },
 
     start() {
         enabled = true;

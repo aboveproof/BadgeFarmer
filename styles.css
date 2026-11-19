@@ -645,6 +645,18 @@
     }
 }
 
+.vc-badge-farmer-modal-body {
+    padding: 0 4px 12px;
+}
+
+.vc-badge-farmer-root-modal {
+    gap: 12px;
+}
+
+.vc-badge-farmer-header-btn-busy {
+    color: var(--bf-positive) !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
     .vc-badge-farmer-live,
     .vc-badge-farmer-done,

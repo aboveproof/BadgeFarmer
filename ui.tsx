@@ -7,7 +7,8 @@
 import { Button } from "@components/Button";
 import { classNameFactory } from "@utils/css";
 import { useForceUpdater } from "@utils/react";
-import { useEffect, useMemo, useRef, useState } from "@webpack/common";
+import type { RenderModalProps } from "@vencord/discord-types";
+import { Modal, openModal, useEffect, useMemo, useRef, useState } from "@webpack/common";
 import type { JSX, KeyboardEvent, ReactNode } from "react";
 
 import type { DetectableApp, FarmerStatus } from "./farmer";
@@ -415,7 +416,7 @@ function StartButton({ label, eta, disabled, onClick }: { label: string; eta: st
     );
 }
 
-export function BadgeFarmerDashboard(): JSX.Element {
+export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; } = {}): JSX.Element {
     const { apps, error: catalogueError } = useCatalogue();
     const status = useFarmerStatus();
 
@@ -439,14 +440,16 @@ export function BadgeFarmerDashboard(): JSX.Element {
         + Math.ceil(Farmer.ETERNAL_HOURS / Farmer.DEFAULT_CHUNK_HOURS) * SECONDS_PER_REQUEST;
 
     return (
-        <div className={cl("root")}>
-            <header className={cl("header")}>
-                <div>
-                    <h2 className={cl("title")}>Badge Farmer</h2>
-                    <p className={cl("subtitle")}>Pick a badge and leave Discord open while it runs.</p>
-                </div>
-                <span className={cl("status", { "status-on": busy })}>{busy ? "Running" : "Idle"}</span>
-            </header>
+        <div className={cl("root", { "root-modal": isModal })}>
+            {!isModal && (
+                <header className={cl("header")}>
+                    <div>
+                        <h2 className={cl("title")}>Badge Farmer</h2>
+                        <p className={cl("subtitle")}>Pick a badge and leave Discord open while it runs.</p>
+                    </div>
+                    <span className={cl("status", { "status-on": busy })}>{busy ? "Running" : "Idle"}</span>
+                </header>
+            )}
 
             {busy && <LiveCard status={status} />}
             {!busy && <DoneCard message={status.finishedMessage} error={status.finishedMessage == null ? status.lastError : null} />}
@@ -561,4 +564,45 @@ export function BadgeFarmerDashboard(): JSX.Element {
             </p>
         </div>
     );
+}
+
+export function BadgeIcon({ width = 20, height = 20, className }: { width?: number; height?: number; className?: string; }) {
+    return (
+        <svg
+            width={width}
+            height={height}
+            viewBox="0 0 24 24"
+            fill="none"
+            className={className}
+        >
+            <path
+                d="M12 2L4.5 5.5V11.5C4.5 16.5 7.7 20.8 12 22C16.3 20.8 19.5 16.5 19.5 11.5V5.5L12 2Z"
+                fill="currentColor"
+                fillOpacity="0.2"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+            />
+            <path
+                d="M12 6.8L13.4 9.6L16.5 10.1L14.2 12.3L14.8 15.4L12 13.9L9.2 15.4L9.8 12.3L7.5 10.1L10.6 9.6L12 6.8Z"
+                fill="currentColor"
+            />
+        </svg>
+    );
+}
+
+export function openBadgeFarmerModal() {
+    return openModal((props: RenderModalProps) => (
+        <Modal
+            {...props}
+            size="lg"
+            title="Badge Farmer"
+            subtitle="Pick a badge and leave Discord open while it runs."
+        >
+            <div className={cl("modal-body")}>
+                <BadgeFarmerDashboard isModal />
+            </div>
+        </Modal>
+    ));
 }
