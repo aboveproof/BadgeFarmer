@@ -7,12 +7,13 @@
 import { Logger } from "@utils/Logger";
 import type { RunningGame } from "@vencord/discord-types";
 import { findByPropsLazy, findStoreLazy } from "@webpack";
-import { RestAPI } from "@webpack/common";
+import { RestAPI, UserStore } from "@webpack/common";
 
 const SCIENCE_URL = "/science";
 const ME_URL = "/users/@me";
-const TOKEN_MAX_AGE = 12 * 60 * 60 * 1_000;
+const TOKEN_MAX_AGE_MS = 12 * 60 * 60 * 1_000;
 const MIN_DURATION_MS = 60_000;
+const MAX_BACKDATE_MS = 24 * 60 * 60 * 1_000;
 
 const SuperProperties: { getSuperProperties(): Record<string, unknown>; } = findByPropsLazy("getSuperProperties");
 const RunningGameStore: {
@@ -29,8 +30,15 @@ export interface CreditableGame {
     exeName: string;
 }
 
-let analyticsToken = "";
-let analyticsTokenFetchedAt = 0;
+interface CachedToken {
+    userId: string;
+    token: string;
+    fetchedAt: number;
+}
+
+// Keyed to the account that fetched it. Without the user check, switching
+// accounts would keep posting sessions with the previous account's token.
+let cachedToken: CachedToken | null = null;
 let sequence = Math.floor(Math.random() * 100_000);
 const fingerprints = new Map<string, string>();
 
@@ -52,15 +60,20 @@ export function fingerprintFor(gameId: string): string {
 }
 
 async function getAnalyticsToken(): Promise<string> {
-    if (analyticsToken !== "" && Date.now() - analyticsTokenFetchedAt < TOKEN_MAX_AGE) return analyticsToken;
+    const userId = UserStore.getCurrentUser()?.id;
+    if (userId == null) throw new Error("You need to be logged in.");
+
+    if (cachedToken != null && cachedToken.userId === userId && Date.now() - cachedToken.fetchedAt < TOKEN_MAX_AGE_MS) {
+        return cachedToken.token;
+    }
 
     const { body } = await RestAPI.get({ url: ME_URL, query: { with_analytics_token: true } });
-    if (typeof body?.analytics_token !== "string") throw new Error("Discord returned no analytics_token");
+    const token = body?.analytics_token;
+    if (typeof token !== "string" || token === "") throw new Error("Discord didn't send an analytics token.");
+    if (body?.id !== userId) throw new Error("You switched accounts mid-request. Start the run again.");
 
-    analyticsToken = body.analytics_token;
-    analyticsTokenFetchedAt = Date.now();
-
-    return analyticsToken;
+    cachedToken = { userId, token, fetchedAt: Date.now() };
+    return token;
 }
 
 function clientSession(): { heartbeatSession: string; launchSignature: string; locale: string; } {
@@ -71,10 +84,12 @@ function clientSession(): { heartbeatSession: string; launchSignature: string; l
         logger.warn("Could not read the client's super properties", error);
     }
 
+    const text = (value: unknown) => typeof value === "string" && value !== "" ? value : null;
+
     return {
-        heartbeatSession: properties.client_heartbeat_session_id as string ?? crypto.randomUUID(),
-        launchSignature: properties.launch_signature as string ?? crypto.randomUUID(),
-        locale: properties.system_locale as string ?? "en-US"
+        heartbeatSession: text(properties.client_heartbeat_session_id) ?? crypto.randomUUID(),
+        launchSignature: text(properties.launch_signature) ?? crypto.randomUUID(),
+        locale: text(properties.system_locale) ?? "en-US"
     };
 }
 
@@ -152,22 +167,21 @@ function buildHeartbeat(game: CreditableGame, durationMs: number, gameSession: s
     };
 }
 
-const MAX_BACKDATE_MS = 24 * 60 * 60 * 1_000;
-
-function resolveStart(duration: number, startedAt: number | undefined): number {
-    const now = Date.now();
-    if (startedAt == null) return Math.max(now - duration, now - MAX_BACKDATE_MS);
-    return Math.max(startedAt, now - MAX_BACKDATE_MS);
-}
-
-export async function creditPlaytime(game: CreditableGame, durationMs: number, startedAt?: number): Promise<void> {
+/** Throws when Discord rejects the request, so callers can retry. */
+export async function creditPlaytime(game: CreditableGame, durationMs: number, startedAt: number): Promise<void> {
     const duration = Math.floor(durationMs);
-    if (duration < MIN_DURATION_MS) return;
+    if (!Number.isFinite(duration) || duration < MIN_DURATION_MS) {
+        throw new Error("Sessions shorter than a minute don't count.");
+    }
+
+    const now = Date.now();
+    // Discord ignores events older than a day, and events stamped in the future look broken.
+    const start = Math.min(Math.max(startedAt, now - MAX_BACKDATE_MS), now - MIN_DURATION_MS);
+    const end = Math.min(start + duration, now);
 
     const fingerprint = fingerprintFor(game.id);
     const token = await getAnalyticsToken();
     const gameSession = crypto.randomUUID();
-    const start = resolveStart(duration, startedAt);
 
     await RestAPI.post({
         url: SCIENCE_URL,
@@ -176,15 +190,10 @@ export async function creditPlaytime(game: CreditableGame, durationMs: number, s
             events: [
                 buildHeartbeat(game, 0, gameSession, true, start),
                 buildLaunch(game, fingerprint, start),
-                buildHeartbeat(game, duration, gameSession, false, start + duration)
+                buildHeartbeat(game, duration, gameSession, false, end)
             ]
         }
     });
 
-    logger.info(`Credited ${Math.round(duration / 60_000)}m of ${game.name}`);
-}
-
-export interface StreamLocation {
-    guildId: string;
-    channelId: string;
+    logger.info(`Sent ${Math.round(duration / 60_000)} minutes of ${game.name}`);
 }

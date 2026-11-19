@@ -16,22 +16,24 @@ import { BadgeFarmerDashboard, loadCatalogue } from "./ui";
 
 const logger = new Logger("BadgeFarmer");
 
+let enabled = false;
+
 const settings = definePluginSettings({
     dashboard: {
         type: OptionType.COMPONENT,
-        description: "Farming dashboard",
+        description: "Badge Farmer dashboard",
         component: BadgeFarmerDashboard
     },
     autoStartMaxAll: {
         type: OptionType.BOOLEAN,
-        description: "Run Max All on client start",
+        description: "Run All three each time Discord starts",
         default: false
     }
 });
 
 export default definePlugin({
     name: "BadgeFarmer",
-    description: "Credited Game Time, Game Variety, and Streaming hours straight to Discord's analytics. One click, every tier.",
+    description: "Earns Discord's activity badges for you. Pick a game and a target, then leave the client open.",
     authors: [{
         name: "rico",
         id: 1361736124858630274n
@@ -41,15 +43,17 @@ export default definePlugin({
     settings,
 
     start() {
+        enabled = true;
         if (!settings.store.autoStartMaxAll) return;
-        onceReady.then(() =>
-            loadCatalogue().then(
-                apps => void maxAll(apps),
-                error => logger.error("Auto max-all could not load the game list", error)
-            ));
+        onceReady
+            .then(loadCatalogue)
+            // The plugin may have been turned off while the game list loaded.
+            .then(apps => enabled ? maxAll(apps) : undefined)
+            .catch(error => logger.error("All three couldn't start on launch", error));
     },
 
     stop() {
+        enabled = false;
         stopFarmer();
     }
 });

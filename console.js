@@ -1,18 +1,19 @@
+/*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 /**
- * BadgeFarmer Console Edition — mobile + desktop
+ * BadgeFarmer Console Edition: mobile and desktop
  *
- * Runs anywhere Discord's JS console exists: Kettu's eval command,
- * Revenge/Bunny dev tools, desktop DevTools. No webpack, no plugin API.
- * Talks straight to Discord's REST + science endpoints with the session
- * token, so it works on modded mobile IPAs where the Equicord plugin
- * can't run.
+ * Runs wherever Discord has a JavaScript console. Talks directly to
+ * Discord's REST and science endpoints with your session token.
  *
- * Game Time and Variety: backdated session chunks, same engine as the
- * Equicord plugin. Streaming: live heartbeats (lawerth's telemetry shape)
- * — go live with a viewer first, or those hours won't count.
+ * Game Time and Variety use backdated session chunks. Streaming uses
+ * live heartbeats: join a voice channel with a viewer first.
  *
- * MIT. Telemetry schemas from lawerth/discord-streamer, game-time engine
- * from Accentaro/gameSessionSpoofer via aboveproof/BadgeFarmer.
+ * General credits to the Discord modding community.
  */
 (() => {
     const API = "https://discord.com/api/v9";
@@ -115,7 +116,6 @@
             { type: "running_game_heartbeat", properties: baseProps({ game_id: game.id, game_name: game.name, game_executable: game.exeName, initial_heartbeat: false, final_heartbeat: true, game_session_id: session, duration_tracked_ms: durationMs }) }
         ];
         // rewrite timestamps onto the session window
-        const now = Date.now();
         for (const ev of events) {
             ev.properties.client_track_timestamp = start;
             ev.properties.client_send_timestamp = start + durationMs;
@@ -139,7 +139,7 @@
                 state.creditedHours += chunk;
                 log(`${state.creditedHours}/${hours}h credited`, true);
             } catch (e) {
-                log(`chunk failed: ${e.message} — retrying in 5s`);
+                log(`chunk failed: ${e.message}, retrying in 5s`);
                 await sleep(5000);
             }
             await sleep(800);
@@ -171,7 +171,7 @@
         log(`Variety done: ${state.gamesCredited} games. Badge updates on the next nightly pass.`, true);
     }
 
-    // ---- Streaming (live per-minute heartbeats, lawerth's shape) ----
+    // Streaming: live per-minute heartbeats
 
     async function farmStream(hours) {
         await ensureAuth();
@@ -181,7 +181,7 @@
         const target = hours * 60;
         const streamProps = { guild_id: "0", channel_id: "0", channel_type: 2 };
 
-        log(`Streaming: ${hours}h target. Go live with a viewer NOW — 1h per real hour.`);
+        log(`Streaming: ${hours}h target. Go live with a viewer now (1h per real hour).`);
         await postScience([
             { type: "media_session_joined", properties: baseProps({ ...streamProps }) },
             { type: "video_stream_started", properties: baseProps({ ...streamProps }) }
@@ -200,7 +200,7 @@
                 fails = 0;
                 if (state.streamMinutes % 30 === 0) log(`${state.streamMinutes}/${target}min credited`, true);
             } catch (e) {
-                if (++fails >= 10) { log("10 straight failures — aborting"); break; }
+                if (++fails >= 10) { log("10 straight failures, aborting"); break; }
             }
         }
 

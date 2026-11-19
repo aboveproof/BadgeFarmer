@@ -4,29 +4,44 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { isPluginEnabled } from "@api/PluginManager";
+import { IS_WINDOWS } from "@utils/constants";
 import { Logger } from "@utils/Logger";
 import { sleep } from "@utils/misc";
-import type { RunningGame } from "@vencord/discord-types";
+import type { Channel, RunningGame } from "@vencord/discord-types";
 import { findByCodeLazy } from "@webpack";
-import { ApplicationStreamingStore, ChannelStore, FluxDispatcher, SelectedChannelStore, showToast } from "@webpack/common";
+import {
+    ApplicationStreamingStore,
+    ChannelStore,
+    FluxDispatcher,
+    MediaEngineStore,
+    PermissionsBits,
+    PermissionStore,
+    SelectedChannelStore,
+    showToast
+} from "@webpack/common";
 
-import { creditPlaytime, fingerprintFor, type StreamLocation } from "./science";
+import { creditPlaytime, fingerprintFor } from "./science";
 
-const logger = new Logger("BadgeFarmer:Farmer");
+const logger = new Logger("BadgeFarmer");
 
-interface StreamSourceInfo {
-    sourceId: string;
-    sourceName: string;
-    sourceIcon?: string;
-    sourcePid?: number | null;
+interface DesktopSource {
+    id: string;
+    name: string;
 }
 
-// The client's own Go Live entry point. It performs permission checks,
-// negotiates the stream with the media servers, and starts the real
-// capture pipeline. This is the exact call the Go Live button makes.
-const startStreamWithSource = findByCodeLazy("no user or channel") as
-    (source: StreamSourceInfo | number, opts?: { sound?: boolean; soundshareEnabled?: boolean; }) => Promise<[boolean, string | undefined]>;
+interface StreamOptions {
+    pid: number | null;
+    sourceId: string;
+    sourceName: string;
+    audioSourceId: string | null;
+    sound: boolean;
+    previewDisabled: boolean;
+}
+
+// The same action creators Discord's Go Live button calls.
+const startStream: (guildId: string | null, channelId: string, options: StreamOptions) => void = findByCodeLazy('type:"STREAM_START"');
+const stopStream: (streamKey: string) => void = findByCodeLazy('type:"STREAM_STOP"');
+const getDesktopSources: (engine: unknown, isWindows: boolean, types: string[], options: null) => Promise<DesktopSource[] | null> = findByCodeLazy("desktop sources");
 
 export interface DetectableApp {
     id: string;
@@ -43,76 +58,125 @@ export interface SpoofedGame extends Omit<RunningGame, "distributor"> {
     start: number;
 }
 
+interface GameSpec {
+    id: string;
+    name: string;
+    exeName: string;
+}
+
 export type FarmerMode = "IDLE" | "GAME_TIME" | "VARIETY" | "STREAM" | "MAX_ALL";
 
 export interface FarmerStatus {
     mode: FarmerMode;
     activeGame: SpoofedGame | null;
-    varietyIndex: number;
-    varietyTotal: number;
-    gamesCreditedThisRun: number;
-    hoursCreditedThisRun: number;
-    streamHoursCreditedThisRun: number;
-    streamBatch: number;
-    streamBatches: number;
+    hoursCredited: number;
+    hoursTarget: number;
+    gamesCredited: number;
+    gamesTarget: number;
+    streamHours: number;
+    streamTarget: number;
+    streamViewers: number | null;
     errors: number;
     lastError: string | null;
-    notrackBlocked: boolean;
     finishedMessage: string | null;
 }
 
-export const MAX_TIME_HOURS = 1000000;
-export const MAX_VARIETY_GAMES = 100;
-export const DEFAULT_VARIETY_MINUTES = 2;
+export const ETERNAL_HOURS = 5_000;
+export const UNIVERSALIST_GAMES = 100;
+export const MAX_TARGET_HOURS = 1_000_000;
+export const MAX_CHUNK_HOURS = 500;
 export const DEFAULT_CHUNK_HOURS = 24;
-const MAX_CHUNK_HOURS = 500;
+export const DEFAULT_VARIETY_MINUTES = 2;
+
+const MIN_CHUNK_MS = 60_000;
+const MAX_BACKDATE_MS = 24 * 60 * 60 * 1_000;
 const REQUEST_DELAY_MS = 600;
 const RETRY_DELAY_MS = 3_000;
+const MAX_FAILED_CHUNKS = 5;
+
+// Discord cuts streams off at 5 hours, so the farm restarts at 4.
+const STREAM_ROTATE_MS = 4 * 60 * 60 * 1_000;
+const STREAM_REJOIN_GAP_MS = 3_000;
+const STREAM_TICK_MS = 15_000;
+const STREAM_START_TIMEOUT_MS = 10_000;
+const STREAM_RESTART_LIMIT = 3;
 
 let mode: FarmerMode = "IDLE";
 let activeGame: SpoofedGame | null = null;
-let varietyList: SpoofedGame[] = [];
-let varietyIndex = 0;
-let gamesCredited = 0;
 let hoursCredited = 0;
-let streamHoursCredited = 0;
-let streamMinutesCredited = 0;
-let streamBatch = 0;
-let streamBatches = 0;
+let hoursTarget = 0;
+let gamesCredited = 0;
+let gamesTarget = 0;
+let streamHours = 0;
+let streamTarget = 0;
+let streamViewers: number | null = null;
 let errors = 0;
 let lastError: string | null = null;
 let finishedMessage: string | null = null;
+
 let running = false;
-let abortToken = 0;
+let runId = 0;
 let cursor = 0;
+let ownsStream = false;
 
 const listeners = new Set<() => void>();
 
 export function subscribe(listener: () => void): () => void {
     listeners.add(listener);
-    return () => listeners.delete(listener);
+    return () => void listeners.delete(listener);
 }
 
 function notify(): void {
-    for (const listener of listeners) listener();
+    for (const listener of listeners) {
+        try {
+            listener();
+        } catch (error) {
+            logger.error("Status listener threw", error);
+        }
+    }
 }
 
 export function getStatus(): FarmerStatus {
     return {
         mode,
         activeGame,
-        varietyIndex: varietyIndex < varietyList.length ? varietyIndex : varietyList.length,
-        varietyTotal: varietyList.length,
-        gamesCreditedThisRun: gamesCredited,
-        hoursCreditedThisRun: hoursCredited,
-        streamHoursCreditedThisRun: streamHoursCredited,
-        streamBatch,
-        streamBatches,
+        hoursCredited,
+        hoursTarget,
+        gamesCredited,
+        gamesTarget,
+        streamHours,
+        streamTarget,
+        streamViewers,
         errors,
         lastError,
-        notrackBlocked: isPluginEnabled("NoTrack"),
         finishedMessage
     };
+}
+
+export function isRunning(): boolean {
+    return running;
+}
+
+export function dismissFinished(): void {
+    if (running) return;
+    finishedMessage = null;
+    lastError = null;
+    notify();
+}
+
+/** A run stays alive until Stop is pressed or a newer run replaces it. */
+function alive(id: number): boolean {
+    return running && id === runId;
+}
+
+function describeError(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    if (error != null && typeof error === "object") {
+        const { body, status } = error as { body?: { message?: unknown; }; status?: unknown; };
+        if (typeof body?.message === "string") return body.message;
+        if (typeof status === "number") return `Discord answered with HTTP ${status}`;
+    }
+    return String(error);
 }
 
 export function executableFor(app: DetectableApp): string {
@@ -121,11 +185,26 @@ export function executableFor(app: DetectableApp): string {
         ?? executables.find(entry => entry.os === "win32")
         ?? executables[0];
 
-    return (executable?.name.replace(/^>/, "") ?? `${app.name}.exe`).replace(/^.*[\\/]/, "");
+    const fallback = `${app.name.replace(/[<>:"/\\|?*]/g, "").trim() || "game"}.exe`;
+    return (executable?.name.replace(/^>/, "") ?? fallback).replace(/^.*[\\/]/, "") || fallback;
 }
 
-export function buildGame(app: { id: string; name: string; exeName: string; }, startedAt: number): SpoofedGame {
-    const folder = app.name.replace(/[<>:"/\\|?*]/g, "").toLowerCase();
+function specFor(app: DetectableApp): GameSpec {
+    return { id: app.id, name: app.name, exeName: executableFor(app) };
+}
+
+export function shuffled<T>(items: readonly T[], count = items.length): T[] {
+    const pool = [...items];
+    const take = Math.min(count, pool.length);
+    for (let index = 0; index < take; index++) {
+        const picked = index + Math.floor(Math.random() * (pool.length - index));
+        [pool[index], pool[picked]] = [pool[picked], pool[index]];
+    }
+    return pool.slice(0, take);
+}
+
+function buildGame(app: GameSpec, startedAt: number): SpoofedGame {
+    const folder = app.name.replace(/[<>:"/\\|?*]/g, "").trim().toLowerCase() || "game";
     const pid = 10_000 + Math.floor(Math.random() * 40_000);
 
     return {
@@ -148,277 +227,314 @@ export function buildGame(app: { id: string; name: string; exeName: string; }, s
     };
 }
 
-function setDebugGame(game: SpoofedGame | null): void {
+function showGame(game: SpoofedGame | null): void {
+    if (game != null) fingerprintFor(game.id);
+    activeGame = game;
     FluxDispatcher.dispatch({ type: "RUNNING_GAME_SET_DEBUG_GAME", game });
 }
 
-function showGame(game: SpoofedGame): void {
-    fingerprintFor(game.id);
-    activeGame = game;
-    setDebugGame(game);
+/** Hands out back-to-back time slots within Discord's 24-hour window so sessions do not overlap. */
+function nextSlotStart(durationMs: number): number {
+    const floor = Date.now() - MAX_BACKDATE_MS;
+    if (cursor - durationMs < floor) {
+        cursor = Date.now() - Math.floor(Math.random() * 60_000);
+    }
+    cursor -= durationMs;
+    return Math.max(cursor, floor);
 }
 
-function clearGame(): void {
-    activeGame = null;
-    setDebugGame(null);
+function retryDelayMs(error: unknown): number {
+    if (error != null && typeof error === "object") {
+        const retryAfter = (error as { body?: { retry_after?: unknown; }; }).body?.retry_after;
+        if (typeof retryAfter === "number" && retryAfter > 0) {
+            return Math.min(Math.ceil(retryAfter * 1_000), 30_000);
+        }
+    }
+    return RETRY_DELAY_MS;
 }
 
-interface Slot {
-    start: number;
-    end: number;
-}
-
-function nextSlot(durationMs: number): Slot {
-    const end = cursor;
-    const start = end - durationMs;
-    cursor = start;
-    return { start, end };
-}
-
-async function withRetry(label: string, action: () => Promise<void>): Promise<boolean> {
-    for (let attempt = 0; attempt < 3 && running; attempt++) {
+async function withRetry(id: number, label: string, action: () => Promise<void>): Promise<boolean> {
+    for (let attempt = 1; attempt <= 3 && alive(id); attempt++) {
         try {
             await action();
             return true;
         } catch (error) {
             errors++;
-            lastError = String(error);
-            logger.error(`${label} failed (attempt ${attempt + 1})`, error);
-            if (attempt < 2) await sleep(RETRY_DELAY_MS);
+            lastError = describeError(error);
+            logger.error(`${label} failed on attempt ${attempt}`, error);
+            notify();
+            if (attempt < 3) await sleep(retryDelayMs(error));
         }
     }
     return false;
 }
 
-const MAX_FAILED_BURSTS = 5;
-
-function shuffled<T>(items: T[]): T[] {
-    const pool = [...items];
-    for (let index = pool.length - 1; index > 0; index--) {
-        const picked = Math.floor(Math.random() * (index + 1));
-        [pool[index], pool[picked]] = [pool[picked], pool[index]];
-    }
-    return pool;
-}
-
-async function creditGameChunk(game: SpoofedGame, hours: number): Promise<void> {
-    const slot = nextSlot(hours * 3_600_000);
-    await creditPlaytime(game, hours * 3_600_000, slot.start);
-    hoursCredited += hours;
-}
-
-async function creditVarietySession(game: SpoofedGame, minutes: number): Promise<void> {
-    const slot = nextSlot(minutes * 60_000);
-    await creditPlaytime(game, minutes * 60_000, slot.start);
-    gamesCredited++;
-}
-
-/**
- * Reads the user's actual live stream from ApplicationStreamingStore.
- * Stream objects carry channelId/guildId directly. Returns the location and
- * viewer count, or null when not currently live.
- */
-function activeLiveStream(): { location: StreamLocation; viewers: number; } | null {
-    try {
-        const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
-        if (stream == null) return null;
-
-        const { channelId } = (stream as { channelId?: string; });
-        if (typeof channelId !== "string" || channelId === "") return null;
-
-        const { guildId } = (stream as { guildId?: string | null; });
-
-        const viewers = ApplicationStreamingStore.getViewerIds(stream).length;
-        return { location: { guildId: guildId ?? "0", channelId }, viewers };
-    } catch (error) {
-        logger.warn("Could not read active stream", error);
-        return null;
-    }
-}
-
-/**
- * Client-native Go Live streaming. Research across every working tool
- * (BadgeMaxxer at 283 stars, discord-streamer, the badge-spoofers) says the
- * same thing: the streaming badge validates REAL media sessions server-side.
- * Science telemetry alone never counts. The winning approach is a genuine
- * Go Live stream kept alive hour by hour, with a viewer in the channel.
- *
- * This implementation drives Discord's own media engine: the same
- * startStreamWithSource call the Go Live button makes, the real capture
- * pipeline, the real voice connection. Every frame is genuine from the
- * server's perspective. The stream claims a screen source, so what gets
- * broadcast is whatever the capture pipeline picks up. A frozen or near
- * black screen still registers as a live media session.
- *
- * Discord ends streams at the 5 hour mark, so we rotate: stop, brief gap,
- * go live again. Hours accumulate across segments.
- */
-const STREAM_ROTATE_MS = 4 * 60 * 60 * 1_000;
-const STREAM_REJOIN_GAP_MS = 3_000;
-const STREAM_RECREATE_LIMIT = 3;
-
-function currentVoiceChannel(): { guildId: string | null; channelId: string; } | null {
-    const channelId = SelectedChannelStore.getVoiceChannelId();
-    if (typeof channelId !== "string" || channelId === "") return null;
-    const channel = ChannelStore.getChannel(channelId);
-    const guildId = channel != null
-        ? ((channel as unknown as { getGuildId?: () => string; }).getGuildId?.() ?? (channel as unknown as { guild_id?: string }).guild_id ?? null)
-        : null;
-    return { guildId: guildId ?? null, channelId };
-}
-
-async function goLiveOnce(): Promise<boolean> {
-    const [ok, reason] = await startStreamWithSource({
-        sourceId: "entire-screen",
-        sourceName: "Screen 1"
-    });
-    if (!ok) {
-        logger.warn(`Go Live refused: ${reason ?? "unknown reason"}`);
-        return false;
-    }
-    return true;
-}
-
-function stopLive(): void {
-    const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
-    if (stream == null) return;
-    const channelId = (stream as { channelId?: string; }).channelId ?? "";
-    const guildId = (stream as { guildId?: string | null; }).guildId ?? null;
-    const ownerId = (stream as { ownerId?: string; }).ownerId ?? "";
-    if (guildId == null) return;
-    // STREAM_STOP dispatch through the client's own action creator
-    FluxDispatcher.dispatch({
-        type: "STREAM_STOP",
-        streamKey: `guild:${guildId}:${channelId}:${ownerId}`,
-        appContext: "APP"
-    });
-}
-
-async function runStream(targetHours: number): Promise<void> {
-    const targetMs = targetHours * 3_600_000;
-    const startedAt = Date.now();
-    let segmentStart = Date.now();
-    let recreates = 0;
-
-    const voice = currentVoiceChannel();
-    if (voice == null) {
-        lastError = "Join a voice channel first, then start the stream farm. Hours only count while live with a viewer watching.";
-        logger.warn(lastError);
-        notify();
-        return;
-    }
-
-    logger.info(`Stream farm: go live in ${voice.channelId}, target ${targetHours}h`);
-    notify();
-
-    while (running && Date.now() - startedAt < targetMs) {
-        // Go live if we're not already
-        const current = activeLiveStream();
-        if (current == null) {
-            if (recreates >= STREAM_RECREATE_LIMIT) {
-                lastError = "Go Live kept failing. Check stream permissions in this channel and try again.";
-                logger.error(lastError);
-                break;
-            }
-            const ok = await goLiveOnce();
-            if (!ok) {
-                recreates++;
-                await sleep(5_000);
-                continue;
-            }
-            recreates = 0;
-            segmentStart = Date.now();
-            logger.info("Go Live active");
-        }
-
-        // Rotate before Discord's 5h cutoff kills the stream
-        const segmentAge = Date.now() - segmentStart;
-        if (segmentAge >= STREAM_ROTATE_MS) {
-            logger.info("4h segment done, rotating stream before the 5h limit");
-            stopLive();
-            await sleep(STREAM_REJOIN_GAP_MS);
-            continue;
-        }
-
-        // Track progress + verify the stream is still alive
-        const check = activeLiveStream();
-        if (check != null) {
-            streamHoursCredited = (Date.now() - startedAt) / 3_600_000;
-            streamMinutesCredited = Math.round((Date.now() - startedAt) / 60_000);
-            streamBatch = streamMinutesCredited % 60;
-            streamBatches = 60;
-            if (check.viewers === 0) {
-                lastError = "Nobody is watching. Hours only count with a viewer in the channel. Bring an alt.";
-            } else if (lastError?.startsWith("Nobody is watching")) {
-                lastError = null;
-            }
-        } else {
-            // Stream died unexpectedly; the loop's go-live step will restart it
-            recreates++;
-        }
-
-        notify();
-        await sleep(30_000);
-    }
-
-    if (running) {
-        stopLive();
-    }
-    streamHoursCredited = Math.min((Date.now() - startedAt) / 3_600_000, targetHours);
-    notify();
-    logger.info(`Stream farm ended at ${streamHoursCredited.toFixed(2)}h`);
-}
-
-async function runGameTime(app: { id: string; name: string; exeName: string; }, targetHours: number, chunkHours = DEFAULT_CHUNK_HOURS): Promise<void> {
-    let credited = 0;
-    let failedBursts = 0;
+async function runGameTime(id: number, app: GameSpec, targetHours: number, chunkHours: number): Promise<void> {
     const chunkSize = Math.min(Math.max(1, chunkHours), MAX_CHUNK_HOURS);
-    while (running && credited < targetHours) {
-        const chunk = Math.min(chunkSize, targetHours - credited);
-        const game = activeGame ?? buildGame(app, cursor);
-        showGame(game);
-        const ok = await withRetry(`Game time chunk (${chunk}h ${game.name})`, () => creditGameChunk(game, chunk));
+    const game = buildGame(app, cursor);
+    let failures = 0;
+
+    hoursTarget = targetHours;
+    showGame(game);
+    notify();
+
+    while (alive(id) && hoursCredited < targetHours) {
+        const chunk = Math.min(chunkSize, targetHours - hoursCredited);
+        const chunkMs = chunk * 3_600_000;
+        // Discord drops sessions shorter than a minute, so a leftover sliver never counts.
+        if (chunkMs < MIN_CHUNK_MS) break;
+
+        const slotStart = nextSlotStart(chunkMs);
+        const ok = await withRetry(id, `${chunk}h chunk for ${game.name}`, async () => {
+            await creditPlaytime(game, chunkMs, slotStart);
+        });
+        if (!alive(id)) return;
+
         if (!ok) {
-            if (++failedBursts >= MAX_FAILED_BURSTS) {
-                lastError = "Stopped after repeated failures";
+            if (++failures >= MAX_FAILED_CHUNKS) {
+                lastError = `Stopped after ${MAX_FAILED_CHUNKS} failed chunks in a row. Last error: ${lastError ?? "unknown"}`;
                 return;
             }
             continue;
         }
-        failedBursts = 0;
-        credited += chunk;
+
+        failures = 0;
+        hoursCredited += chunk;
         notify();
         await sleep(REQUEST_DELAY_MS);
     }
 }
 
-async function runVariety(list: SpoofedGame[], minutesPerGame: number): Promise<void> {
-    for (varietyIndex = 0; varietyIndex < list.length && running; varietyIndex++) {
-        const game = list[varietyIndex];
+async function runVariety(id: number, apps: DetectableApp[], minutesPerGame: number): Promise<void> {
+    const sessionMs = minutesPerGame * 60_000;
+    let failures = 0;
+    gamesTarget = apps.length;
+    notify();
+
+    for (const app of apps) {
+        if (!alive(id)) return;
+        const game = buildGame(specFor(app), cursor);
         showGame(game);
-        await withRetry(`Variety session ${game.name}`, () => creditVarietySession(game, minutesPerGame));
+
+        const slotStart = nextSlotStart(sessionMs);
+        const ok = await withRetry(id, `Variety session for ${game.name}`, async () => {
+            await creditPlaytime(game, sessionMs, slotStart);
+        });
+        if (!alive(id)) return;
+
+        if (!ok) {
+            if (++failures >= MAX_FAILED_CHUNKS) {
+                lastError = `Stopped after ${MAX_FAILED_CHUNKS} failed games in a row. Last error: ${lastError ?? "unknown"}`;
+                return;
+            }
+            continue;
+        }
+
+        failures = 0;
+        gamesCredited++;
         notify();
         await sleep(REQUEST_DELAY_MS);
     }
+
+    showGame(null);
 }
 
-function begin(nextMode: FarmerMode): boolean {
-    if (running) return false;
+function currentVoiceChannel(): Channel | null {
+    const channelId = SelectedChannelStore.getVoiceChannelId();
+    if (channelId == null || channelId === "") return null;
+    return ChannelStore.getChannel(channelId) ?? null;
+}
+
+function voiceProblem(channel: Channel | null): string | null {
+    if (channel == null) return "Join a voice channel, then start the stream farm.";
+    // Stage channels use a separate stream flow.
+    if (channel.type === 13) return "Stage channels don't support Go Live. Pick a regular voice channel.";
+    const isGuild = !channel.isDM() && !channel.isGroupDM();
+    if (isGuild && !PermissionStore.can(PermissionsBits.STREAM, channel)) {
+        return "You don't have permission to stream in this voice channel.";
+    }
+    return null;
+}
+
+function streamKeyOf(stream: { guildId: string | null; channelId: string; ownerId: string; }): string {
+    return stream.guildId != null
+        ? `guild:${stream.guildId}:${stream.channelId}:${stream.ownerId}`
+        : `call:${stream.channelId}:${stream.ownerId}`;
+}
+
+function readLiveStream(): { viewers: number; } | null {
+    try {
+        const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
+        if (stream == null) return null;
+        return { viewers: ApplicationStreamingStore.getViewerIds(streamKeyOf(stream)).length };
+    } catch (error) {
+        logger.warn("Could not read the active stream", error);
+        return null;
+    }
+}
+
+function endOwnedStream(): void {
+    if (!ownsStream) return;
+    ownsStream = false;
+    try {
+        const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
+        if (stream != null) stopStream(streamKeyOf(stream));
+    } catch (error) {
+        logger.error("Could not end the stream", error);
+    }
+}
+
+async function goLive(id: number, channel: Channel): Promise<boolean> {
+    try {
+        const sources = await getDesktopSources(MediaEngineStore.getMediaEngine(), IS_WINDOWS, ["screen"], null) ?? [];
+        const source = sources[0];
+        if (source == null) {
+            lastError = "Discord found no screen to share.";
+            return false;
+        }
+        if (!alive(id)) return false;
+
+        startStream(channel.guild_id ?? null, channel.id, {
+            pid: null,
+            sourceId: source.id,
+            sourceName: source.name,
+            audioSourceId: null,
+            sound: false,
+            previewDisabled: false
+        });
+
+        // Keep waiting even after Stop, so a stream that comes up late gets ended instead of left running.
+        const deadline = Date.now() + STREAM_START_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+            await sleep(500);
+            const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
+            if (stream == null) continue;
+            if (!alive(id)) {
+                if (!running) stopStream(streamKeyOf(stream));
+                return false;
+            }
+            ownsStream = true;
+            return true;
+        }
+        lastError = "Go Live didn't start within 10 seconds.";
+        return false;
+    } catch (error) {
+        lastError = `Go Live failed: ${describeError(error)}`;
+        logger.error("Go Live failed", error);
+        return false;
+    }
+}
+
+async function runStream(id: number, targetHours: number): Promise<boolean> {
+    const targetMs = targetHours * 3_600_000;
+    streamTarget = targetHours;
+
+    const problem = voiceProblem(currentVoiceChannel());
+    if (problem != null) {
+        lastError = problem;
+        notify();
+        return false;
+    }
+
+    let liveMs = 0;
+    let lastTick = Date.now();
+    let segmentStart = Date.now();
+    let restarts = 0;
+
+    while (alive(id) && liveMs < targetMs) {
+        const channel = currentVoiceChannel();
+        const issue = voiceProblem(channel);
+        if (issue != null) {
+            lastError = issue;
+            break;
+        }
+
+        const live = readLiveStream();
+        const now = Date.now();
+
+        if (live == null) {
+            if (restarts >= STREAM_RESTART_LIMIT) {
+                lastError = `Go Live failed ${STREAM_RESTART_LIMIT} times in a row. ${lastError ?? ""}`.trim();
+                break;
+            }
+            restarts++;
+            streamViewers = null;
+            notify();
+            if (await goLive(id, channel!)) {
+                restarts = 0;
+                segmentStart = Date.now();
+                lastTick = Date.now();
+                if (lastError?.startsWith("Go Live")) lastError = null;
+            } else {
+                await sleep(5_000);
+            }
+            continue;
+        }
+
+        liveMs += now - lastTick;
+        lastTick = now;
+        streamHours = Math.min(liveMs, targetMs) / 3_600_000;
+        streamViewers = live.viewers;
+
+        if (live.viewers === 0) {
+            lastError = "Nobody is watching. Bring an alt into the channel to open your stream.";
+        } else if (lastError?.startsWith("Nobody is watching")) {
+            lastError = null;
+        }
+
+        if (now - segmentStart >= STREAM_ROTATE_MS) {
+            logger.info("Restarting the stream before Discord's 5 hour cutoff");
+            // Rotating means the farm owns the stream from here on, even one it adopted.
+            ownsStream = true;
+            endOwnedStream();
+            segmentStart = Date.now();
+            await sleep(STREAM_REJOIN_GAP_MS);
+            lastTick = Date.now();
+            continue;
+        }
+
+        notify();
+        await sleep(Math.min(STREAM_TICK_MS, Math.max(1_000, targetMs - liveMs)));
+    }
+
+    if (alive(id)) {
+        endOwnedStream();
+        streamViewers = null;
+        notify();
+    }
+
+    return liveMs >= targetMs;
+}
+
+function begin(nextMode: FarmerMode): number | null {
+    if (running) return null;
     running = true;
     mode = nextMode;
-    gamesCredited = 0;
+    activeGame = null;
     hoursCredited = 0;
-    streamHoursCredited = 0;
-    streamMinutesCredited = 0;
-    streamBatch = 0;
-    streamBatches = 0;
+    hoursTarget = 0;
+    gamesCredited = 0;
+    gamesTarget = 0;
+    streamHours = 0;
+    streamTarget = 0;
+    streamViewers = null;
     errors = 0;
     lastError = null;
     finishedMessage = null;
     cursor = Date.now();
-    abortToken++;
+    ownsStream = false;
     notify();
-    return true;
+    return ++runId;
+}
+
+function end(id: number): void {
+    if (id !== runId) return;
+    running = false;
+    mode = "IDLE";
+    showGame(null);
+    endOwnedStream();
+    streamViewers = null;
+    notify();
 }
 
 function markFinished(message: string): void {
@@ -426,88 +542,75 @@ function markFinished(message: string): void {
     showToast({ text: message, variant: "success" });
 }
 
-type GameSpec = { id: string; name: string; exeName: string; };
-
-export async function startGameTime(app: DetectableApp, hours = MAX_TIME_HOURS, chunkHours = DEFAULT_CHUNK_HOURS): Promise<void> {
-    const spec: GameSpec = { id: app.id, name: app.name, exeName: executableFor(app) };
-    if (!begin("GAME_TIME")) return;
-    const token = abortToken;
+export async function startGameTime(app: DetectableApp, hours = ETERNAL_HOURS, chunkHours = DEFAULT_CHUNK_HOURS): Promise<void> {
+    const id = begin("GAME_TIME");
+    if (id == null) return;
     try {
-        await runGameTime(spec, hours, chunkHours);
-        if (running && hoursCredited >= hours) {
-            markFinished(`Game Time done. ${Math.round(hoursCredited)}h credited to ${spec.name}. Badge updates on the next nightly pass.`);
+        await runGameTime(id, specFor(app), hours, chunkHours);
+        if (alive(id) && hoursCredited >= hours) {
+            markFinished(`Sent ${Math.round(hoursCredited).toLocaleString()} hours of ${app.name}. Discord updates the badge overnight.`);
         }
     } finally {
-        if (token === abortToken) finish();
+        end(id);
     }
 }
 
 export async function startVariety(apps: DetectableApp[], minutesPerGame = DEFAULT_VARIETY_MINUTES): Promise<void> {
-    if (!begin("VARIETY")) return;
-    varietyList = apps.map(app => buildGame({ id: app.id, name: app.name, exeName: executableFor(app) }, cursor));
-    varietyIndex = 0;
-    const token = abortToken;
+    const id = begin("VARIETY");
+    if (id == null) return;
     try {
-        await runVariety(varietyList, minutesPerGame);
-        if (running && gamesCredited >= varietyList.length) {
-            markFinished(`Variety done. ${gamesCredited} games credited. Badge updates on the next nightly pass.`);
+        await runVariety(id, apps, minutesPerGame);
+        if (alive(id) && gamesCredited >= apps.length) {
+            markFinished(`Sent sessions for ${gamesCredited} games. Discord updates the badge overnight.`);
         }
     } finally {
-        if (token === abortToken) finish();
+        end(id);
     }
 }
 
-export async function startStream(hours = MAX_TIME_HOURS): Promise<void> {
-    if (!begin("STREAM")) return;
-    const token = abortToken;
+export async function startStreamFarm(hours = ETERNAL_HOURS): Promise<void> {
+    const id = begin("STREAM");
+    if (id == null) return;
     try {
-        await runStream(hours);
-        if (running && streamHoursCredited >= hours) {
-            markFinished(`Streaming done. ${Math.round(streamHoursCredited)}h streamed live. Badge updates within 24 to 48 hours.`);
+        const reached = await runStream(id, hours);
+        if (alive(id) && reached) {
+            markFinished(`Streamed ${Math.round(streamHours).toLocaleString()} hours. Give Discord a day or two to update the badge.`);
         }
     } finally {
-        if (token === abortToken) finish();
+        end(id);
     }
 }
 
 export async function maxAll(apps: DetectableApp[]): Promise<void> {
-    if (!begin("MAX_ALL")) return;
-    const token = abortToken;
+    const id = begin("MAX_ALL");
+    if (id == null) return;
     try {
-        varietyList = shuffled(apps).slice(0, MAX_VARIETY_GAMES).map(app => buildGame({ id: app.id, name: app.name, exeName: executableFor(app) }, cursor));
-        varietyIndex = 0;
-        await runVariety(varietyList, 1.5);
+        const pool = shuffled(apps, UNIVERSALIST_GAMES);
+        await runVariety(id, pool, DEFAULT_VARIETY_MINUTES);
+        if (!alive(id) || pool.length === 0) return;
 
-        if (running && varietyList.length > 0) {
-            await runGameTime(varietyList[0], MAX_TIME_HOURS);
+        await runGameTime(id, specFor(pool[0]), ETERNAL_HOURS, DEFAULT_CHUNK_HOURS);
+        if (!alive(id)) return;
+
+        const summary = `${gamesCredited} games and ${Math.round(hoursCredited).toLocaleString()} hours of ${pool[0].name}`;
+
+        if (voiceProblem(currentVoiceChannel()) != null) {
+            markFinished(`Sent ${summary}. Join a voice channel and run Streaming on its own for the third badge.`);
+            return;
         }
 
-        if (running) {
-            await runStream(MAX_TIME_HOURS);
-        }
-
-        if (running && gamesCredited >= varietyList.length && hoursCredited >= MAX_TIME_HOURS && streamHoursCredited >= MAX_TIME_HOURS) {
-            markFinished(`All badges done. ${gamesCredited} games, ${Math.round(hoursCredited)}h game time, ${Math.round(streamHoursCredited)}h streaming. Badge updates on the next nightly pass.`);
+        showToast({ text: `Sent ${summary}. Going live for the streaming badge now.`, variant: "success" });
+        const reached = await runStream(id, ETERNAL_HOURS);
+        if (alive(id) && reached) {
+            markFinished(`Done. ${summary}, plus ${Math.round(streamHours).toLocaleString()} hours streamed.`);
         }
     } finally {
-        if (token === abortToken) finish();
+        end(id);
     }
 }
 
-function finish(): void {
-    running = false;
-    mode = "IDLE";
-    clearGame();
-    varietyList = [];
-    varietyIndex = 0;
-    notify();
-}
-
 export function stop(): void {
-    abortToken++;
-    finish();
-}
-
-export function isRunning(): boolean {
-    return running;
+    if (!running) return;
+    end(runId);
+    runId++;
 }
