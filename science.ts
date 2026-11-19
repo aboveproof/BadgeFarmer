@@ -178,6 +178,7 @@ export async function creditPlaytime(game: CreditableGame, durationMs: number, s
     // Discord ignores events older than a day, and events stamped in the future look broken.
     const start = Math.min(Math.max(startedAt, now - MAX_BACKDATE_MS), now - MIN_DURATION_MS);
     const end = Math.min(start + duration, now);
+    const actualDuration = Math.max(end - start, MIN_DURATION_MS);
 
     const fingerprint = fingerprintFor(game.id);
     const token = await getAnalyticsToken();
@@ -190,7 +191,7 @@ export async function creditPlaytime(game: CreditableGame, durationMs: number, s
             events: [
                 buildHeartbeat(game, 0, gameSession, true, start),
                 buildLaunch(game, fingerprint, start),
-                buildHeartbeat(game, duration, gameSession, false, end)
+                buildHeartbeat(game, actualDuration, gameSession, false, end)
             ]
         }
     });

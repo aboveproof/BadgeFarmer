@@ -466,6 +466,7 @@ async function runStream(id: number, targetHours: number): Promise<boolean> {
                 lastTick = Date.now();
                 if (lastError?.startsWith("Go Live")) lastError = null;
             } else {
+                lastTick = Date.now();
                 await sleep(5_000);
             }
             continue;

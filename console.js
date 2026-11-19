@@ -127,12 +127,17 @@
     async function farmGameTime(app, hours) {
         await ensureAuth();
         state.running = true; state.stopFlag = false; state.creditedHours = 0;
+        const maxBackdate = 24 * 60 * 60 * 1000;
         let cursor = Date.now();
         log(`Game Time: ${hours}h on ${app.name}...`);
         while (state.running && !state.stopFlag && state.creditedHours < hours) {
             const chunk = Math.min(2, hours - state.creditedHours);
             const dur = chunk * 3600000;
-            const start = cursor - dur;
+            const floor = Date.now() - maxBackdate;
+            if (cursor - dur < floor) {
+                cursor = Date.now() - Math.floor(Math.random() * 60000);
+            }
+            const start = Math.max(cursor - dur, floor);
             cursor = start;
             try {
                 await creditPlaytime(app, dur, start);
@@ -151,12 +156,17 @@
     async function farmVariety(games, minutesPerGame) {
         await ensureAuth();
         state.running = true; state.stopFlag = false; state.gamesCredited = 0;
+        const maxBackdate = 24 * 60 * 60 * 1000;
         let cursor = Date.now();
         log(`Variety: ${games.length} games, ${minutesPerGame}min each...`);
         for (const game of games) {
             if (state.stopFlag) break;
             const dur = minutesPerGame * 60000;
-            const start = cursor - dur;
+            const floor = Date.now() - maxBackdate;
+            if (cursor - dur < floor) {
+                cursor = Date.now() - Math.floor(Math.random() * 60000);
+            }
+            const start = Math.max(cursor - dur, floor);
             cursor = start;
             try {
                 await creditPlaytime(game, dur, start);
