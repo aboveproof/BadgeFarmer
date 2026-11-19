@@ -5,6 +5,7 @@
  */
 
 import { Button } from "@components/Button";
+import ErrorBoundary from "@components/ErrorBoundary";
 import { classNameFactory } from "@utils/css";
 import { useForceUpdater } from "@utils/react";
 import type { RenderModalProps } from "@vencord/discord-types";
@@ -98,7 +99,9 @@ function useFarmerStatus(): FarmerStatus {
 }
 
 function parseNumber(value: string, min: number, max: number, integer: boolean): number | null {
-    const parsed = Number(value.replace(/[,_\s]/g, ""));
+    const trimmed = value.trim();
+    if (trimmed === "") return null;
+    const parsed = Number(trimmed.replace(/[,_\s]/g, ""));
     if (!Number.isFinite(parsed) || parsed < min || parsed > max) return null;
     if (integer && !Number.isInteger(parsed)) return null;
     return parsed;
@@ -566,7 +569,21 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
     );
 }
 
-export function BadgeIcon({ width = 20, height = 20, className }: { width?: number; height?: number; className?: string; }) {
+export function BadgeIcon({
+    width = 20,
+    height = 20,
+    className,
+    size: _size,
+    color: _color,
+    ...props
+}: {
+    width?: number;
+    height?: number;
+    className?: string;
+    size?: string;
+    color?: string;
+    [key: string]: any;
+}) {
     return (
         <svg
             width={width}
@@ -574,6 +591,7 @@ export function BadgeIcon({ width = 20, height = 20, className }: { width?: numb
             viewBox="0 0 24 24"
             fill="none"
             className={className}
+            {...props}
         >
             <path
                 d="M12 2L4.5 5.5V11.5C4.5 16.5 7.7 20.8 12 22C16.3 20.8 19.5 16.5 19.5 11.5V5.5L12 2Z"
@@ -594,15 +612,17 @@ export function BadgeIcon({ width = 20, height = 20, className }: { width?: numb
 
 export function openBadgeFarmerModal() {
     return openModal((props: RenderModalProps) => (
-        <Modal
-            {...props}
-            size="lg"
-            title="Badge Farmer"
-            subtitle="Pick a badge and leave Discord open while it runs."
-        >
-            <div className={cl("modal-body")}>
-                <BadgeFarmerDashboard isModal />
-            </div>
-        </Modal>
+        <ErrorBoundary>
+            <Modal
+                {...props}
+                size="lg"
+                title="Badge Farmer"
+                subtitle="Pick a badge and leave Discord open while it runs."
+            >
+                <div className={cl("modal-body")}>
+                    <BadgeFarmerDashboard isModal />
+                </div>
+            </Modal>
+        </ErrorBoundary>
     ));
 }

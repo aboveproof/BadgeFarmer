@@ -48,7 +48,12 @@ export function fingerprintFor(gameId: string): string {
 
     let detected: DetectedGame[] = [];
     try {
-        detected = [...RunningGameStore.getRunningGames(), ...RunningGameStore.getGamesSeen(true)];
+        const running = RunningGameStore?.getRunningGames?.() ?? [];
+        const seen = RunningGameStore?.getGamesSeen?.(true) ?? [];
+        detected = [
+            ...(Array.isArray(running) ? running : []),
+            ...(Array.isArray(seen) ? seen : [])
+        ];
     } catch (error) {
         logger.warn("Could not read Discord's detected games", error);
     }
@@ -79,7 +84,7 @@ async function getAnalyticsToken(): Promise<string> {
 function clientSession(): { heartbeatSession: string; launchSignature: string; locale: string; } {
     let properties: Record<string, unknown> = {};
     try {
-        properties = SuperProperties.getSuperProperties() ?? {};
+        properties = SuperProperties?.getSuperProperties?.() ?? {};
     } catch (error) {
         logger.warn("Could not read the client's super properties", error);
     }
@@ -167,8 +172,8 @@ function buildHeartbeat(game: CreditableGame, durationMs: number, gameSession: s
     };
 }
 
-/** Throws when Discord rejects the request, so callers can retry. */
-export async function creditPlaytime(game: CreditableGame, durationMs: number, startedAt: number): Promise<void> {
+/** Throws when Discord rejects the request, so callers can retry. Returns the actual duration credited in ms. */
+export async function creditPlaytime(game: CreditableGame, durationMs: number, startedAt: number): Promise<number> {
     const duration = Math.floor(durationMs);
     if (!Number.isFinite(duration) || duration < MIN_DURATION_MS) {
         throw new Error("Sessions shorter than a minute don't count.");
@@ -196,5 +201,6 @@ export async function creditPlaytime(game: CreditableGame, durationMs: number, s
         }
     });
 
-    logger.info(`Sent ${Math.round(duration / 60_000)} minutes of ${game.name}`);
+    logger.info(`Sent ${Math.round(actualDuration / 60_000)} minutes of ${game.name}`);
+    return actualDuration;
 }

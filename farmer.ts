@@ -230,7 +230,11 @@ function buildGame(app: GameSpec, startedAt: number): SpoofedGame {
 function showGame(game: SpoofedGame | null): void {
     if (game != null) fingerprintFor(game.id);
     activeGame = game;
-    FluxDispatcher.dispatch({ type: "RUNNING_GAME_SET_DEBUG_GAME", game });
+    try {
+        FluxDispatcher.dispatch({ type: "RUNNING_GAME_SET_DEBUG_GAME", game });
+    } catch (error) {
+        logger.warn("Could not set debug game on presence", error);
+    }
 }
 
 /** Hands out back-to-back time slots within Discord's 24-hour window so sessions do not overlap. */
@@ -285,8 +289,9 @@ async function runGameTime(id: number, app: GameSpec, targetHours: number, chunk
         if (chunkMs < MIN_CHUNK_MS) break;
 
         const slotStart = nextSlotStart(chunkMs);
+        let creditedMs = 0;
         const ok = await withRetry(id, `${chunk}h chunk for ${game.name}`, async () => {
-            await creditPlaytime(game, chunkMs, slotStart);
+            creditedMs = await creditPlaytime(game, chunkMs, slotStart);
         });
         if (!alive(id)) return;
 
@@ -299,14 +304,14 @@ async function runGameTime(id: number, app: GameSpec, targetHours: number, chunk
         }
 
         failures = 0;
-        hoursCredited += chunk;
+        hoursCredited += creditedMs / 3_600_000;
         notify();
         await sleep(REQUEST_DELAY_MS);
     }
 }
 
 async function runVariety(id: number, apps: DetectableApp[], minutesPerGame: number): Promise<void> {
-    const sessionMs = minutesPerGame * 60_000;
+    const sessionMs = Math.max(MIN_CHUNK_MS, Math.floor(minutesPerGame * 60_000));
     let failures = 0;
     gamesTarget = apps.length;
     notify();
@@ -349,8 +354,10 @@ function voiceProblem(channel: Channel | null): string | null {
     if (channel == null) return "Join a voice channel, then start the stream farm.";
     // Stage channels use a separate stream flow.
     if (channel.type === 13) return "Stage channels don't support Go Live. Pick a regular voice channel.";
-    const isGuild = !channel.isDM() && !channel.isGroupDM();
-    if (isGuild && !PermissionStore.can(PermissionsBits.STREAM, channel)) {
+    const isDm = typeof channel.isDM === "function" ? channel.isDM() : channel.type === 1;
+    const isGroupDm = typeof channel.isGroupDM === "function" ? channel.isGroupDM() : channel.type === 3;
+    const isGuild = !isDm && !isGroupDm;
+    if (isGuild && PermissionStore?.can && !PermissionStore.can(PermissionsBits.STREAM, channel)) {
         return "You don't have permission to stream in this voice channel.";
     }
     return null;
@@ -366,7 +373,8 @@ function readLiveStream(): { viewers: number; } | null {
     try {
         const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
         if (stream == null) return null;
-        return { viewers: ApplicationStreamingStore.getViewerIds(streamKeyOf(stream)).length };
+        const viewerIds = ApplicationStreamingStore.getViewerIds(streamKeyOf(stream));
+        return { viewers: Array.isArray(viewerIds) ? viewerIds.length : 0 };
     } catch (error) {
         logger.warn("Could not read the active stream", error);
         return null;
@@ -386,7 +394,8 @@ function endOwnedStream(): void {
 
 async function goLive(id: number, channel: Channel): Promise<boolean> {
     try {
-        const sources = await getDesktopSources(MediaEngineStore.getMediaEngine(), IS_WINDOWS, ["screen"], null) ?? [];
+        const engine = MediaEngineStore?.getMediaEngine?.();
+        const sources = await getDesktopSources(engine, IS_WINDOWS, ["screen"], null) ?? [];
         const source = sources[0];
         if (source == null) {
             lastError = "Discord found no screen to share.";
@@ -544,11 +553,18 @@ function markFinished(message: string): void {
 }
 
 export async function startGameTime(app: DetectableApp, hours = ETERNAL_HOURS, chunkHours = DEFAULT_CHUNK_HOURS): Promise<void> {
+    if (app == null || typeof app.id !== "string" || typeof app.name !== "string") {
+        lastError = "Select a valid game before starting.";
+        notify();
+        return;
+    }
+    const safeHours = Math.max(0.1, hours);
+    const safeChunk = Math.min(Math.max(1, chunkHours), MAX_CHUNK_HOURS);
     const id = begin("GAME_TIME");
     if (id == null) return;
     try {
-        await runGameTime(id, specFor(app), hours, chunkHours);
-        if (alive(id) && hoursCredited >= hours) {
+        await runGameTime(id, specFor(app), safeHours, safeChunk);
+        if (alive(id) && hoursCredited >= safeHours) {
             markFinished(`Sent ${Math.round(hoursCredited).toLocaleString()} hours of ${app.name}. Discord updates the badge overnight.`);
         }
     } finally {
@@ -557,10 +573,16 @@ export async function startGameTime(app: DetectableApp, hours = ETERNAL_HOURS, c
 }
 
 export async function startVariety(apps: DetectableApp[], minutesPerGame = DEFAULT_VARIETY_MINUTES): Promise<void> {
+    if (!Array.isArray(apps) || apps.length === 0) {
+        lastError = "No games available. Load the catalog and try again.";
+        notify();
+        return;
+    }
+    const safeMinutes = Math.max(1, minutesPerGame);
     const id = begin("VARIETY");
     if (id == null) return;
     try {
-        await runVariety(id, apps, minutesPerGame);
+        await runVariety(id, apps, safeMinutes);
         if (alive(id) && gamesCredited >= apps.length) {
             markFinished(`Sent sessions for ${gamesCredited} games. Discord updates the badge overnight.`);
         }
@@ -570,10 +592,11 @@ export async function startVariety(apps: DetectableApp[], minutesPerGame = DEFAU
 }
 
 export async function startStreamFarm(hours = ETERNAL_HOURS): Promise<void> {
+    const safeHours = Math.max(0.1, hours);
     const id = begin("STREAM");
     if (id == null) return;
     try {
-        const reached = await runStream(id, hours);
+        const reached = await runStream(id, safeHours);
         if (alive(id) && reached) {
             markFinished(`Streamed ${Math.round(streamHours).toLocaleString()} hours. Give Discord a day or two to update the badge.`);
         }
@@ -583,12 +606,22 @@ export async function startStreamFarm(hours = ETERNAL_HOURS): Promise<void> {
 }
 
 export async function maxAll(apps: DetectableApp[]): Promise<void> {
+    if (!Array.isArray(apps) || apps.length === 0) {
+        lastError = "Game catalog not ready. Wait for games to load and try again.";
+        notify();
+        return;
+    }
     const id = begin("MAX_ALL");
     if (id == null) return;
     try {
         const pool = shuffled(apps, UNIVERSALIST_GAMES);
+        if (pool.length === 0) {
+            lastError = "Could not pick games from the catalog.";
+            notify();
+            return;
+        }
         await runVariety(id, pool, DEFAULT_VARIETY_MINUTES);
-        if (!alive(id) || pool.length === 0) return;
+        if (!alive(id)) return;
 
         await runGameTime(id, specFor(pool[0]), ETERNAL_HOURS, DEFAULT_CHUNK_HOURS);
         if (!alive(id)) return;

@@ -50,7 +50,7 @@ function HeaderBadgeButton() {
 
     return (
         <HeaderBarButton
-            className="vc-badge-farmer-header-btn"
+            className={`vc-badge-farmer-header-btn ${busy ? "vc-badge-farmer-header-btn-busy" : ""}`}
             onClick={() => void openBadgeFarmerModal()}
             tooltip={busy ? "Badge Farmer (Running)" : "Badge Farmer"}
             icon={BadgeIcon}

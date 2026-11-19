@@ -64,7 +64,7 @@
     async function ensureAuth() {
         if (state.token) return;
         state.token = await findToken();
-        log(`token found (${state.token.slice(0, 12)}...)`, true);
+        log("Session token found", true);
     }
 
     async function ensureAnalyticsToken() {
@@ -106,7 +106,7 @@
 
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-    // ---- Game Time + Variety (backdated chunks, same shape as the plugin) ----
+    // Game Time and Variety
 
     async function creditPlaytime(game, durationMs, start) {
         const session = crypto.randomUUID();
@@ -222,9 +222,10 @@
         log(`Streaming done: ${state.streamMinutes}min. Badge updates on the next nightly pass.`, true);
     }
 
-    // ---- helpers for picking games ----
+    // Helpers for picking games
 
     function pickRandom(apps, count) {
+        if (!Array.isArray(apps) || apps.length === 0) return [];
         const pool = [...apps];
         for (let i = pool.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
@@ -240,7 +241,12 @@
         stop() { state.stopFlag = true; log("stopping after the current chunk..."); },
 
         search(name) {
-            return loadCatalogue().then(apps => apps.filter(a => a.name.toLowerCase().includes(name.toLowerCase())).slice(0, 20));
+            if (typeof name !== "string" || name.trim() === "") return Promise.resolve([]);
+            return loadCatalogue().then(apps => {
+                if (!Array.isArray(apps)) return [];
+                const needle = name.toLowerCase();
+                return apps.filter(a => typeof a?.name === "string" && a.name.toLowerCase().includes(needle)).slice(0, 20);
+            });
         },
 
         gameTime(name, hours = 5000) {
@@ -260,9 +266,14 @@
 
         async maxAll() {
             const apps = await loadCatalogue();
+            if (!Array.isArray(apps) || apps.length === 0) {
+                log("Could not load game catalog", false);
+                return;
+            }
             await this.variety(2, 100);
+            if (state.stopFlag) return;
             const [game] = pickRandom(apps, 1);
-            await farmGameTime(game, 5000);
+            if (game) await farmGameTime(game, 5000);
         }
     };
 
