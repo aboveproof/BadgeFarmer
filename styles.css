@@ -133,6 +133,14 @@
     font-variant-numeric: tabular-nums;
 }
 
+.vc-badge-farmer-live-status-text {
+    color: var(--text-strong, var(--header-primary));
+    font-size: 20px;
+    font-weight: 700;
+    line-height: 26px;
+    letter-spacing: -0.01em;
+}
+
 .vc-badge-farmer-live-target {
     color: var(--bf-muted);
     font-size: 13px;
@@ -384,7 +392,7 @@
     color: var(--text-feedback-critical, #f23f43);
 }
 
-/* Stream source selector & voice readiness */
+/* Stream source selector, toggles, & viewer helper */
 
 .vc-badge-farmer-voice-bar {
     display: flex;
@@ -404,6 +412,15 @@
     flex: 0 0 auto;
     border-radius: 50%;
     background: var(--bf-muted);
+}
+
+.vc-badge-farmer-voice-bar-warn {
+    border-color: color-mix(in srgb, var(--bf-warning) 35%, transparent);
+    color: var(--text-default);
+}
+
+.vc-badge-farmer-voice-bar-warn .vc-badge-farmer-voice-dot {
+    background: var(--bf-warning);
 }
 
 .vc-badge-farmer-voice-bar-ok {
@@ -564,6 +581,133 @@
     font-size: 13px;
     font-weight: 700;
     line-height: 1;
+}
+
+.vc-badge-farmer-toggles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px;
+}
+
+.vc-badge-farmer-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--bf-border);
+    border-radius: var(--bf-radius-inner);
+    background: var(--background-base-lowest, var(--input-background));
+    color: var(--text-default);
+    font-family: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition:
+        border-color 140ms ease,
+        background-color 140ms ease;
+}
+
+.vc-badge-farmer-toggle:focus-visible {
+    outline: 2px solid var(--border-focus, var(--bf-accent));
+    outline-offset: -1px;
+}
+
+.vc-badge-farmer-toggle:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+.vc-badge-farmer-toggle-on {
+    border-color: color-mix(in srgb, var(--bf-accent) 45%, var(--bf-border));
+}
+
+.vc-badge-farmer-toggle-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.vc-badge-farmer-toggle-title {
+    color: var(--text-strong, var(--header-primary));
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 17px;
+}
+
+.vc-badge-farmer-toggle-note {
+    color: var(--bf-muted);
+    font-size: 11px;
+    line-height: 15px;
+}
+
+.vc-badge-farmer-switch {
+    position: relative;
+    flex: 0 0 auto;
+    width: 34px;
+    height: 20px;
+    border-radius: 999px;
+    background: var(--background-mod-subtle, rgb(128 132 142 / 28%));
+    transition: background-color 160ms ease;
+}
+
+.vc-badge-farmer-switch-on {
+    background: var(--bf-accent);
+}
+
+.vc-badge-farmer-switch-knob {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #fff;
+    transition: transform 160ms var(--bf-ease);
+}
+
+.vc-badge-farmer-switch-on .vc-badge-farmer-switch-knob {
+    transform: translateX(14px);
+}
+
+.vc-badge-farmer-alt-box {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--bf-border);
+    border-radius: var(--bf-radius-inner);
+    background: var(--bf-raised);
+}
+
+.vc-badge-farmer-alt-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1 1 220px;
+    min-width: 0;
+}
+
+.vc-badge-farmer-alt-title {
+    color: var(--text-strong, var(--header-primary));
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 17px;
+}
+
+.vc-badge-farmer-alt-note {
+    color: var(--bf-muted);
+    font-size: 12px;
+    line-height: 16px;
+}
+
+.vc-badge-farmer-alt-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
 }
 
 /* Game picker */
@@ -863,7 +1007,8 @@
         background: var(--background-mod-subtle, rgb(128 132 142 / 14%));
     }
 
-    .vc-badge-farmer-picker-btn:hover:not(:disabled):not(.vc-badge-farmer-picker-btn-open) {
+    .vc-badge-farmer-picker-btn:hover:not(:disabled):not(.vc-badge-farmer-picker-btn-open),
+    .vc-badge-farmer-toggle:hover:not(:disabled) {
         border-color: var(--border-normal, rgb(128 132 142 / 34%));
     }
 
@@ -926,7 +1071,8 @@
     .vc-badge-farmer-tabs-thumb,
     .vc-badge-farmer-bar-fill,
     .vc-badge-farmer-tier,
-    .vc-badge-farmer-picker-chevron {
+    .vc-badge-farmer-picker-chevron,
+    .vc-badge-farmer-switch-knob {
         transition: none;
     }
 }

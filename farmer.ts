@@ -7,9 +7,10 @@
 import { Settings } from "@api/Settings";
 import { IS_LINUX, IS_MAC, IS_WINDOWS } from "@utils/constants";
 import { Logger } from "@utils/Logger";
-import type { Channel, RunningGame } from "@vencord/discord-types";
+import type { ApplicationStream, Channel, RunningGame } from "@vencord/discord-types";
 import { findByCodeLazy } from "@webpack";
 import {
+    ApplicationStreamingSettingsStore,
     ApplicationStreamingStore,
     ChannelStore,
     FluxDispatcher,
@@ -17,13 +18,17 @@ import {
     MediaEngineStore,
     PermissionsBits,
     PermissionStore,
+    RTCConnectionStore,
     SelectedChannelStore,
-    showToast
+    showToast,
+    UserStore,
+    VoiceStateStore
 } from "@webpack/common";
 
 import {
     creditPlaytimeBatch,
     fingerprintFor,
+    isAnalyticsStubbed,
     MAX_SESSION_MS,
     MAX_SESSIONS_PER_BATCH,
     MIN_DURATION_MS,
@@ -35,10 +40,20 @@ const logger = new Logger("BadgeFarmer");
 const DETECTABLE_APPS_URL = "https://discord.com/api/v10/applications/detectable";
 const CATALOGUE_TIMEOUT_MS = 20_000;
 
+const PRESET_CUSTOM = 3;
+const LOW_POWER_RESOLUTION = 480;
+const LOW_POWER_FPS = 15;
+
 export interface DesktopSource {
     id: string;
     name: string;
     kind: "screen" | "window";
+}
+
+export interface StreamFarmConfig {
+    sourceId?: string;
+    lowPower?: boolean;
+    checkpoint?: boolean;
 }
 
 interface StreamOptions {
@@ -50,15 +65,23 @@ interface StreamOptions {
     previewDisabled: boolean;
 }
 
+interface SavedStreamSettings {
+    preset: number;
+    resolution: number;
+    fps: number;
+}
+
 type RawDesktopSource = { id?: unknown; name?: unknown; };
 type GetDesktopSources4 = (engine: unknown, isWindows: boolean, types: string[], options: null) => Promise<RawDesktopSource[] | null>;
 type GetDesktopSources3 = (engine: unknown, types: string[], options: null) => Promise<RawDesktopSource[] | null>;
 
-// The same action creators Discord's Go Live button calls.
+// Discord's internal Go Live action creators.
 const startStream: ((guildId: string | null, channelId: string, options: StreamOptions) => void) | undefined =
     findByCodeLazy('type:"STREAM_START"');
 const stopStream: ((streamKey: string) => void) | undefined =
     findByCodeLazy('type:"STREAM_STOP"');
+const watchStreamAction: ((stream: ApplicationStream | string, allowMultiple?: boolean) => void) | undefined =
+    findByCodeLazy('type:"STREAM_WATCH"');
 const getDesktopSources: (GetDesktopSources4 & GetDesktopSources3) | undefined =
     findByCodeLazy("desktop sources");
 
@@ -91,7 +114,7 @@ interface GameSpec {
     exeName: string;
 }
 
-export type FarmerMode = "IDLE" | "GAME_TIME" | "VARIETY" | "STREAM" | "MAX_ALL";
+export type FarmerMode = "IDLE" | "GAME_TIME" | "VARIETY" | "STREAM" | "VIEWER" | "MAX_ALL";
 
 export interface FarmerStatus {
     mode: FarmerMode;
@@ -104,6 +127,7 @@ export interface FarmerStatus {
     streamTarget: number;
     streamViewers: number | null;
     streamPaused: boolean;
+    watchingOwner: string | null;
     errors: number;
     lastError: string | null;
     finishedMessage: string | null;
@@ -111,8 +135,11 @@ export interface FarmerStatus {
 
 export interface VoiceReadiness {
     channelName: string | null;
+    peersInChannel: number;
     problem: string | null;
 }
+
+export type NoTrackStreamState = "ok" | "disabled_in_settings" | "needs_restart";
 
 export const ETERNAL_HOURS = 5_000;
 export const UNIVERSALIST_GAMES = 100;
@@ -122,18 +149,51 @@ export const DEFAULT_CHUNK_HOURS = 24;
 export const DEFAULT_VARIETY_MINUTES = 2;
 export const BATCH_SIZE = MAX_SESSIONS_PER_BATCH;
 
-const REQUEST_DELAY_MS = 700;
+const REQUEST_DELAY_MS = 500;
 const RETRY_DELAY_MS = 3_000;
 const MAX_RATE_LIMIT_WAIT_MS = 30_000;
 const MAX_FAILED_BATCHES = 5;
 
-// Discord cuts streams off at 5 hours, so BadgeFarmer restarts at 4.
-const STREAM_ROTATE_MS = 4 * 60 * 60 * 1_000;
-const STREAM_REJOIN_GAP_MS = 3_000;
-const STREAM_TICK_MS = 10_000;
+// Optional periodic checkpoint to flush video_stream_ended when paired with an auto-watching alt.
+const STREAM_CHECKPOINT_MS = 2 * 60 * 60 * 1_000;
+const STREAM_REJOIN_GAP_MS = 2_500;
+const STREAM_TICK_MS = 8_000;
+const VIEWER_TICK_MS = 4_000;
 const MAX_TICK_DELTA_MS = STREAM_TICK_MS * 3;
 const STREAM_START_TIMEOUT_MS = 10_000;
-const STREAM_RESTART_LIMIT = 3;
+const STREAM_RESTART_LIMIT = 4;
+
+/** Compact browser console snippet users can paste on an unmodded alt tab to auto-watch and stay unpaused 24/7. */
+export const ALT_WATCH_SNIPPET = `(() => {
+  if (window.__bfWatch) clearInterval(window.__bfWatch);
+  let Dispatcher, StreamStore, ChannelStore;
+  webpackChunkdiscord_app.push([[Symbol()], {}, req => {
+    for (const m of Object.values(req.c)) {
+      const e = m?.exports;
+      for (const c of [e, e?.default, e?.Z, e?.ZP]) {
+        if (!c) continue;
+        if (c.dispatch && c.subscribe) Dispatcher = c;
+        if (c.getName?.() === "ApplicationStreamingStore") StreamStore = c;
+        if (c.getName?.() === "SelectedChannelStore") ChannelStore = c;
+      }
+    }
+  }]);
+  if (!Dispatcher || !StreamStore || !ChannelStore) return console.error("[BadgeFarmer] Discord stores not found.");
+  const tick = () => {
+    const ch = ChannelStore.getVoiceChannelId?.();
+    if (!ch) return;
+    const streams = StreamStore.getAllApplicationStreamsForChannel?.(ch) ?? [];
+    for (const s of streams) {
+      const key = s.guildId ? \`guild:\${s.guildId}:\${s.channelId}:\${s.ownerId}\` : \`call:\${s.channelId}:\${s.ownerId}\`;
+      const active = StreamStore.getActiveStreamForStreamKey?.(key);
+      if (!active) Dispatcher.dispatch({ type: "STREAM_WATCH", streamKey: key, allowMultiple: true });
+      Dispatcher.dispatch({ type: "STREAM_SET_PAUSED", streamKey: key, paused: false });
+    }
+  };
+  tick();
+  window.__bfWatch = setInterval(tick, 3000);
+  console.log("%c[BadgeFarmer] Alt auto-watcher active. Leave this tab in the voice channel.", "color:#57f287;font-weight:bold");
+})();`;
 
 let mode: FarmerMode = "IDLE";
 let activeGame: SpoofedGame | null = null;
@@ -145,6 +205,7 @@ let streamHours = 0;
 let streamTarget = 0;
 let streamViewers: number | null = null;
 let streamPaused = false;
+let watchingOwner: string | null = null;
 let errors = 0;
 let lastError: string | null = null;
 let finishedMessage: string | null = null;
@@ -154,6 +215,7 @@ let runId = 0;
 let runAbort: AbortController | null = null;
 let cursor = 0;
 let ownsStream = false;
+let savedStreamSettings: SavedStreamSettings | null = null;
 
 let cataloguePromise: Promise<DetectableApp[]> | null = null;
 
@@ -186,6 +248,7 @@ export function getStatus(): FarmerStatus {
         streamTarget,
         streamViewers,
         streamPaused,
+        watchingOwner,
         errors,
         lastError,
         finishedMessage
@@ -203,13 +266,29 @@ export function dismissFinished(): void {
     notify();
 }
 
-export function isNoTrackBlockingStream(): boolean {
+export function getNoTrackStreamState(): NoTrackStreamState {
     try {
         const noTrack = Settings.plugins?.NoTrack as
             | { enabled?: boolean; disableAnalytics?: boolean; allowBadgeTracking?: boolean; }
             | undefined;
-        if (noTrack == null || noTrack.enabled === false) return false;
-        return noTrack.disableAnalytics === true && noTrack.allowBadgeTracking === false;
+        if (noTrack != null && noTrack.enabled !== false && noTrack.disableAnalytics === true && noTrack.allowBadgeTracking === false) {
+            return "disabled_in_settings";
+        }
+        if (isAnalyticsStubbed()) {
+            return "needs_restart";
+        }
+        return "ok";
+    } catch {
+        return "ok";
+    }
+}
+
+export function enableNoTrackBadgeTracking(): boolean {
+    try {
+        const noTrack = Settings.plugins?.NoTrack as { allowBadgeTracking?: boolean; } | undefined;
+        if (noTrack == null) return false;
+        noTrack.allowBadgeTracking = true;
+        return true;
     } catch {
         return false;
     }
@@ -230,7 +309,6 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
     });
 }
 
-/** Keeps a run active until Stop is pressed or a newer run replaces it. */
 function alive(id: number): boolean {
     return running && id === runId;
 }
@@ -579,26 +657,43 @@ function currentVoiceChannel(): Channel | null {
     }
 }
 
-function voiceProblem(channel: Channel | null): string | null {
-    if (channel == null) return "Join a voice channel before starting a stream run.";
-    // Stage channels use a separate broadcast flow.
+function countOtherChannelMembers(channelId: string): number {
+    try {
+        const myId = UserStore?.getCurrentUser?.()?.id;
+        const states = VoiceStateStore?.getVoiceStatesForChannel?.(channelId);
+        if (states == null || typeof states !== "object") return 0;
+        let count = 0;
+        for (const userId of Object.keys(states)) {
+            if (userId !== myId) count++;
+        }
+        return count;
+    } catch {
+        return 0;
+    }
+}
+
+function voiceProblem(channel: Channel | null, requireStreamPerm = true): string | null {
+    if (channel == null) return "Join a voice channel before starting.";
     if (channel.type === 13) return "Stage channels do not support Go Live. Pick a regular voice channel.";
-    const isDm = typeof channel.isDM === "function" ? channel.isDM() : channel.type === 1;
-    const isGroupDm = typeof channel.isGroupDM === "function" ? channel.isGroupDM() : channel.type === 3;
-    const isGuild = !isDm && !isGroupDm;
-    if (isGuild && PermissionStore?.can && !PermissionStore.can(PermissionsBits.STREAM, channel)) {
-        return "You lack permission to stream in this voice channel.";
+    if (requireStreamPerm) {
+        const isDm = typeof channel.isDM === "function" ? channel.isDM() : channel.type === 1;
+        const isGroupDm = typeof channel.isGroupDM === "function" ? channel.isGroupDM() : channel.type === 3;
+        const isGuild = !isDm && !isGroupDm;
+        if (isGuild && PermissionStore?.can && !PermissionStore.can(PermissionsBits.STREAM, channel)) {
+            return "You lack permission to stream in this voice channel.";
+        }
     }
     return null;
 }
 
 export function getVoiceState(): VoiceReadiness {
     const channel = currentVoiceChannel();
-    const problem = voiceProblem(channel);
+    const problem = voiceProblem(channel, true);
     const channelName = channel == null
         ? null
         : (channel.name && channel.name.trim() !== "" ? `#${channel.name}` : "Voice Call");
-    return { channelName, problem };
+    const peersInChannel = channel != null ? countOtherChannelMembers(channel.id) : 0;
+    return { channelName, peersInChannel, problem };
 }
 
 function streamKeyOf(stream: { guildId: string | null; channelId: string; ownerId: string; }): string {
@@ -607,28 +702,96 @@ function streamKeyOf(stream: { guildId: string | null; channelId: string; ownerI
         : `call:${stream.channelId}:${stream.ownerId}`;
 }
 
-function readLiveStream(): { viewers: number; } | null {
+function keepStreamUnpaused(streamKey: string): void {
     try {
-        const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
+        FluxDispatcher.dispatch({
+            type: "STREAM_SET_PAUSED",
+            streamKey,
+            paused: false
+        });
+    } catch (error) {
+        logger.warn("Could not unpause stream", error);
+    }
+}
+
+function applyLowPowerStreamSettings(): void {
+    if (savedStreamSettings != null) return;
+    try {
+        const state = ApplicationStreamingSettingsStore?.getState?.();
+        if (state != null) {
+            savedStreamSettings = {
+                preset: state.preset,
+                resolution: state.resolution,
+                fps: state.fps
+            };
+        }
+        FluxDispatcher.dispatch({
+            type: "STREAM_UPDATE_SETTINGS",
+            preset: PRESET_CUSTOM,
+            resolution: LOW_POWER_RESOLUTION,
+            frameRate: LOW_POWER_FPS
+        });
+    } catch (error) {
+        logger.warn("Could not apply low-power stream settings", error);
+    }
+}
+
+function restoreStreamSettings(): void {
+    if (savedStreamSettings == null) return;
+    const restore = savedStreamSettings;
+    savedStreamSettings = null;
+    try {
+        FluxDispatcher.dispatch({
+            type: "STREAM_UPDATE_SETTINGS",
+            preset: restore.preset,
+            resolution: restore.resolution,
+            frameRate: restore.fps
+        });
+    } catch (error) {
+        logger.warn("Could not restore stream settings", error);
+    }
+}
+
+function isRtcReady(): boolean {
+    try {
+        if (typeof RTCConnectionStore?.isConnected !== "function") return true;
+        return RTCConnectionStore.isConnected();
+    } catch {
+        return true;
+    }
+}
+
+function readLiveStream(): { key: string; viewers: number; } | null {
+    try {
+        const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.() as
+            | { guildId: string | null; channelId: string; ownerId: string; state?: string; }
+            | null
+            | undefined;
         if (stream == null) return null;
-        const viewerIds = ApplicationStreamingStore?.getViewerIds?.(streamKeyOf(stream));
-        return { viewers: Array.isArray(viewerIds) ? viewerIds.length : 0 };
+        if (stream.state === "ENDED" || stream.state === "FAILED") return null;
+        const key = streamKeyOf(stream);
+        const viewerIds = ApplicationStreamingStore?.getViewerIds?.(key);
+        return { key, viewers: Array.isArray(viewerIds) ? viewerIds.length : 0 };
     } catch (error) {
         logger.warn("Could not read the active stream", error);
         return null;
     }
 }
 
-function endOwnedStream(): void {
-    if (!ownsStream) return;
+export function endOwnedStream(): void {
+    const shouldStop = ownsStream;
     ownsStream = false;
     try {
-        const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
-        if (stream != null && typeof stopStream === "function") {
-            stopStream(streamKeyOf(stream));
+        if (shouldStop) {
+            const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
+            if (stream != null && typeof stopStream === "function") {
+                stopStream(streamKeyOf(stream));
+            }
         }
     } catch (error) {
         logger.error("Could not end the stream", error);
+    } finally {
+        restoreStreamSettings();
     }
 }
 
@@ -673,7 +836,7 @@ export async function listStreamSources(): Promise<DesktopSource[]> {
     return sources;
 }
 
-async function goLive(id: number, channel: Channel, preferredSourceId?: string): Promise<boolean> {
+async function goLive(id: number, channel: Channel, config: StreamFarmConfig): Promise<boolean> {
     if (typeof startStream !== "function" || typeof getDesktopSources !== "function") {
         lastError = "Go Live requires the Discord desktop app.";
         return false;
@@ -681,8 +844,8 @@ async function goLive(id: number, channel: Channel, preferredSourceId?: string):
 
     try {
         const sources = await listStreamSources();
-        const preferred = preferredSourceId != null
-            ? sources.find(item => item.id === preferredSourceId)
+        const preferred = config.sourceId != null && config.sourceId !== ""
+            ? sources.find(item => item.id === config.sourceId)
             : undefined;
         const source = preferred ?? sources.find(item => item.kind === "screen") ?? sources[0];
 
@@ -692,13 +855,16 @@ async function goLive(id: number, channel: Channel, preferredSourceId?: string):
         }
         if (!alive(id)) return false;
 
+        const lowPower = config.lowPower !== false;
+        if (lowPower) applyLowPowerStreamSettings();
+
         startStream(channel.guild_id ?? null, channel.id, {
             pid: null,
             sourceId: source.id,
             sourceName: source.name,
             audioSourceId: null,
             sound: false,
-            previewDisabled: false
+            previewDisabled: lowPower
         });
 
         // Keep polling after Stop so a late stream gets ended instead of staying live.
@@ -707,11 +873,14 @@ async function goLive(id: number, channel: Channel, preferredSourceId?: string):
             await wait(500);
             const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
             if (stream == null) continue;
+            const key = streamKeyOf(stream);
             if (!alive(id)) {
-                if (!running && typeof stopStream === "function") stopStream(streamKeyOf(stream));
+                if (!running && typeof stopStream === "function") stopStream(key);
+                restoreStreamSettings();
                 return false;
             }
             ownsStream = true;
+            keepStreamUnpaused(key);
             return true;
         }
         lastError = "Go Live did not start within 10 seconds.";
@@ -723,11 +892,23 @@ async function goLive(id: number, channel: Channel, preferredSourceId?: string):
     }
 }
 
-async function runStream(id: number, targetHours: number, sourceId?: string): Promise<boolean> {
+async function runStream(id: number, targetHours: number, config: StreamFarmConfig = {}): Promise<boolean> {
     const targetMs = Math.round(targetHours * 3_600_000);
     streamTarget = targetHours;
 
-    const problem = voiceProblem(currentVoiceChannel());
+    const noTrackState = getNoTrackStreamState();
+    if (noTrackState === "disabled_in_settings") {
+        lastError = 'NoTrack blocks stream badge events. Click "Enable in NoTrack" and reload Discord first.';
+        notify();
+        return false;
+    }
+    if (noTrackState === "needs_restart") {
+        lastError = "Reload Discord once so NoTrack's badge tracking change takes effect.";
+        notify();
+        return false;
+    }
+
+    const problem = voiceProblem(currentVoiceChannel(), true);
     if (problem != null) {
         lastError = problem;
         notify();
@@ -741,14 +922,23 @@ async function runStream(id: number, targetHours: number, sourceId?: string): Pr
 
     while (alive(id) && liveMs < targetMs) {
         const channel = currentVoiceChannel();
-        const issue = voiceProblem(channel);
+        const issue = voiceProblem(channel, true);
         if (issue != null) {
             lastError = issue;
             break;
         }
 
-        const live = readLiveStream();
         const now = Date.now();
+        if (!isRtcReady()) {
+            lastTick = now;
+            streamPaused = true;
+            lastError = "Voice connection is reconnecting. Waiting for RTC...";
+            notify();
+            await wait(3_000, runAbort?.signal);
+            continue;
+        }
+
+        const live = readLiveStream();
 
         if (live == null) {
             if (restarts >= STREAM_RESTART_LIMIT) {
@@ -760,17 +950,26 @@ async function runStream(id: number, targetHours: number, sourceId?: string): Pr
             streamPaused = false;
             notify();
 
-            if (await goLive(id, channel!, sourceId)) {
+            if (await goLive(id, channel!, config)) {
                 restarts = 0;
                 segmentStart = Date.now();
                 lastTick = Date.now();
-                if (lastError?.startsWith("Go Live")) lastError = null;
+                if (lastError?.startsWith("Go Live") || lastError?.startsWith("Voice connection")) {
+                    lastError = null;
+                }
             } else {
                 lastTick = Date.now();
                 await wait(5_000, runAbort?.signal);
             }
             continue;
         }
+
+        // Adopt the active stream so stopping or finishing dispatches STREAM_STOP and flushes video_stream_ended.
+        ownsStream = true;
+        if (config.lowPower !== false && savedStreamSettings == null) {
+            applyLowPowerStreamSettings();
+        }
+        keepStreamUnpaused(live.key);
 
         // Clamp delta so OS sleep/wake jumps cannot fabricate fake stream hours.
         const delta = Math.min(Math.max(0, now - lastTick), MAX_TICK_DELTA_MS);
@@ -781,15 +980,19 @@ async function runStream(id: number, targetHours: number, sourceId?: string): Pr
             liveMs += delta;
             streamHours = Math.min(liveMs, targetMs) / 3_600_000;
             streamPaused = false;
-            if (lastError?.startsWith("Waiting for a viewer")) lastError = null;
+            if (lastError?.startsWith("Waiting for a viewer") || lastError?.startsWith("Voice connection")) {
+                lastError = null;
+            }
         } else {
             streamPaused = true;
-            lastError = "Waiting for a viewer. Bring another account into the channel and open your stream.";
+            const others = countOtherChannelMembers(channel!.id);
+            lastError = others > 0
+                ? "Waiting for a viewer. Have the other person in call click Watch Stream (or run Auto-watch on your alt)."
+                : "Waiting for a viewer. Bring an alt into this voice channel and watch your stream.";
         }
 
-        if (now - segmentStart >= STREAM_ROTATE_MS) {
-            logger.info("Restarting the stream before Discord's 5-hour cutoff");
-            ownsStream = true;
+        if (config.checkpoint === true && now - segmentStart >= STREAM_CHECKPOINT_MS && liveMs < targetMs) {
+            logger.info("Checkpointing stream so Discord flushes video_stream_ended");
             endOwnedStream();
             segmentStart = Date.now();
             await wait(STREAM_REJOIN_GAP_MS, runAbort?.signal);
@@ -811,6 +1014,50 @@ async function runStream(id: number, targetHours: number, sourceId?: string): Pr
     return alive(id) && liveMs >= targetMs;
 }
 
+async function runViewerHelper(id: number): Promise<void> {
+    const myId = UserStore?.getCurrentUser?.()?.id;
+
+    while (alive(id)) {
+        const channel = currentVoiceChannel();
+        const issue = voiceProblem(channel, false);
+        if (issue != null) {
+            watchingOwner = null;
+            lastError = issue;
+            notify();
+            await wait(VIEWER_TICK_MS, runAbort?.signal);
+            continue;
+        }
+
+        try {
+            const streams = ApplicationStreamingStore?.getAllApplicationStreamsForChannel?.(channel!.id) ?? [];
+            const target = streams.find(stream => stream.ownerId !== myId) ?? null;
+
+            if (target == null) {
+                watchingOwner = null;
+                lastError = `Waiting for someone to Go Live in ${channel!.name ? `#${channel!.name}` : "this call"}...`;
+            } else {
+                const key = streamKeyOf(target);
+                const active = ApplicationStreamingStore?.getActiveStreamForStreamKey?.(key);
+                if (active == null) {
+                    if (typeof watchStreamAction === "function") {
+                        watchStreamAction(target, true);
+                    } else {
+                        FluxDispatcher.dispatch({ type: "STREAM_WATCH", streamKey: key, allowMultiple: true });
+                    }
+                }
+                keepStreamUnpaused(key);
+                watchingOwner = target.ownerId;
+                lastError = null;
+            }
+        } catch (error) {
+            logger.warn("Viewer auto-watch tick failed", error);
+        }
+
+        notify();
+        await wait(VIEWER_TICK_MS, runAbort?.signal);
+    }
+}
+
 function begin(nextMode: FarmerMode): number | null {
     if (running) return null;
     running = true;
@@ -824,6 +1071,7 @@ function begin(nextMode: FarmerMode): number | null {
     streamTarget = 0;
     streamViewers = null;
     streamPaused = false;
+    watchingOwner = null;
     errors = 0;
     lastError = null;
     finishedMessage = null;
@@ -844,6 +1092,7 @@ function end(id: number): void {
     endOwnedStream();
     streamViewers = null;
     streamPaused = false;
+    watchingOwner = null;
     notify();
 }
 
@@ -901,14 +1150,14 @@ export async function startVariety(apps: DetectableApp[], minutesPerGame = DEFAU
     }
 }
 
-export async function startStreamFarm(hours = ETERNAL_HOURS, sourceId?: string): Promise<void> {
+export async function startStreamFarm(hours = ETERNAL_HOURS, config: StreamFarmConfig = {}): Promise<void> {
     const safeHours = Number.isFinite(hours) ? Math.min(Math.max(0.1, hours), MAX_TARGET_HOURS) : ETERNAL_HOURS;
     const id = begin("STREAM");
     if (id == null) return;
     try {
-        const reached = await runStream(id, safeHours, sourceId);
+        const reached = await runStream(id, safeHours, config);
         if (reached) {
-            markFinished(`Streamed ${Math.round(streamHours).toLocaleString()} hours. Give Discord a day or two to update the badge.`);
+            markFinished(`Streamed ${Math.round(streamHours).toLocaleString()} hours. Give Discord up to 48 hours to update the badge.`);
         }
     } catch (error) {
         lastError = describeError(error);
@@ -918,7 +1167,27 @@ export async function startStreamFarm(hours = ETERNAL_HOURS, sourceId?: string):
     }
 }
 
-export async function maxAll(apps: DetectableApp[], sourceId?: string): Promise<void> {
+export async function startViewerWatch(): Promise<void> {
+    const channel = currentVoiceChannel();
+    const problem = voiceProblem(channel, false);
+    if (problem != null) {
+        lastError = problem;
+        notify();
+        return;
+    }
+    const id = begin("VIEWER");
+    if (id == null) return;
+    try {
+        await runViewerHelper(id);
+    } catch (error) {
+        lastError = describeError(error);
+        logger.error("Viewer helper crashed", error);
+    } finally {
+        end(id);
+    }
+}
+
+export async function maxAll(apps: DetectableApp[], config: StreamFarmConfig = {}): Promise<void> {
     if (!Array.isArray(apps) || apps.length === 0) {
         lastError = "Game catalog is not ready yet. Wait for it to finish loading.";
         notify();
@@ -941,7 +1210,7 @@ export async function maxAll(apps: DetectableApp[], sourceId?: string): Promise<
 
         const summary = `${gamesCredited} games and ${Math.round(hoursCredited).toLocaleString()} hours of ${pool[0].name}`;
 
-        if (voiceProblem(currentVoiceChannel()) != null) {
+        if (voiceProblem(currentVoiceChannel(), true) != null || getNoTrackStreamState() !== "ok") {
             markFinished(`Sent ${summary}. Join a voice channel and run Streaming on its own for the third badge.`);
             return;
         }
@@ -951,7 +1220,7 @@ export async function maxAll(apps: DetectableApp[], sourceId?: string): Promise<
         } catch {
             // Toast failures are non-fatal.
         }
-        const reached = await runStream(id, ETERNAL_HOURS, sourceId);
+        const reached = await runStream(id, ETERNAL_HOURS, config);
         if (reached) {
             markFinished(`Finished ${summary}, plus ${Math.round(streamHours).toLocaleString()} hours streamed.`);
         }

@@ -15,10 +15,11 @@ const TOKEN_MAX_AGE_MS = 12 * 60 * 60 * 1_000;
 
 export const MIN_DURATION_MS = 60_000;
 export const MAX_SESSION_MS = 24 * 60 * 60 * 1_000;
-export const MAX_SESSIONS_PER_BATCH = 8;
+export const MAX_SESSIONS_PER_BATCH = 12;
 
 const SuperProperties: { getSuperProperties?(): Record<string, unknown>; } = findByPropsLazy("getSuperProperties");
 const ConsentStore: { hasConsented?(type: string): boolean; } = findStoreLazy("ConsentStore");
+const AnalyticsTrackingStore: { submitEventsImmediately?: (...args: unknown[]) => unknown; } = findStoreLazy("AnalyticsTrackingStore");
 const logger = new Logger("BadgeFarmer");
 
 type DetectedGame = RunningGame & { executableFingerprint?: string; };
@@ -69,6 +70,16 @@ export function isPersonalizationEnabled(): boolean | null {
         return Boolean(ConsentStore.hasConsented("personalization"));
     } catch {
         return null;
+    }
+}
+
+/** True when NoTrack's stub store is active in memory and dropping client stream events. */
+export function isAnalyticsStubbed(): boolean {
+    try {
+        const fn = AnalyticsTrackingStore?.submitEventsImmediately;
+        return typeof fn === "function" && String(fn).includes("NoTrack");
+    } catch {
+        return false;
     }
 }
 
@@ -136,6 +147,7 @@ function readClientTelemetry(): ClientTelemetry {
 
 function buildLaunch(
     game: CreditableGame,
+    exeLower: string,
     fingerprint: string,
     telemetry: ClientTelemetry,
     trackAt: number,
@@ -162,7 +174,7 @@ function buildLaunch(
         activity_status_shared_guilds: [],
         current_user_status: "online",
         game_detection_enabled: true,
-        executable_path: game.exeName,
+        executable_path: exeLower,
         voice_channel_id: null,
         voice_channel_type: null,
         voice_channel_bitrate: null,
@@ -187,6 +199,7 @@ function buildLaunch(
 
 function buildHeartbeat(
     game: CreditableGame,
+    exeLower: string,
     durationMs: number,
     gameSession: string,
     initial: boolean,
@@ -203,7 +216,7 @@ function buildHeartbeat(
             game_id: game.id,
             game_name: game.name,
             game_metadata: null,
-            game_executable: game.exeName,
+            game_executable: exeLower,
             game_detection_enabled: true,
             initial_heartbeat: initial,
             final_heartbeat: !initial,
@@ -250,13 +263,14 @@ export async function creditPlaytimeBatch(sessions: readonly PlaytimeSession[]):
         const end = Math.min(start + duration, sendAt);
         const actualDuration = Math.max(end - start, MIN_DURATION_MS);
 
+        const exeLower = session.game.exeName.toLowerCase();
         const fingerprint = fingerprintFor(session.game.id);
         const gameSession = crypto.randomUUID();
 
         events.push(
-            buildLaunch(session.game, fingerprint, telemetry, start, sendAt),
-            buildHeartbeat(session.game, 0, gameSession, true, telemetry, start, sendAt),
-            buildHeartbeat(session.game, actualDuration, gameSession, false, telemetry, end, sendAt)
+            buildLaunch(session.game, exeLower, fingerprint, telemetry, start, sendAt),
+            buildHeartbeat(session.game, exeLower, 0, gameSession, true, telemetry, start, sendAt),
+            buildHeartbeat(session.game, exeLower, actualDuration, gameSession, false, telemetry, end, sendAt)
         );
 
         creditedMs += actualDuration;

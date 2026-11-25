@@ -14,13 +14,17 @@ import definePlugin, { OptionType } from "@utils/types";
 import { onceReady } from "@webpack";
 import { FluxDispatcher, useEffect, UserStore } from "@webpack/common";
 
-import { getStatus, loadCatalogue, maxAll, stop as stopFarmer, subscribe } from "./farmer";
+import { endOwnedStream, getStatus, loadCatalogue, maxAll, stop as stopFarmer, subscribe } from "./farmer";
 import { BadgeFarmerDashboard, BadgeIcon, closeBadgeFarmerModal, openBadgeFarmerModal } from "./ui";
 
 const logger = new Logger("BadgeFarmer");
 
 let enabled = false;
 let pendingConnectionHandler: (() => void) | null = null;
+
+function handleBeforeUnload(): void {
+    endOwnedStream();
+}
 
 const settings = definePluginSettings({
     dashboard: {
@@ -93,6 +97,8 @@ export default definePlugin({
 
     start() {
         enabled = true;
+        window.addEventListener("beforeunload", handleBeforeUnload);
+
         if (!settings.store.autoStartMaxAll) return;
 
         onceReady
@@ -113,6 +119,7 @@ export default definePlugin({
 
     stop() {
         enabled = false;
+        window.removeEventListener("beforeunload", handleBeforeUnload);
         detachConnectionWaiter();
         closeBadgeFarmerModal();
         stopFarmer();

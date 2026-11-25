@@ -5,15 +5,13 @@
  */
 
 /**
- * BadgeFarmer Console Edition (desktop and mobile JS consoles)
- *
- * Uses your Discord session token to post batched /science play sessions for
- * Game Time and Variety, and tracks live Go Live stream hours on desktop.
+ * BadgeFarmer Console Edition (desktop and browser DevTools)
  *
  * Commands:
  *   BadgeFarmer.gameTime("Dota 2", 5000)
  *   BadgeFarmer.variety(2, 100)
  *   BadgeFarmer.stream(1)
+ *   BadgeFarmer.watch()
  *   BadgeFarmer.maxAll()
  *   BadgeFarmer.search("counter")
  *   BadgeFarmer.stop()
@@ -26,11 +24,13 @@
 
     const MIN_DURATION_MS = 60_000;
     const MAX_SESSION_MS = 24 * 60 * 60 * 1_000;
-    const BATCH_SIZE = 8;
-    const REQUEST_DELAY_MS = 700;
+    const BATCH_SIZE = 12;
+    const REQUEST_DELAY_MS = 500;
     const RETRY_DELAY_MS = 3_000;
     const MAX_FAILED_BATCHES = 5;
-    const STREAM_TICK_MS = 10_000;
+    const STREAM_TICK_MS = 8_000;
+    const VIEWER_TICK_MS = 4_000;
+    const STREAM_CHECKPOINT_MS = 2 * 60 * 60 * 1_000;
     const MAX_TICK_DELTA_MS = STREAM_TICK_MS * 3;
 
     const state = {
@@ -46,10 +46,12 @@
         gamesCredited: 0,
         streamHours: 0,
         streamViewers: null,
+        watchingOwner: null,
         errors: 0,
         lastError: null,
         abort: null,
-        catalogue: null
+        catalogue: null,
+        savedStreamSettings: null
     };
 
     const log = (msg, ok = true) =>
@@ -80,9 +82,29 @@
 
     function findStore(name) {
         for (const exp of getWebpackExports()) {
-            const candidates = [exp, exp?.default, exp?.Z, exp?.ZP];
-            for (const c of candidates) {
+            for (const c of [exp, exp?.default, exp?.Z, exp?.ZP]) {
                 if (c?.getName?.() === name) return c;
+            }
+        }
+        return null;
+    }
+
+    function findDispatcher() {
+        for (const exp of getWebpackExports()) {
+            for (const c of [exp, exp?.default, exp?.Z, exp?.ZP]) {
+                if (typeof c?.dispatch === "function" && typeof c?.subscribe === "function") return c;
+            }
+        }
+        return null;
+    }
+
+    function findFnByCode(snippet) {
+        for (const exp of getWebpackExports()) {
+            if (typeof exp === "function" && String(exp).includes(snippet)) return exp;
+            if (exp && typeof exp === "object") {
+                for (const val of Object.values(exp)) {
+                    if (typeof val === "function" && String(val).includes(snippet)) return val;
+                }
             }
         }
         return null;
@@ -207,6 +229,7 @@
         const end = Math.min(start + clamped, sendAt);
         const actual = Math.max(end - start, MIN_DURATION_MS);
         const sessionId = crypto.randomUUID();
+        const exeLower = game.exeName.toLowerCase();
 
         const shared = {
             client_heartbeat_session_id: state.heartbeatSessionId,
@@ -233,7 +256,7 @@
                         detection_method: "verified_game",
                         activity_status_enabled: true,
                         game_detection_enabled: true,
-                        executable_path: game.exeName
+                        executable_path: exeLower
                     }
                 },
                 {
@@ -244,7 +267,7 @@
                         event_sequence_number: ++state.sequence,
                         game_id: game.id,
                         game_name: game.name,
-                        game_executable: game.exeName,
+                        game_executable: exeLower,
                         game_detection_enabled: true,
                         initial_heartbeat: true,
                         final_heartbeat: false,
@@ -260,7 +283,7 @@
                         event_sequence_number: ++state.sequence,
                         game_id: game.id,
                         game_name: game.name,
-                        game_executable: game.exeName,
+                        game_executable: exeLower,
                         game_detection_enabled: true,
                         initial_heartbeat: false,
                         final_heartbeat: true,
@@ -322,6 +345,7 @@
         state.mode = mode;
         state.errors = 0;
         state.lastError = null;
+        state.watchingOwner = null;
         state.abort = new AbortController();
         return state.abort.signal;
     }
@@ -329,6 +353,7 @@
     function finish() {
         state.running = false;
         state.mode = "IDLE";
+        state.watchingOwner = null;
         state.abort = null;
     }
 
@@ -375,16 +400,25 @@
     }
 
     async function runVariety(games, minutesPerGame, signal) {
+        const unique = [];
+        const seen = new Set();
+        for (const game of games) {
+            if (game?.id && !seen.has(game.id)) {
+                seen.add(game.id);
+                unique.push(game);
+            }
+        }
+
         const sessionMs = Math.min(MAX_SESSION_MS, Math.max(MIN_DURATION_MS, Math.floor(minutesPerGame * 60_000)));
         const cursorRef = { value: Date.now() };
         let failures = 0;
         state.gamesCredited = 0;
 
-        log(`Variety: ${games.length} games, ${minutesPerGame} min each (${BATCH_SIZE} per batch)`);
+        log(`Variety: ${unique.length} games, ${minutesPerGame} min each (${BATCH_SIZE} per batch)`);
 
-        for (let i = 0; i < games.length; i += BATCH_SIZE) {
+        for (let i = 0; i < unique.length; i += BATCH_SIZE) {
             if (signal.aborted) return false;
-            const batch = games.slice(i, i + BATCH_SIZE).map(game => ({
+            const batch = unique.slice(i, i + BATCH_SIZE).map(game => ({
                 game,
                 durationMs: sessionMs,
                 startedAt: nextSlot(cursorRef, sessionMs)
@@ -401,48 +435,127 @@
             }
             failures = 0;
             state.gamesCredited += result.count;
-            log(`${state.gamesCredited}/${games.length} games sent`);
-            if (i + BATCH_SIZE < games.length) await wait(REQUEST_DELAY_MS, signal);
+            log(`${state.gamesCredited}/${unique.length} games sent`);
+            if (i + BATCH_SIZE < unique.length) await wait(REQUEST_DELAY_MS, signal);
         }
 
-        const done = !signal.aborted && state.gamesCredited >= games.length;
+        const done = !signal.aborted && state.gamesCredited >= unique.length;
         if (done) log(`Variety done: ${state.gamesCredited} games sent. Discord updates badges overnight.`);
         return done;
     }
 
-    async function runStreamMonitor(hours, signal) {
+    function streamKeyOf(s) {
+        return s.guildId != null
+            ? `guild:${s.guildId}:${s.channelId}:${s.ownerId}`
+            : `call:${s.channelId}:${s.ownerId}`;
+    }
+
+    async function runStreamFarm(hours, opts, signal) {
+        const dispatcher = findDispatcher();
         const streamingStore = findStore("ApplicationStreamingStore");
-        if (!streamingStore?.getCurrentUserActiveStream) {
-            log("Streaming requires Discord desktop with an active Go Live broadcast and at least one viewer. Fake telemetry earns nothing.", false);
+        const streamSettingsStore = findStore("ApplicationStreamingSettingsStore");
+        const selectedStore = findStore("SelectedChannelStore");
+        const channelStore = findStore("ChannelStore");
+        const rtcStore = findStore("RTCConnectionStore");
+        const mediaStore = findStore("MediaEngineStore");
+        const startStreamFn = findFnByCode('type:"STREAM_START"');
+        const stopStreamFn = findFnByCode('type:"STREAM_STOP"');
+        const getSourcesFn = findFnByCode("desktop sources");
+
+        if (!streamingStore?.getCurrentUserActiveStream || !dispatcher) {
+            log("Streaming requires Discord desktop with an active Go Live broadcast and a viewer.", false);
             return false;
         }
 
+        const lowPower = opts?.lowPower !== false;
+        const checkpoint = opts?.checkpoint === true;
         const targetMs = Math.round(Math.max(0.1, hours) * 3_600_000);
         let liveMs = 0;
         let lastTick = Date.now();
-        let warnedNoStream = false;
+        let segmentStart = Date.now();
         let warnedNoViewers = false;
+        let owns = false;
         state.streamHours = 0;
 
-        log(`Streaming: tracking ${hours}h. Start Go Live in a voice channel with at least one viewer watching.`);
+        if (lowPower && streamSettingsStore?.getState) {
+            const cur = streamSettingsStore.getState();
+            if (cur) state.savedStreamSettings = { preset: cur.preset, resolution: cur.resolution, fps: cur.fps };
+            dispatcher.dispatch({ type: "STREAM_UPDATE_SETTINGS", preset: 3, resolution: 480, frameRate: 15 });
+        }
 
-        while (!signal.aborted && liveMs < targetMs) {
-            const now = Date.now();
-            const delta = Math.min(Math.max(0, now - lastTick), MAX_TICK_DELTA_MS);
-            lastTick = now;
-
-            const stream = streamingStore.getCurrentUserActiveStream();
-            if (!stream) {
-                state.streamViewers = null;
-                if (!warnedNoStream) {
-                    log("No active Go Live stream detected. Start Go Live in a voice channel.", false);
-                    warnedNoStream = true;
+        function cleanupStream() {
+            try {
+                if (owns && stopStreamFn) {
+                    const active = streamingStore.getCurrentUserActiveStream();
+                    if (active) stopStreamFn(streamKeyOf(active));
                 }
-            } else {
-                warnedNoStream = false;
-                const key = stream.guildId != null
-                    ? `guild:${stream.guildId}:${stream.channelId}:${stream.ownerId}`
-                    : `call:${stream.channelId}:${stream.ownerId}`;
+            } catch { /* ignore */ }
+            owns = false;
+            if (state.savedStreamSettings) {
+                const s = state.savedStreamSettings;
+                state.savedStreamSettings = null;
+                try {
+                    dispatcher.dispatch({ type: "STREAM_UPDATE_SETTINGS", preset: s.preset, resolution: s.resolution, frameRate: s.fps });
+                } catch { /* ignore */ }
+            }
+        }
+
+        try {
+            log(`Streaming: target ${hours}h. Keep at least one viewer watching (run BadgeFarmer.watch() on your alt).`);
+
+            while (!signal.aborted && liveMs < targetMs) {
+                const channelId = selectedStore?.getVoiceChannelId?.();
+                const channel = channelId ? channelStore?.getChannel?.(channelId) : null;
+                if (!channel) {
+                    log("Join a voice channel before streaming.", false);
+                    break;
+                }
+
+                const now = Date.now();
+                if (rtcStore?.isConnected && !rtcStore.isConnected()) {
+                    lastTick = now;
+                    await wait(3_000, signal);
+                    continue;
+                }
+
+                let stream = streamingStore.getCurrentUserActiveStream();
+                if (!stream && startStreamFn && getSourcesFn && mediaStore?.getMediaEngine) {
+                    try {
+                        const engine = mediaStore.getMediaEngine();
+                        const isWin = navigator.userAgent.includes("Windows");
+                        const sources = getSourcesFn.length === 3
+                            ? await getSourcesFn(engine, ["screen", "window"], null)
+                            : await getSourcesFn(engine, isWin, ["screen", "window"], null);
+                        const source = sources?.[0];
+                        if (source) {
+                            startStreamFn(channel.guild_id ?? null, channel.id, {
+                                pid: null,
+                                sourceId: source.id,
+                                sourceName: source.name,
+                                audioSourceId: null,
+                                sound: false,
+                                previewDisabled: lowPower
+                            });
+                            await wait(2_500, signal);
+                            stream = streamingStore.getCurrentUserActiveStream();
+                        }
+                    } catch (err) {
+                        log(`Auto-start Go Live failed (${err.message}). Click Go Live manually.`, false);
+                    }
+                }
+
+                if (!stream) {
+                    lastTick = Date.now();
+                    await wait(5_000, signal);
+                    continue;
+                }
+
+                owns = true;
+                const key = streamKeyOf(stream);
+                dispatcher.dispatch({ type: "STREAM_SET_PAUSED", streamKey: key, paused: false });
+
+                const delta = Math.min(Math.max(0, now - lastTick), MAX_TICK_DELTA_MS);
+                lastTick = now;
                 const viewers = streamingStore.getViewerIds?.(key)?.length ?? 0;
                 state.streamViewers = viewers;
 
@@ -451,17 +564,63 @@
                     liveMs += delta;
                     state.streamHours = Math.round((Math.min(liveMs, targetMs) / 3_600_000) * 100) / 100;
                 } else if (!warnedNoViewers) {
-                    log("Waiting for a viewer. Have another account watch your stream so hours count.", false);
+                    log("Waiting for a viewer. Run BadgeFarmer.watch() in your alt's console.", false);
                     warnedNoViewers = true;
                 }
-            }
 
-            await wait(Math.min(STREAM_TICK_MS, Math.max(1_000, targetMs - liveMs)), signal);
+                if (checkpoint && now - segmentStart >= STREAM_CHECKPOINT_MS && liveMs < targetMs) {
+                    if (stopStreamFn) stopStreamFn(key);
+                    segmentStart = Date.now();
+                    await wait(2_500, signal);
+                    lastTick = Date.now();
+                    continue;
+                }
+
+                await wait(Math.min(STREAM_TICK_MS, Math.max(1_000, targetMs - liveMs)), signal);
+            }
+        } finally {
+            cleanupStream();
         }
 
         const done = !signal.aborted && liveMs >= targetMs;
         if (done) log(`Streaming done: ${hours}h tracked. Give Discord up to 48 hours to update the badge.`);
         return done;
+    }
+
+    async function runViewerHelper(signal) {
+        const dispatcher = findDispatcher();
+        const streamingStore = findStore("ApplicationStreamingStore");
+        const selectedStore = findStore("SelectedChannelStore");
+        const userStore = findStore("UserStore");
+
+        if (!dispatcher || !streamingStore || !selectedStore) {
+            throw new Error("Discord voice/stream stores not found.");
+        }
+
+        const myId = userStore?.getCurrentUser?.()?.id;
+        log("Viewer auto-watch active. Leave this account in the voice channel.");
+
+        while (!signal.aborted) {
+            const channelId = selectedStore.getVoiceChannelId?.();
+            if (channelId) {
+                const streams = streamingStore.getAllApplicationStreamsForChannel?.(channelId) ?? [];
+                const target = streams.find(s => s.ownerId !== myId);
+                if (target) {
+                    const key = streamKeyOf(target);
+                    const active = streamingStore.getActiveStreamForStreamKey?.(key);
+                    if (!active) {
+                        dispatcher.dispatch({ type: "STREAM_WATCH", streamKey: key, allowMultiple: true });
+                    }
+                    dispatcher.dispatch({ type: "STREAM_SET_PAUSED", streamKey: key, paused: false });
+                    state.watchingOwner = target.ownerId;
+                } else {
+                    state.watchingOwner = null;
+                }
+            } else {
+                state.watchingOwner = null;
+            }
+            await wait(VIEWER_TICK_MS, signal);
+        }
     }
 
     function pickRandom(apps, count) {
@@ -502,6 +661,7 @@
                 games: state.gamesCredited,
                 streamHours: state.streamHours,
                 streamViewers: state.streamViewers,
+                watchingOwner: state.watchingOwner,
                 errors: state.errors,
                 lastError: state.lastError
             };
@@ -543,10 +703,19 @@
             }
         },
 
-        async stream(hours = 1) {
+        async stream(hours = 1, opts = {}) {
             const signal = begin("STREAM");
             try {
-                await runStreamMonitor(hours, signal);
+                await runStreamFarm(hours, opts, signal);
+            } finally {
+                finish();
+            }
+        },
+
+        async watch() {
+            const signal = begin("VIEWER");
+            try {
+                await runViewerHelper(signal);
             } finally {
                 finish();
             }
@@ -571,6 +740,6 @@
     if (typeof window !== "undefined") window.BadgeFarmer = BadgeFarmer;
     else globalThis.BadgeFarmer = BadgeFarmer;
 
-    log('Loaded. Try BadgeFarmer.gameTime("Dota 2", 5000), .variety(), .stream(1), .maxAll(), .stop(), .status');
+    log('Loaded. Try BadgeFarmer.gameTime("Dota 2", 5000), .variety(), .stream(1), .watch(), .maxAll(), .stop()');
     return BadgeFarmer;
 })();

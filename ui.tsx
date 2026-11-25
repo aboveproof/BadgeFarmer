@@ -6,6 +6,7 @@
 
 import { Button } from "@components/Button";
 import ErrorBoundary from "@components/ErrorBoundary";
+import { copyToClipboard } from "@utils/clipboard";
 import { classNameFactory } from "@utils/css";
 import { useForceUpdater } from "@utils/react";
 import type { RenderModalProps } from "@vencord/discord-types";
@@ -15,6 +16,7 @@ import {
     openModal,
     ReactDOM,
     SelectedChannelStore,
+    showToast,
     useEffect,
     useLayoutEffect,
     useMemo,
@@ -32,8 +34,8 @@ const cl = classNameFactory("vc-badge-farmer-");
 
 const MODAL_KEY = "vc-badge-farmer-modal";
 const MAX_RESULTS = 40;
-// Average cost of one batched /science POST plus the pacing pause.
-const SECONDS_PER_BATCH = 0.9;
+// Average cost of one batched /science POST plus the 500ms pacing delay.
+const SECONDS_PER_BATCH = 0.65;
 
 interface Tier {
     name: string;
@@ -264,6 +266,33 @@ function Field({ label, hint, value, onChange, error, suffix, disabled }: {
     );
 }
 
+function ToggleOption({ checked, disabled, title, note, onChange }: {
+    checked: boolean;
+    disabled: boolean;
+    title: string;
+    note: string;
+    onChange: (next: boolean) => void;
+}) {
+    return (
+        <button
+            type="button"
+            role="switch"
+            aria-checked={checked}
+            disabled={disabled}
+            className={cl("toggle", { "toggle-on": checked })}
+            onClick={() => onChange(!checked)}
+        >
+            <div className={cl("toggle-copy")}>
+                <span className={cl("toggle-title")}>{title}</span>
+                <span className={cl("toggle-note")}>{note}</span>
+            </div>
+            <span className={cl("switch", { "switch-on": checked })} aria-hidden="true">
+                <span className={cl("switch-knob")} />
+            </span>
+        </button>
+    );
+}
+
 function GamePicker({ apps, error, selected, onSelect, disabled }: {
     apps: DetectableApp[] | null;
     error: string | null;
@@ -272,7 +301,9 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
     disabled: boolean;
 }) {
     const [query, setQuery] = useState("");
+    const [open, setOpen] = useState(false);
     const [highlight, setHighlight] = useState(0);
+    const wrapRef = useRef<HTMLDivElement>(null);
     const listRef = useRef<HTMLDivElement>(null);
 
     const indexed = useMemo<IndexedApp[]>(() => {
@@ -311,32 +342,47 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
         return matches.slice(0, MAX_RESULTS);
     }, [indexed, query]);
 
+    const showResults = open && results.length > 0;
     const activeIndex = highlight < results.length ? highlight : 0;
 
     useEffect(() => {
+        if (!showResults) return;
         const row = listRef.current?.children[activeIndex] as HTMLElement | undefined;
         row?.scrollIntoView({ block: "nearest" });
-    }, [activeIndex]);
+    }, [showResults, activeIndex]);
+
+    useEffect(() => {
+        if (!showResults) return;
+        function onMouseDown(event: MouseEvent) {
+            if (!wrapRef.current?.contains(event.target as Node | null)) setOpen(false);
+        }
+        document.addEventListener("mousedown", onMouseDown);
+        return () => document.removeEventListener("mousedown", onMouseDown);
+    }, [showResults]);
 
     function choose(app: DetectableApp) {
         onSelect(app);
         setQuery("");
+        setOpen(false);
         setHighlight(0);
     }
 
     function onKeyDown(event: KeyboardEvent<HTMLInputElement>) {
         if (event.key === "Escape") {
+            setOpen(false);
             setQuery("");
             return;
         }
         if (results.length === 0) return;
         if (event.key === "ArrowDown") {
             event.preventDefault();
+            setOpen(true);
             setHighlight(Math.min(activeIndex + 1, results.length - 1));
         } else if (event.key === "ArrowUp") {
             event.preventDefault();
+            setOpen(true);
             setHighlight(Math.max(activeIndex - 1, 0));
-        } else if (event.key === "Enter") {
+        } else if (event.key === "Enter" && showResults) {
             event.preventDefault();
             const picked = results[activeIndex];
             if (picked != null) choose(picked.app);
@@ -362,7 +408,7 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
         : apps == null ? "Loading Discord's game list" : `Search ${apps.length.toLocaleString()} games`;
 
     return (
-        <div className={cl("search")}>
+        <div className={cl("search")} ref={wrapRef}>
             <span className={cl("input-wrap")}>
                 <input
                     className={cl("input")}
@@ -371,11 +417,13 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
                     disabled={disabled || apps == null}
                     spellCheck={false}
                     role="combobox"
-                    aria-expanded={results.length > 0}
+                    aria-expanded={showResults}
                     aria-controls="vc-badge-farmer-results"
                     aria-label="Search for a game"
+                    onFocus={() => setOpen(true)}
                     onChange={event => {
                         setQuery(event.currentTarget.value);
+                        setOpen(true);
                         setHighlight(0);
                     }}
                     onKeyDown={onKeyDown}
@@ -385,13 +433,16 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
                         type="button"
                         className={cl("clear")}
                         aria-label="Clear search"
-                        onClick={() => setQuery("")}
+                        onClick={() => {
+                            setQuery("");
+                            setOpen(false);
+                        }}
                     >
                         ×
                     </button>
                 )}
             </span>
-            {results.length > 0 && (
+            {showResults && (
                 <div className={cl("results")} id="vc-badge-farmer-results" role="listbox" ref={listRef}>
                     {results.map((item, index) => (
                         <button
@@ -410,7 +461,7 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
                     ))}
                 </div>
             )}
-            {query.trim().length >= 2 && results.length === 0 && apps != null && (
+            {open && query.trim().length >= 2 && results.length === 0 && apps != null && (
                 <span className={cl("field-note")}>No game in Discord's catalog matches that name.</span>
             )}
         </div>
@@ -424,15 +475,29 @@ interface LiveView {
     target: number;
     unit: string;
     paused: boolean;
+    viewerMode?: boolean;
 }
 
 function liveView(status: FarmerStatus): LiveView {
+    if (status.mode === "VIEWER") {
+        const active = status.watchingOwner != null;
+        return {
+            title: "Viewer Helper",
+            detail: active ? "Keeping incoming stream active and unpaused" : "Standing by for a Go Live stream in this call",
+            current: 0,
+            target: 0,
+            unit: "",
+            paused: !active,
+            viewerMode: true
+        };
+    }
+
     const game = status.activeGame?.name ?? null;
     const viewers = status.streamViewers == null
         ? "Starting Go Live"
         : status.streamPaused
             ? "Paused · waiting for a viewer"
-            : status.streamViewers === 1 ? "1 viewer" : `${status.streamViewers} viewers`;
+            : status.streamViewers === 1 ? "1 viewer · unpaused" : `${status.streamViewers} viewers · unpaused`;
 
     const time: LiveView = { title: "Game Time", detail: game, current: status.hoursCredited, target: status.hoursTarget, unit: "hours", paused: false };
     const variety: LiveView = { title: "Variety", detail: game, current: status.gamesCredited, target: status.gamesTarget, unit: "games", paused: false };
@@ -463,15 +528,25 @@ function LiveCard({ status }: { status: FarmerStatus; }) {
                 <Button variant="dangerSecondary" size="small" onClick={Farmer.stop}>Stop</Button>
             </div>
 
-            <div className={cl("live-figure")}>
-                <span className={cl("live-number")}>{formatCount(view.current)}</span>
-                <span className={cl("live-target")}>of {view.target.toLocaleString()} {view.unit}</span>
-                <span className={cl("live-pct")}>{Math.floor(pct)}%</span>
-            </div>
+            {view.viewerMode ? (
+                <div className={cl("live-figure")}>
+                    <span className={cl("live-status-text")}>
+                        {status.watchingOwner != null ? "Watching live" : "Waiting for stream"}
+                    </span>
+                </div>
+            ) : (
+                <>
+                    <div className={cl("live-figure")}>
+                        <span className={cl("live-number")}>{formatCount(view.current)}</span>
+                        <span className={cl("live-target")}>of {view.target.toLocaleString()} {view.unit}</span>
+                        <span className={cl("live-pct")}>{Math.floor(pct)}%</span>
+                    </div>
 
-            <div className={cl("bar")}>
-                <div className={cl("bar-fill", { "bar-fill-active": pct > 0 })} style={{ width: `${pct}%` }} />
-            </div>
+                    <div className={cl("bar")}>
+                        <div className={cl("bar-fill", { "bar-fill-active": pct > 0 })} style={{ width: `${pct}%` }} />
+                    </div>
+                </>
+            )}
 
             <div className={cl("live-foot")}>
                 <span className={cl("live-detail")}>{view.detail ?? "Starting"}</span>
@@ -702,7 +777,7 @@ function SourcePicker({ sources, value, loading, disabled, onChange }: {
             } else {
                 setHighlight(Math.max(activeIndex - 1, 0));
             }
-        } else if (event.key === "Enter" && open) {
+        } else if ((event.key === "Enter" || event.key === " ") && open) {
             event.preventDefault();
             const chosen = options[activeIndex];
             if (chosen != null) pick(chosen);
@@ -796,6 +871,7 @@ function SourcePicker({ sources, value, loading, disabled, onChange }: {
 export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; } = {}): JSX.Element {
     const { apps, error: catalogueError, retry: retryCatalogue } = useCatalogue();
     const status = useFarmerStatus();
+    const refreshView = useForceUpdater();
 
     const [tab, setTab] = useState<Tab>("time");
     const [selected, setSelected] = useState<DetectableApp | null>(null);
@@ -805,12 +881,22 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
     const [varietyMinutes, setVarietyMinutes] = useState(String(Farmer.DEFAULT_VARIETY_MINUTES));
     const [streamTarget, setStreamTarget] = useState("1");
     const [selectedSourceId, setSelectedSourceId] = useState("");
+    const [lowPower, setLowPower] = useState(true);
+    const [checkpoint, setCheckpoint] = useState(false);
+    const [copiedAlt, setCopiedAlt] = useState(false);
 
     const busy = status.mode !== "IDLE";
     const personalization = isPersonalizationEnabled();
-    const noTrackBlocksStream = Farmer.isNoTrackBlockingStream();
+    const noTrackState = Farmer.getNoTrackStreamState();
     const voice = useVoiceReadiness(tab === "stream" || tab === "all");
     const streamSources = useStreamSources(tab === "stream");
+
+    useEffect(() => {
+        if (selectedSourceId === "" || streamSources.loading || streamSources.sources.length === 0) return;
+        if (!streamSources.sources.some(item => item.id === selectedSourceId)) {
+            setSelectedSourceId("");
+        }
+    }, [selectedSourceId, streamSources.loading, streamSources.sources]);
 
     const hours = parseNumber(timeTarget, 1, Farmer.MAX_TARGET_HOURS, false);
     const chunk = parseNumber(chunkHours, 1, Farmer.MAX_CHUNK_HOURS, true);
@@ -827,6 +913,31 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
     const varietyBatches = games != null ? Math.ceil(games / Farmer.BATCH_SIZE) : null;
     const allBatches = Math.ceil(Farmer.UNIVERSALIST_GAMES / Farmer.BATCH_SIZE)
         + Math.ceil(Math.ceil(Farmer.ETERNAL_HOURS / Farmer.DEFAULT_CHUNK_HOURS) / Farmer.BATCH_SIZE);
+
+    function copyAltScript() {
+        copyToClipboard(Farmer.ALT_WATCH_SNIPPET)
+            .then(() => {
+                setCopiedAlt(true);
+                showToast({ text: "Copied alt auto-watch script. Paste it into your alt's DevTools console.", variant: "success" });
+                setTimeout(() => setCopiedAlt(false), 2_500);
+            })
+            .catch(() => {
+                showToast({ text: "Could not copy script to clipboard.", variant: "critical" });
+            });
+    }
+
+    function fixNoTrack() {
+        if (Farmer.enableNoTrackBadgeTracking()) {
+            refreshView();
+            showToast({ text: "Enabled badge tracking in NoTrack. Reload Discord to apply.", variant: "success" });
+        }
+    }
+
+    const voiceStatusText = voice.problem != null
+        ? voice.problem
+        : voice.peersInChannel > 0
+            ? `Connected to ${voice.channelName} · ${voice.peersInChannel} other ${voice.peersInChannel === 1 ? "person" : "people"} in call`
+            : `Connected to ${voice.channelName} · alone in call (bring an alt so hours count)`;
 
     return (
         <div className={cl("root", { "root-modal": isModal })}>
@@ -945,26 +1056,39 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
             {tab === "stream" && (
                 <Panel
                     key="stream"
-                    intro="Starts Go Live in your current voice channel and restarts at the 4-hour mark. Hours count in real time while at least one viewer watches."
+                    intro="Discord verifies streaming hours against live media servers and an active viewer, so fake telemetry earns nothing. BadgeFarmer keeps Go Live unpaused at low GPU cost so real hours count."
                     action={
                         <StartButton
                             label="Go live"
                             eta={streamHours != null ? `Takes ${formatDuration(streamHours * 3_600)}` : null}
-                            disabled={busy || streamHours == null || voice.problem != null}
-                            onClick={() => void Farmer.startStreamFarm(streamHours!, selectedSourceId || undefined)}
+                            disabled={busy || streamHours == null || voice.problem != null || noTrackState !== "ok"}
+                            onClick={() => void Farmer.startStreamFarm(streamHours!, {
+                                sourceId: selectedSourceId || undefined,
+                                lowPower,
+                                checkpoint
+                            })}
                         />
                     }
                 >
-                    <div className={cl("voice-bar", { "voice-bar-ok": voice.problem == null })}>
+                    <div className={cl("voice-bar", {
+                        "voice-bar-ok": voice.problem == null && voice.peersInChannel > 0,
+                        "voice-bar-warn": voice.problem == null && voice.peersInChannel === 0
+                    })}>
                         <span className={cl("voice-dot")} />
-                        <span className={cl("voice-text")}>
-                            {voice.problem ?? `Connected to ${voice.channelName}`}
-                        </span>
+                        <span className={cl("voice-text")}>{voiceStatusText}</span>
                     </div>
 
-                    {noTrackBlocksStream && (
-                        <div className={cl("callout", "callout-danger")}>
-                            NoTrack has badge tracking turned off. Enable "Allow badge tracking" in NoTrack settings and restart Discord so Go Live hours count.
+                    {noTrackState === "disabled_in_settings" && (
+                        <div className={cl("callout", "callout-danger", "callout-row")}>
+                            <span>NoTrack has badge tracking off, which blocks Discord's stream badge events.</span>
+                            <button type="button" className={cl("ghost")} onClick={fixNoTrack}>Enable in NoTrack</button>
+                        </div>
+                    )}
+
+                    {noTrackState === "needs_restart" && (
+                        <div className={cl("callout", "callout-warn", "callout-row")}>
+                            <span>Reload Discord once so NoTrack's badge tracking change takes effect.</span>
+                            <button type="button" className={cl("ghost")} onClick={() => location.reload()}>Reload</button>
                         </div>
                     )}
 
@@ -981,7 +1105,7 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                             value={streamTarget}
                             disabled={busy}
                             onChange={setStreamTarget}
-                            hint="An alt watching your stream counts"
+                            hint="Counts while at least one viewer watches"
                             error={streamHours == null ? `Use 0.1 to ${Farmer.MAX_TARGET_HOURS.toLocaleString()}` : null}
                         />
                         <div className={cl("field")}>
@@ -1007,6 +1131,49 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                         </div>
                     </div>
 
+                    <div className={cl("toggles")}>
+                        <ToggleOption
+                            checked={lowPower}
+                            disabled={busy}
+                            title="Low-power 480p / 15 FPS"
+                            note="Cuts GPU and upload load while farming, then restores your stream quality on Stop"
+                            onChange={setLowPower}
+                        />
+                        <ToggleOption
+                            checked={checkpoint}
+                            disabled={busy}
+                            title="2-hour checkpoints"
+                            note="Restarts Go Live every 2 hours to bank hours along the way. Pair with alt auto-watch below"
+                            onChange={setCheckpoint}
+                        />
+                    </div>
+
+                    <div className={cl("alt-box")}>
+                        <div className={cl("alt-copy")}>
+                            <span className={cl("alt-title")}>Alt viewer auto-watch</span>
+                            <span className={cl("alt-note")}>
+                                Keeps your alt watching and unpaused across reconnects, background tabs, and checkpoints.
+                            </span>
+                        </div>
+                        <div className={cl("alt-actions")}>
+                            <button
+                                type="button"
+                                className={cl("ghost")}
+                                disabled={busy || voice.problem != null}
+                                onClick={() => void Farmer.startViewerWatch()}
+                            >
+                                Watch this call
+                            </button>
+                            <button
+                                type="button"
+                                className={cl("ghost")}
+                                onClick={copyAltScript}
+                            >
+                                {copiedAlt ? "Copied" : "Copy alt script"}
+                            </button>
+                        </div>
+                    </div>
+
                     <TierMeter
                         value={streamHours}
                         tiers={STREAM_TIERS}
@@ -1026,7 +1193,11 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                             label="Start all three"
                             eta={`First two take ${formatDuration(allBatches * SECONDS_PER_BATCH)}`}
                             disabled={busy || apps == null}
-                            onClick={() => void Farmer.maxAll(apps!, selectedSourceId || undefined)}
+                            onClick={() => void Farmer.maxAll(apps!, {
+                                sourceId: selectedSourceId || undefined,
+                                lowPower,
+                                checkpoint
+                            })}
                         />
                     }
                 >
@@ -1042,9 +1213,9 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                         <li className={cl("flow-step")}>
                             <span className={cl("flow-name")}>Streaming</span>
                             <span className={cl("flow-note")}>
-                                {voice.problem == null
+                                {voice.problem == null && noTrackState === "ok"
                                     ? `Goes live in ${voice.channelName} after step two`
-                                    : "Skipped unless you join a voice channel before step two finishes"}
+                                    : "Skipped unless you join a voice channel (with NoTrack badge tracking on) before step two finishes"}
                             </span>
                         </li>
                     </ol>
