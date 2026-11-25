@@ -427,27 +427,143 @@
     gap: 8px;
 }
 
-.vc-badge-farmer-select {
+.vc-badge-farmer-picker-btn {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
     flex: 1 1 auto;
     min-width: 0;
-    padding: 9px 10px;
+    padding: 9px 11px;
     border: 1px solid var(--bf-border);
     border-radius: var(--bf-radius-inner);
     background: var(--background-base-lowest, var(--input-background));
     color: var(--text-default);
     font-family: inherit;
     font-size: 13px;
+    line-height: 20px;
+    text-align: left;
     cursor: pointer;
+    transition:
+        border-color 140ms ease,
+        box-shadow 140ms ease,
+        background-color 140ms ease;
 }
 
-.vc-badge-farmer-select:focus-visible {
-    outline: 2px solid var(--border-focus, var(--bf-accent));
-    outline-offset: -1px;
+.vc-badge-farmer-picker-btn-open,
+.vc-badge-farmer-picker-btn:focus-visible {
+    border-color: var(--bf-accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--bf-accent) 22%, transparent);
+    outline: 0;
 }
 
-.vc-badge-farmer-select:disabled {
+.vc-badge-farmer-picker-btn:disabled {
     cursor: not-allowed;
     opacity: 0.6;
+}
+
+.vc-badge-farmer-picker-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.vc-badge-farmer-picker-chevron {
+    flex: 0 0 auto;
+    color: var(--bf-muted);
+    transition:
+        transform 180ms var(--bf-ease),
+        color 140ms ease;
+}
+
+.vc-badge-farmer-picker-chevron-open {
+    color: var(--text-default);
+    transform: rotate(180deg);
+}
+
+.vc-badge-farmer-popover {
+    --bf-ease: cubic-bezier(0.23, 1, 0.32, 1);
+    --bf-border: var(--border-subtle, rgb(128 132 142 / 22%));
+    --bf-accent: var(--brand-500, #5865f2);
+    --bf-muted: var(--text-muted, #949ba4);
+
+    position: fixed;
+    z-index: 10002;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 5px;
+    overflow-y: auto;
+    border: 1px solid var(--bf-border);
+    border-radius: 10px;
+    background: var(--background-surface-high, var(--background-floating, #18191c));
+    color: var(--text-default);
+    box-shadow: 0 12px 32px rgb(0 0 0 / 45%);
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thin-thumb) transparent;
+    animation: vc-badge-farmer-fade 140ms var(--bf-ease);
+}
+
+.vc-badge-farmer-option {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    min-width: 0;
+    padding: 8px 10px;
+    border: 0;
+    border-radius: 7px;
+    background: none;
+    color: var(--text-default);
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 18px;
+    text-align: left;
+    cursor: pointer;
+    transition:
+        background-color 120ms ease,
+        color 120ms ease;
+}
+
+.vc-badge-farmer-option-active {
+    background: var(--background-mod-subtle, rgb(128 132 142 / 14%));
+}
+
+.vc-badge-farmer-option-selected {
+    color: var(--text-strong, var(--header-primary));
+    font-weight: 600;
+}
+
+.vc-badge-farmer-option-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.vc-badge-farmer-option-right {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+}
+
+.vc-badge-farmer-option-tag {
+    padding: 2px 6px;
+    border-radius: 5px;
+    background: var(--background-mod-subtle, rgb(128 132 142 / 14%));
+    color: var(--bf-muted);
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 14px;
+}
+
+.vc-badge-farmer-option-check {
+    color: var(--bf-accent);
+    font-size: 13px;
+    font-weight: 700;
+    line-height: 1;
 }
 
 /* Game picker */
@@ -747,6 +863,10 @@
         background: var(--background-mod-subtle, rgb(128 132 142 / 14%));
     }
 
+    .vc-badge-farmer-picker-btn:hover:not(:disabled):not(.vc-badge-farmer-picker-btn-open) {
+        border-color: var(--border-normal, rgb(128 132 142 / 34%));
+    }
+
     .vc-badge-farmer-tier:hover:not(:disabled) {
         transform: scaleY(1.35);
     }
@@ -794,7 +914,8 @@
     .vc-badge-farmer-done,
     .vc-badge-farmer-panel,
     .vc-badge-farmer-results,
-    .vc-badge-farmer-picked {
+    .vc-badge-farmer-picked,
+    .vc-badge-farmer-popover {
         animation-name: vc-badge-farmer-fade-only;
     }
 
@@ -804,7 +925,8 @@
 
     .vc-badge-farmer-tabs-thumb,
     .vc-badge-farmer-bar-fill,
-    .vc-badge-farmer-tier {
+    .vc-badge-farmer-tier,
+    .vc-badge-farmer-picker-chevron {
         transition: none;
     }
 }

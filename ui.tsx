@@ -13,8 +13,10 @@ import {
     closeModal,
     Modal,
     openModal,
+    ReactDOM,
     SelectedChannelStore,
     useEffect,
+    useLayoutEffect,
     useMemo,
     useRef,
     useState,
@@ -552,6 +554,245 @@ function StartButton({ label, eta, disabled, onClick }: { label: string; eta: st
     );
 }
 
+interface SourceOption {
+    id: string;
+    label: string;
+    tag: string;
+}
+
+interface PopoverCoords {
+    top?: number;
+    bottom?: number;
+    left: number;
+    width: number;
+    maxHeight: number;
+}
+
+function SourcePicker({ sources, value, loading, disabled, onChange }: {
+    sources: DesktopSource[];
+    value: string;
+    loading: boolean;
+    disabled: boolean;
+    onChange: (id: string) => void;
+}) {
+    const [open, setOpen] = useState(false);
+    const [highlight, setHighlight] = useState(0);
+    const [coords, setCoords] = useState<PopoverCoords | null>(null);
+    const triggerRef = useRef<HTMLButtonElement>(null);
+    const menuRef = useRef<HTMLDivElement>(null);
+
+    const options = useMemo<SourceOption[]>(() => [
+        { id: "", label: "Main screen", tag: "Auto" },
+        ...sources.map(source => ({
+            id: source.id,
+            label: source.name,
+            tag: source.kind === "screen" ? "Screen" : "Window"
+        }))
+    ], [sources]);
+
+    const selectedIndex = Math.max(0, options.findIndex(option => option.id === value));
+    const current = options[selectedIndex] ?? options[0];
+    const activeIndex = highlight < options.length ? highlight : selectedIndex;
+
+    function updatePosition() {
+        const button = triggerRef.current;
+        if (button == null) return;
+        const rect = button.getBoundingClientRect();
+        const margin = 12;
+        const gap = 6;
+        const width = Math.min(Math.max(rect.width, 260), window.innerWidth - margin * 2);
+        const left = Math.min(Math.max(margin, rect.left), window.innerWidth - width - margin);
+        const spaceBelow = window.innerHeight - rect.bottom - margin - gap;
+        const spaceAbove = rect.top - margin - gap;
+        const desired = Math.min(240, options.length * 36 + 12);
+
+        if (spaceBelow < desired && spaceAbove > spaceBelow) {
+            setCoords({
+                bottom: window.innerHeight - rect.top + gap,
+                left,
+                width,
+                maxHeight: Math.max(120, Math.min(260, spaceAbove))
+            });
+        } else {
+            setCoords({
+                top: rect.bottom + gap,
+                left,
+                width,
+                maxHeight: Math.max(120, Math.min(260, spaceBelow))
+            });
+        }
+    }
+
+    useLayoutEffect(() => {
+        if (!open) return;
+        updatePosition();
+    }, [open, options.length]);
+
+    useEffect(() => {
+        if (!open) return;
+
+        function onMouseDown(event: MouseEvent) {
+            const target = event.target as Node | null;
+            if (triggerRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+            setOpen(false);
+        }
+
+        function onKey(event: globalThis.KeyboardEvent) {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                setOpen(false);
+                triggerRef.current?.focus();
+            }
+        }
+
+        function onViewportChange(event: Event) {
+            if (event.type === "scroll" && menuRef.current?.contains(event.target as Node | null)) return;
+            updatePosition();
+        }
+
+        document.addEventListener("mousedown", onMouseDown);
+        document.addEventListener("keydown", onKey);
+        window.addEventListener("resize", onViewportChange);
+        window.addEventListener("scroll", onViewportChange, true);
+        return () => {
+            document.removeEventListener("mousedown", onMouseDown);
+            document.removeEventListener("keydown", onKey);
+            window.removeEventListener("resize", onViewportChange);
+            window.removeEventListener("scroll", onViewportChange, true);
+        };
+    }, [open, options.length]);
+
+    useEffect(() => {
+        if (!open) return;
+        const row = menuRef.current?.children[activeIndex] as HTMLElement | undefined;
+        row?.scrollIntoView({ block: "nearest" });
+    }, [open, activeIndex]);
+
+    useEffect(() => {
+        if (disabled) setOpen(false);
+    }, [disabled]);
+
+    function pick(option: SourceOption) {
+        onChange(option.id);
+        setOpen(false);
+        triggerRef.current?.focus();
+    }
+
+    function toggle() {
+        if (disabled || loading) return;
+        setHighlight(selectedIndex);
+        setOpen(prev => !prev);
+    }
+
+    function onTriggerKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+        if (disabled || loading) return;
+        if (event.key === "ArrowDown") {
+            event.preventDefault();
+            if (!open) {
+                setHighlight(selectedIndex);
+                setOpen(true);
+            } else {
+                setHighlight(Math.min(activeIndex + 1, options.length - 1));
+            }
+        } else if (event.key === "ArrowUp") {
+            event.preventDefault();
+            if (!open) {
+                setHighlight(selectedIndex);
+                setOpen(true);
+            } else {
+                setHighlight(Math.max(activeIndex - 1, 0));
+            }
+        } else if (event.key === "Enter" && open) {
+            event.preventDefault();
+            const chosen = options[activeIndex];
+            if (chosen != null) pick(chosen);
+        } else if (event.key === "Escape" && open) {
+            event.preventDefault();
+            setOpen(false);
+        }
+    }
+
+    const menu = open && coords != null && typeof document !== "undefined"
+        ? ReactDOM.createPortal(
+            <div
+                ref={menuRef}
+                role="listbox"
+                aria-label="Stream capture source"
+                className={cl("popover")}
+                style={{
+                    top: coords.top,
+                    bottom: coords.bottom,
+                    left: coords.left,
+                    width: coords.width,
+                    maxHeight: coords.maxHeight
+                }}
+            >
+                {options.map((option, index) => {
+                    const isSelected = option.id === value;
+                    const isActive = index === activeIndex;
+                    return (
+                        <button
+                            key={option.id || "__auto__"}
+                            type="button"
+                            role="option"
+                            aria-selected={isSelected}
+                            className={cl("option", { "option-active": isActive, "option-selected": isSelected })}
+                            onMouseEnter={() => setHighlight(index)}
+                            onMouseDown={event => event.preventDefault()}
+                            onClick={() => pick(option)}
+                        >
+                            <span className={cl("option-label")}>{option.label}</span>
+                            <span className={cl("option-right")}>
+                                <span className={cl("option-tag")}>{option.tag}</span>
+                                {isSelected && <span className={cl("option-check")} aria-hidden="true">{"\u2713"}</span>}
+                            </span>
+                        </button>
+                    );
+                })}
+            </div>,
+            document.body
+        )
+        : null;
+
+    return (
+        <>
+            <button
+                ref={triggerRef}
+                type="button"
+                role="combobox"
+                aria-expanded={open}
+                aria-haspopup="listbox"
+                aria-label="Stream capture source"
+                disabled={disabled || loading}
+                className={cl("picker-btn", { "picker-btn-open": open })}
+                onClick={toggle}
+                onKeyDown={onTriggerKeyDown}
+            >
+                <span className={cl("picker-label")}>
+                    {loading ? "Loading sources..." : current.label}
+                </span>
+                <svg
+                    className={cl("picker-chevron", { "picker-chevron-open": open })}
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    aria-hidden="true"
+                >
+                    <path
+                        d="M6 9L12 15L18 9"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                    />
+                </svg>
+            </button>
+            {menu}
+        </>
+    );
+}
+
 export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; } = {}): JSX.Element {
     const { apps, error: catalogueError, retry: retryCatalogue } = useCatalogue();
     const status = useFarmerStatus();
@@ -746,20 +987,13 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                         <div className={cl("field")}>
                             <span className={cl("field-label")}>Capture source</span>
                             <div className={cl("select-row")}>
-                                <select
-                                    className={cl("select")}
+                                <SourcePicker
+                                    sources={streamSources.sources}
                                     value={selectedSourceId}
-                                    disabled={busy || streamSources.loading}
-                                    aria-label="Stream capture source"
-                                    onChange={event => setSelectedSourceId(event.currentTarget.value)}
-                                >
-                                    <option value="">Main screen (auto)</option>
-                                    {streamSources.sources.map(source => (
-                                        <option key={source.id} value={source.id}>
-                                            {source.kind === "screen" ? `[Screen] ${source.name}` : source.name}
-                                        </option>
-                                    ))}
-                                </select>
+                                    loading={streamSources.loading}
+                                    disabled={busy}
+                                    onChange={setSelectedSourceId}
+                                />
                                 <button
                                     type="button"
                                     className={cl("ghost")}
