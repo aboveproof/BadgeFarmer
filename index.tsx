@@ -12,14 +12,15 @@ import { Logger } from "@utils/Logger";
 import { useForceUpdater } from "@utils/react";
 import definePlugin, { OptionType } from "@utils/types";
 import { onceReady } from "@webpack";
-import { useEffect } from "@webpack/common";
+import { FluxDispatcher, useEffect, UserStore } from "@webpack/common";
 
-import { getStatus, maxAll, stop as stopFarmer, subscribe } from "./farmer";
-import { BadgeFarmerDashboard, BadgeIcon, loadCatalogue, openBadgeFarmerModal } from "./ui";
+import { getStatus, loadCatalogue, maxAll, stop as stopFarmer, subscribe } from "./farmer";
+import { BadgeFarmerDashboard, BadgeIcon, closeBadgeFarmerModal, openBadgeFarmerModal } from "./ui";
 
 const logger = new Logger("BadgeFarmer");
 
 let enabled = false;
+let pendingConnectionHandler: (() => void) | null = null;
 
 const settings = definePluginSettings({
     dashboard: {
@@ -34,10 +35,23 @@ const settings = definePluginSettings({
     },
     autoStartMaxAll: {
         type: OptionType.BOOLEAN,
-        description: "Run All three each time Discord starts",
+        description: "Run All three on Discord startup",
         default: false
     }
 });
+
+function detachConnectionWaiter(): void {
+    if (pendingConnectionHandler == null) return;
+    FluxDispatcher.unsubscribe("CONNECTION_OPEN", pendingConnectionHandler);
+    pendingConnectionHandler = null;
+}
+
+function launchAutoMaxAll(): void {
+    if (!enabled) return;
+    loadCatalogue()
+        .then(apps => (enabled ? maxAll(apps) : undefined))
+        .catch(error => logger.error("Could not start All three on launch", error));
+}
 
 function HeaderBadgeButton() {
     const { headerButton } = settings.use(["headerButton"]);
@@ -51,7 +65,7 @@ function HeaderBadgeButton() {
     return (
         <HeaderBarButton
             className={`vc-badge-farmer-header-btn ${busy ? "vc-badge-farmer-header-btn-busy" : ""}`}
-            onClick={() => void openBadgeFarmerModal()}
+            onClick={() => openBadgeFarmerModal()}
             tooltip={busy ? "Badge Farmer (Running)" : "Badge Farmer"}
             icon={BadgeIcon}
             selected={busy}
@@ -61,7 +75,7 @@ function HeaderBadgeButton() {
 
 export default definePlugin({
     name: "BadgeFarmer",
-    description: "Earns Discord's activity badges for you. Pick a game and a target, then leave the client open.",
+    description: "Earns Discord's Game Time, Variety, and Streaming badges while you keep the client open.",
     authors: [{
         name: "rico",
         id: 1361736124858630274n
@@ -80,15 +94,27 @@ export default definePlugin({
     start() {
         enabled = true;
         if (!settings.store.autoStartMaxAll) return;
+
         onceReady
-            .then(loadCatalogue)
-            // The plugin may have been turned off while the game list loaded.
-            .then(apps => enabled ? maxAll(apps) : undefined)
-            .catch(error => logger.error("All three couldn't start on launch", error));
+            .then(() => {
+                if (!enabled) return;
+                if (UserStore?.getCurrentUser?.() != null) {
+                    launchAutoMaxAll();
+                    return;
+                }
+                pendingConnectionHandler = () => {
+                    detachConnectionWaiter();
+                    launchAutoMaxAll();
+                };
+                FluxDispatcher.subscribe("CONNECTION_OPEN", pendingConnectionHandler);
+            })
+            .catch(error => logger.error("Failed waiting for Discord startup", error));
     },
 
     stop() {
         enabled = false;
+        detachConnectionWaiter();
+        closeBadgeFarmerModal();
         stopFarmer();
     }
 });

@@ -9,18 +9,29 @@ import ErrorBoundary from "@components/ErrorBoundary";
 import { classNameFactory } from "@utils/css";
 import { useForceUpdater } from "@utils/react";
 import type { RenderModalProps } from "@vencord/discord-types";
-import { Modal, openModal, useEffect, useMemo, useRef, useState } from "@webpack/common";
+import {
+    closeModal,
+    Modal,
+    openModal,
+    SelectedChannelStore,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+    VoiceStateStore
+} from "@webpack/common";
 import type { JSX, KeyboardEvent, ReactNode } from "react";
 
-import type { DetectableApp, FarmerStatus } from "./farmer";
+import type { DesktopSource, DetectableApp, FarmerStatus, VoiceReadiness } from "./farmer";
 import * as Farmer from "./farmer";
+import { isPersonalizationEnabled } from "./science";
 
 const cl = classNameFactory("vc-badge-farmer-");
 
-const DETECTABLE_APPS_URL = "https://discord.com/api/v10/applications/detectable";
+const MODAL_KEY = "vc-badge-farmer-modal";
 const MAX_RESULTS = 40;
-// Rough cost of one request plus the pause between requests.
-const SECONDS_PER_REQUEST = 1;
+// Average cost of one batched /science POST plus the pacing pause.
+const SECONDS_PER_BATCH = 0.9;
 
 interface Tier {
     name: string;
@@ -29,21 +40,41 @@ interface Tier {
 
 const TIME_TIERS: Tier[] = [
     { name: "Casual", at: 1 },
-    { name: "Recreational", at: 8 },
+    { name: "Recreational", at: 5 },
     { name: "Dedicated", at: 20 },
-    { name: "Committed", at: 78 },
-    { name: "Veteran", at: 250 },
-    { name: "Elite", at: 1_000 },
-    { name: "Legendary", at: 2_500 },
+    { name: "Committed", at: 75 },
+    { name: "Serious", at: 150 },
+    { name: "Devoted", at: 300 },
+    { name: "Seasoned", at: 500 },
+    { name: "Ironclad", at: 1_000 },
+    { name: "Unshakable", at: 2_000 },
     { name: "Eternal", at: 5_000 }
 ];
 
 const VARIETY_TIERS: Tier[] = [
-    { name: "Dabbler", at: 3 },
-    { name: "Adventurer", at: 10 },
-    { name: "Explorer", at: 25 },
-    { name: "Connoisseur", at: 50 },
+    { name: "Sampler", at: 2 },
+    { name: "Dabbler", at: 5 },
+    { name: "Enthusiast", at: 10 },
+    { name: "Ranger", at: 15 },
+    { name: "Explorer", at: 20 },
+    { name: "Adventurer", at: 30 },
+    { name: "Voyager", at: 40 },
+    { name: "Maverick", at: 60 },
+    { name: "Polymath", at: 80 },
     { name: "Universalist", at: 100 }
+];
+
+const STREAM_TIERS: Tier[] = [
+    { name: "Newcomer", at: 1 },
+    { name: "Fledgling", at: 5 },
+    { name: "Breakout", at: 20 },
+    { name: "Standout", at: 75 },
+    { name: "Trendsetter", at: 150 },
+    { name: "Headliner", at: 300 },
+    { name: "Star", at: 500 },
+    { name: "Sensation", at: 1_000 },
+    { name: "Visionary", at: 2_000 },
+    { name: "Phenomenon", at: 5_000 }
 ];
 
 type Tab = "time" | "variety" | "stream" | "all";
@@ -55,47 +86,91 @@ const TABS: Array<{ id: Tab; label: string; }> = [
     { id: "all", label: "All three" }
 ];
 
-let cataloguePromise: Promise<DetectableApp[]> | null = null;
-
-export function loadCatalogue(): Promise<DetectableApp[]> {
-    cataloguePromise ??= fetch(DETECTABLE_APPS_URL)
-        .then(response => {
-            if (!response.ok) throw new Error(`Discord answered with HTTP ${response.status}`);
-            return response.json() as Promise<unknown>;
-        })
-        .then(data => {
-            if (!Array.isArray(data)) throw new Error("Discord sent a game list in an unknown format");
-            return data.filter((app): app is DetectableApp =>
-                app != null && typeof app.id === "string" && typeof app.name === "string" && app.name.trim() !== "");
-        })
-        .catch(error => {
-            cataloguePromise = null;
-            throw error;
-        });
-
-    return cataloguePromise;
+interface IndexedApp {
+    app: DetectableApp;
+    lower: string;
+    aliases: string[];
+    exe: string;
 }
 
-function useCatalogue(): { apps: DetectableApp[] | null; error: string | null; } {
+function useCatalogue(): { apps: DetectableApp[] | null; error: string | null; retry: () => void; } {
     const [apps, setApps] = useState<DetectableApp[] | null>(null);
     const [error, setError] = useState<string | null>(null);
+    const [attempt, setAttempt] = useState(0);
 
     useEffect(() => {
         let cancelled = false;
-        loadCatalogue().then(
+        setError(null);
+        Farmer.loadCatalogue().then(
             loaded => { if (!cancelled) setApps(loaded); },
-            cause => { if (!cancelled) setError(`Couldn't load Discord's game list. ${cause?.message ?? ""}`.trim()); }
+            cause => {
+                if (!cancelled) {
+                    const detail = cause instanceof Error ? cause.message : String(cause ?? "");
+                    setError(`Could not load Discord's game list. ${detail}`.trim());
+                }
+            }
         );
         return () => { cancelled = true; };
-    }, []);
+    }, [attempt]);
 
-    return { apps, error };
+    function retry() {
+        Farmer.clearCatalogueCache();
+        setApps(null);
+        setAttempt(count => count + 1);
+    }
+
+    return { apps, error, retry };
 }
 
 function useFarmerStatus(): FarmerStatus {
     const forceUpdate = useForceUpdater();
-    useEffect(() => Farmer.subscribe(forceUpdate), []);
+    useEffect(() => Farmer.subscribe(forceUpdate), [forceUpdate]);
     return Farmer.getStatus();
+}
+
+function useVoiceReadiness(active: boolean): VoiceReadiness {
+    const [voice, setVoice] = useState<VoiceReadiness>(() => Farmer.getVoiceState());
+
+    useEffect(() => {
+        if (!active) return;
+        const refresh = () => setVoice(Farmer.getVoiceState());
+        refresh();
+        SelectedChannelStore?.addChangeListener?.(refresh);
+        VoiceStateStore?.addChangeListener?.(refresh);
+        return () => {
+            SelectedChannelStore?.removeChangeListener?.(refresh);
+            VoiceStateStore?.removeChangeListener?.(refresh);
+        };
+    }, [active]);
+
+    return voice;
+}
+
+function useStreamSources(active: boolean): {
+    sources: DesktopSource[];
+    loading: boolean;
+    refresh: () => void;
+} {
+    const [sources, setSources] = useState<DesktopSource[]>([]);
+    const [loading, setLoading] = useState(false);
+    const [tick, setTick] = useState(0);
+
+    useEffect(() => {
+        if (!active) return;
+        let cancelled = false;
+        setLoading(true);
+        Farmer.listStreamSources()
+            .then(list => { if (!cancelled) setSources(list); })
+            .catch(() => { if (!cancelled) setSources([]); })
+            .finally(() => { if (!cancelled) setLoading(false); });
+        return () => { cancelled = true; };
+    }, [active, tick]);
+
+    return {
+        sources,
+        loading,
+        refresh: () => setTick(value => value + 1)
+    };
 }
 
 function parseNumber(value: string, min: number, max: number, integer: boolean): number | null {
@@ -112,32 +187,44 @@ function formatCount(value: number): string {
 }
 
 function formatDuration(seconds: number): string {
-    if (seconds < 60) return "under a minute";
-    if (seconds < 3_600) return `${Math.ceil(seconds / 60)} min`;
-    if (seconds < 172_800) return `${Math.round(seconds / 3_600)} hr`;
-    return `${Math.round(seconds / 86_400).toLocaleString()} days`;
+    if (seconds < 60) return `about ${Math.max(1, Math.ceil(seconds))} sec`;
+    if (seconds < 3_600) return `about ${Math.ceil(seconds / 60)} min`;
+    if (seconds < 172_800) return `about ${Math.round(seconds / 3_600)} hr`;
+    return `about ${Math.round(seconds / 86_400).toLocaleString()} days`;
 }
 
 function reachedTier(value: number, tiers: Tier[]): number {
     let reached = -1;
-    tiers.forEach((tier, index) => { if (value >= tier.at) reached = index; });
+    for (let index = 0; index < tiers.length; index++) {
+        if (value >= tiers[index].at) reached = index;
+    }
     return reached;
 }
 
-function TierMeter({ value, tiers, unit }: { value: number | null; tiers: Tier[]; unit: string; }) {
+function TierMeter({ value, tiers, unit, onPick, disabled }: {
+    value: number | null;
+    tiers: Tier[];
+    unit: string;
+    onPick: (target: number) => void;
+    disabled: boolean;
+}) {
     const reached = value == null ? -1 : reachedTier(value, tiers);
     const label = value == null
-        ? "Enter a valid number"
+        ? "Invalid target"
         : reached >= 0 ? tiers[reached].name : `Below ${tiers[0].name}`;
 
     return (
         <div className={cl("tiers")}>
-            <div className={cl("tiers-track")}>
+            <div className={cl("tiers-track")} role="group" aria-label="Badge tier presets">
                 {tiers.map((tier, index) => (
-                    <span
+                    <button
                         key={tier.name}
+                        type="button"
+                        disabled={disabled}
                         className={cl("tier", { "tier-on": index <= reached })}
                         title={`${tier.name}: ${tier.at.toLocaleString()} ${unit}`}
+                        aria-label={`Set target to ${tier.name} (${tier.at.toLocaleString()} ${unit})`}
+                        onClick={() => onPick(tier.at)}
                     />
                 ))}
             </div>
@@ -146,13 +233,14 @@ function TierMeter({ value, tiers, unit }: { value: number | null; tiers: Tier[]
     );
 }
 
-function Field({ label, hint, value, onChange, error, suffix }: {
+function Field({ label, hint, value, onChange, error, suffix, disabled }: {
     label: string;
     hint?: string;
     value: string;
     onChange: (value: string) => void;
     error: string | null;
     suffix?: string;
+    disabled?: boolean;
 }) {
     return (
         <label className={cl("field")}>
@@ -161,6 +249,7 @@ function Field({ label, hint, value, onChange, error, suffix }: {
                 <input
                     className={cl("input")}
                     value={value}
+                    disabled={disabled}
                     inputMode="decimal"
                     spellCheck={false}
                     onChange={event => onChange(event.currentTarget.value)}
@@ -184,18 +273,41 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
     const [highlight, setHighlight] = useState(0);
     const listRef = useRef<HTMLDivElement>(null);
 
+    const indexed = useMemo<IndexedApp[]>(() => {
+        if (apps == null) return [];
+        return apps.map(app => ({
+            app,
+            lower: app.name.toLowerCase(),
+            aliases: (app.aliases ?? []).map(alias => alias.toLowerCase()),
+            exe: Farmer.executableFor(app)
+        }));
+    }, [apps]);
+
     const results = useMemo(() => {
         const needle = query.trim().toLowerCase();
-        if (apps == null || needle.length < 2) return [];
+        if (indexed.length === 0 || needle.length < 2) return [];
 
-        return apps
-            .filter(app => app.name.toLowerCase().includes(needle))
-            .sort((left, right) =>
-                Number(right.name.toLowerCase().startsWith(needle)) - Number(left.name.toLowerCase().startsWith(needle))
-                || left.name.length - right.name.length
-                || left.name.localeCompare(right.name))
-            .slice(0, MAX_RESULTS);
-    }, [apps, query]);
+        const matches: IndexedApp[] = [];
+        for (const item of indexed) {
+            if (item.lower.includes(needle) || item.aliases.some(alias => alias.includes(needle))) {
+                matches.push(item);
+            }
+        }
+
+        matches.sort((left, right) => {
+            const leftExact = Number(left.lower === needle);
+            const rightExact = Number(right.lower === needle);
+            if (leftExact !== rightExact) return rightExact - leftExact;
+
+            const leftPrefix = Number(left.lower.startsWith(needle));
+            const rightPrefix = Number(right.lower.startsWith(needle));
+            if (leftPrefix !== rightPrefix) return rightPrefix - leftPrefix;
+
+            return left.app.name.length - right.app.name.length || left.app.name.localeCompare(right.app.name);
+        });
+
+        return matches.slice(0, MAX_RESULTS);
+    }, [indexed, query]);
 
     const activeIndex = highlight < results.length ? highlight : 0;
 
@@ -211,6 +323,10 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
     }
 
     function onKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+        if (event.key === "Escape") {
+            setQuery("");
+            return;
+        }
         if (results.length === 0) return;
         if (event.key === "ArrowDown") {
             event.preventDefault();
@@ -221,9 +337,7 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
         } else if (event.key === "Enter") {
             event.preventDefault();
             const picked = results[activeIndex];
-            if (picked != null) choose(picked);
-        } else if (event.key === "Escape") {
-            setQuery("");
+            if (picked != null) choose(picked.app);
         }
     }
 
@@ -264,27 +378,38 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
                     }}
                     onKeyDown={onKeyDown}
                 />
+                {query !== "" && !disabled && (
+                    <button
+                        type="button"
+                        className={cl("clear")}
+                        aria-label="Clear search"
+                        onClick={() => setQuery("")}
+                    >
+                        ×
+                    </button>
+                )}
             </span>
             {results.length > 0 && (
                 <div className={cl("results")} id="vc-badge-farmer-results" role="listbox" ref={listRef}>
-                    {results.map((app, index) => (
+                    {results.map((item, index) => (
                         <button
-                            key={app.id}
+                            key={item.app.id}
                             type="button"
                             role="option"
                             aria-selected={index === activeIndex}
                             className={cl("result", { "result-active": index === activeIndex })}
                             onMouseEnter={() => setHighlight(index)}
-                            onClick={() => choose(app)}
+                            onMouseDown={event => event.preventDefault()}
+                            onClick={() => choose(item.app)}
                         >
-                            <span className={cl("result-name")}>{app.name}</span>
-                            <span className={cl("result-meta")}>{Farmer.executableFor(app)}</span>
+                            <span className={cl("result-name")}>{item.app.name}</span>
+                            <span className={cl("result-meta")}>{item.exe}</span>
                         </button>
                     ))}
                 </div>
             )}
             {query.trim().length >= 2 && results.length === 0 && apps != null && (
-                <span className={cl("field-note")}>No game in Discord's list matches that name.</span>
+                <span className={cl("field-note")}>No game in Discord's catalog matches that name.</span>
             )}
         </div>
     );
@@ -296,17 +421,20 @@ interface LiveView {
     current: number;
     target: number;
     unit: string;
+    paused: boolean;
 }
 
 function liveView(status: FarmerStatus): LiveView {
     const game = status.activeGame?.name ?? null;
     const viewers = status.streamViewers == null
         ? "Starting Go Live"
-        : status.streamViewers === 1 ? "1 person watching" : `${status.streamViewers} people watching`;
+        : status.streamPaused
+            ? "Paused · waiting for a viewer"
+            : status.streamViewers === 1 ? "1 viewer" : `${status.streamViewers} viewers`;
 
-    const time: LiveView = { title: "Game Time", detail: game, current: status.hoursCredited, target: status.hoursTarget, unit: "hours" };
-    const variety: LiveView = { title: "Variety", detail: game, current: status.gamesCredited, target: status.gamesTarget, unit: "games" };
-    const stream: LiveView = { title: "Streaming", detail: viewers, current: status.streamHours, target: status.streamTarget, unit: "hours" };
+    const time: LiveView = { title: "Game Time", detail: game, current: status.hoursCredited, target: status.hoursTarget, unit: "hours", paused: false };
+    const variety: LiveView = { title: "Variety", detail: game, current: status.gamesCredited, target: status.gamesTarget, unit: "games", paused: false };
+    const stream: LiveView = { title: "Streaming", detail: viewers, current: status.streamHours, target: status.streamTarget, unit: "hours", paused: status.streamPaused };
 
     switch (status.mode) {
         case "GAME_TIME": return time;
@@ -327,7 +455,7 @@ function LiveCard({ status }: { status: FarmerStatus; }) {
         <section className={cl("live")} aria-live="polite">
             <div className={cl("live-head")}>
                 <div className={cl("live-title")}>
-                    <span className={cl("pulse")} />
+                    <span className={cl("pulse", { "pulse-paused": view.paused })} />
                     <span>{view.title}</span>
                 </div>
                 <Button variant="dangerSecondary" size="small" onClick={Farmer.stop}>Stop</Button>
@@ -336,14 +464,15 @@ function LiveCard({ status }: { status: FarmerStatus; }) {
             <div className={cl("live-figure")}>
                 <span className={cl("live-number")}>{formatCount(view.current)}</span>
                 <span className={cl("live-target")}>of {view.target.toLocaleString()} {view.unit}</span>
+                <span className={cl("live-pct")}>{Math.floor(pct)}%</span>
             </div>
 
             <div className={cl("bar")}>
-                <div className={cl("bar-fill")} style={{ width: `${pct}%` }} />
+                <div className={cl("bar-fill", { "bar-fill-active": pct > 0 })} style={{ width: `${pct}%` }} />
             </div>
 
             <div className={cl("live-foot")}>
-                <span className={cl("live-detail")}>{view.detail ?? "Getting ready"}</span>
+                <span className={cl("live-detail")}>{view.detail ?? "Starting"}</span>
                 {status.errors > 0 && (
                     <span className={cl("live-detail")}>{status.errors} failed {status.errors === 1 ? "request" : "requests"}</span>
                 )}
@@ -369,12 +498,15 @@ function DoneCard({ message, error }: { message: string | null; error: string | 
 
 function Tabs({ value, onChange }: { value: Tab; onChange: (tab: Tab) => void; }) {
     const index = TABS.findIndex(tab => tab.id === value);
+    const buttonRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
     function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
         const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
         if (step === 0) return;
         event.preventDefault();
-        onChange(TABS[(index + step + TABS.length) % TABS.length].id);
+        const nextIndex = (index + step + TABS.length) % TABS.length;
+        onChange(TABS[nextIndex].id);
+        buttonRefs.current[nextIndex]?.focus();
     }
 
     return (
@@ -383,9 +515,10 @@ function Tabs({ value, onChange }: { value: Tab; onChange: (tab: Tab) => void; }
                 className={cl("tabs-thumb")}
                 style={{ width: `calc((100% - 8px) / ${TABS.length})`, transform: `translateX(${index * 100}%)` }}
             />
-            {TABS.map(tab => (
+            {TABS.map((tab, tabIndex) => (
                 <button
                     key={tab.id}
+                    ref={el => { buttonRefs.current[tabIndex] = el; }}
                     type="button"
                     role="tab"
                     aria-selected={tab.id === value}
@@ -420,7 +553,7 @@ function StartButton({ label, eta, disabled, onClick }: { label: string; eta: st
 }
 
 export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; } = {}): JSX.Element {
-    const { apps, error: catalogueError } = useCatalogue();
+    const { apps, error: catalogueError, retry: retryCatalogue } = useCatalogue();
     const status = useFarmerStatus();
 
     const [tab, setTab] = useState<Tab>("time");
@@ -430,8 +563,13 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
     const [varietyCount, setVarietyCount] = useState(String(Farmer.UNIVERSALIST_GAMES));
     const [varietyMinutes, setVarietyMinutes] = useState(String(Farmer.DEFAULT_VARIETY_MINUTES));
     const [streamTarget, setStreamTarget] = useState("1");
+    const [selectedSourceId, setSelectedSourceId] = useState("");
 
     const busy = status.mode !== "IDLE";
+    const personalization = isPersonalizationEnabled();
+    const noTrackBlocksStream = Farmer.isNoTrackBlockingStream();
+    const voice = useVoiceReadiness(tab === "stream" || tab === "all");
+    const streamSources = useStreamSources(tab === "stream");
 
     const hours = parseNumber(timeTarget, 1, Farmer.MAX_TARGET_HOURS, false);
     const chunk = parseNumber(chunkHours, 1, Farmer.MAX_CHUNK_HOURS, true);
@@ -439,8 +577,15 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
     const minutes = parseNumber(varietyMinutes, 1, 1_440, false);
     const streamHours = parseNumber(streamTarget, 0.1, Farmer.MAX_TARGET_HOURS, false);
 
-    const allEta = Farmer.UNIVERSALIST_GAMES * SECONDS_PER_REQUEST
-        + Math.ceil(Farmer.ETERNAL_HOURS / Farmer.DEFAULT_CHUNK_HOURS) * SECONDS_PER_REQUEST;
+    const activeSource = streamSources.sources.find(item => item.id === selectedSourceId) ?? null;
+    const sharingFullScreen = activeSource == null || activeSource.kind === "screen";
+
+    const timeBatches = hours != null && chunk != null
+        ? Math.ceil(Math.ceil(hours / chunk) / Farmer.BATCH_SIZE)
+        : null;
+    const varietyBatches = games != null ? Math.ceil(games / Farmer.BATCH_SIZE) : null;
+    const allBatches = Math.ceil(Farmer.UNIVERSALIST_GAMES / Farmer.BATCH_SIZE)
+        + Math.ceil(Math.ceil(Farmer.ETERNAL_HOURS / Farmer.DEFAULT_CHUNK_HOURS) / Farmer.BATCH_SIZE);
 
     return (
         <div className={cl("root", { "root-modal": isModal })}>
@@ -448,26 +593,38 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                 <header className={cl("header")}>
                     <div>
                         <h2 className={cl("title")}>Badge Farmer</h2>
-                        <p className={cl("subtitle")}>Pick a badge and leave Discord open while it runs.</p>
+                        <p className={cl("subtitle")}>Pick a badge, start a run, and keep Discord open.</p>
                     </div>
                     <span className={cl("status", { "status-on": busy })}>{busy ? "Running" : "Idle"}</span>
                 </header>
             )}
 
+            {personalization === false && (
+                <div className={cl("callout", "callout-danger")}>
+                    Data personalization is off. Turn on "Use data to personalize my Discord experience" under Data &amp; Privacy or Discord will drop these sessions.
+                </div>
+            )}
+
             {busy && <LiveCard status={status} />}
             {!busy && <DoneCard message={status.finishedMessage} error={status.finishedMessage == null ? status.lastError : null} />}
-            {catalogueError != null && <div className={cl("callout", "callout-danger")}>{catalogueError}</div>}
+
+            {catalogueError != null && (
+                <div className={cl("callout", "callout-danger", "callout-row")}>
+                    <span>{catalogueError}</span>
+                    <button type="button" className={cl("ghost")} onClick={retryCatalogue}>Retry</button>
+                </div>
+            )}
 
             <Tabs value={tab} onChange={setTab} />
 
             {tab === "time" && (
                 <Panel
                     key="time"
-                    intro="Sends finished play sessions for one game. Eternal, the top tier, starts at 5,000 hours."
+                    intro="Posts batched play sessions for one game. Click any tier bar to set the target."
                     action={
                         <StartButton
-                            label={selected == null ? "Pick a game first" : `Start ${selected.name}`}
-                            eta={hours != null && chunk != null ? `About ${formatDuration(Math.ceil(hours / chunk) * SECONDS_PER_REQUEST)}` : null}
+                            label={selected == null ? "Pick a game" : `Start ${selected.name}`}
+                            eta={timeBatches != null ? formatDuration(timeBatches * SECONDS_PER_BATCH) : null}
                             disabled={busy || selected == null || hours == null || chunk == null}
                             onClick={() => void Farmer.startGameTime(selected!, hours!, chunk!)}
                         />
@@ -475,73 +632,167 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                 >
                     <GamePicker apps={apps} error={catalogueError} selected={selected} onSelect={setSelected} disabled={busy} />
                     <div className={cl("row")}>
-                        <Field label="Target" suffix="hours" value={timeTarget} onChange={setTimeTarget}
-                            error={hours == null ? `Use 1 to ${Farmer.MAX_TARGET_HOURS.toLocaleString()}` : null} />
-                        <Field label="Per request" suffix="hours" value={chunkHours} onChange={setChunkHours}
-                            hint="Bigger chunks finish sooner"
-                            error={chunk == null ? `Whole number, 1 to ${Farmer.MAX_CHUNK_HOURS}` : null} />
+                        <Field
+                            label="Target"
+                            suffix="hours"
+                            value={timeTarget}
+                            disabled={busy}
+                            onChange={setTimeTarget}
+                            error={hours == null ? `Use 1 to ${Farmer.MAX_TARGET_HOURS.toLocaleString()}` : null}
+                        />
+                        <Field
+                            label="Hours per session"
+                            suffix="hours"
+                            value={chunkHours}
+                            disabled={busy}
+                            onChange={setChunkHours}
+                            hint={`Batches up to ${Farmer.BATCH_SIZE} sessions per request`}
+                            error={chunk == null ? `Whole number, 1 to ${Farmer.MAX_CHUNK_HOURS}` : null}
+                        />
                     </div>
-                    <TierMeter value={hours} tiers={TIME_TIERS} unit="hours" />
+                    <TierMeter
+                        value={hours}
+                        tiers={TIME_TIERS}
+                        unit="hours"
+                        disabled={busy}
+                        onPick={target => setTimeTarget(String(target))}
+                    />
                 </Panel>
             )}
 
             {tab === "variety" && (
                 <Panel
                     key="variety"
-                    intro="Sends one short session each for random games from Discord's catalog. Universalist needs 100."
+                    intro="Posts one short session each for random games from Discord's catalog. Universalist needs 100."
                     action={
                         <StartButton
                             label="Start Variety"
-                            eta={games != null ? `About ${formatDuration(games * SECONDS_PER_REQUEST)}` : null}
+                            eta={varietyBatches != null ? formatDuration(varietyBatches * SECONDS_PER_BATCH) : null}
                             disabled={busy || apps == null || games == null || minutes == null}
                             onClick={() => void Farmer.startVariety(Farmer.shuffled(apps!, games!), minutes!)}
                         />
                     }
                 >
                     <div className={cl("row")}>
-                        <Field label="Games" value={varietyCount} onChange={setVarietyCount}
-                            error={games == null ? `Whole number, 1 to ${(apps?.length ?? 1_000).toLocaleString()}` : null} />
-                        <Field label="Each session" suffix="min" value={varietyMinutes} onChange={setVarietyMinutes}
-                            hint="Two minutes works"
-                            error={minutes == null ? "Use 1 to 1,440" : null} />
+                        <Field
+                            label="Games"
+                            value={varietyCount}
+                            disabled={busy}
+                            onChange={setVarietyCount}
+                            error={games == null ? `Whole number, 1 to ${(apps?.length ?? 1_000).toLocaleString()}` : null}
+                        />
+                        <Field
+                            label="Each session"
+                            suffix="min"
+                            value={varietyMinutes}
+                            disabled={busy}
+                            onChange={setVarietyMinutes}
+                            hint="Two minutes is enough"
+                            error={minutes == null ? "Use 1 to 1,440" : null}
+                        />
                     </div>
-                    <TierMeter value={games} tiers={VARIETY_TIERS} unit="games" />
+                    <TierMeter
+                        value={games}
+                        tiers={VARIETY_TIERS}
+                        unit="games"
+                        disabled={busy}
+                        onPick={target => setVarietyCount(String(target))}
+                    />
                 </Panel>
             )}
 
             {tab === "stream" && (
                 <Panel
                     key="stream"
-                    intro="Goes live in your current voice channel with Discord's own Go Live and keeps the stream up. Hours count in real time, one per hour live."
+                    intro="Starts Go Live in your current voice channel and restarts at the 4-hour mark. Hours count in real time while at least one viewer watches."
                     action={
                         <StartButton
                             label="Go live"
                             eta={streamHours != null ? `Takes ${formatDuration(streamHours * 3_600)}` : null}
-                            disabled={busy || streamHours == null}
-                            onClick={() => void Farmer.startStreamFarm(streamHours!)}
+                            disabled={busy || streamHours == null || voice.problem != null}
+                            onClick={() => void Farmer.startStreamFarm(streamHours!, selectedSourceId || undefined)}
                         />
                     }
                 >
-                    <div className={cl("callout", "callout-warn")}>
-                        Go Live shares your main screen with the voice channel. Close private windows before you start.
+                    <div className={cl("voice-bar", { "voice-bar-ok": voice.problem == null })}>
+                        <span className={cl("voice-dot")} />
+                        <span className={cl("voice-text")}>
+                            {voice.problem ?? `Connected to ${voice.channelName}`}
+                        </span>
                     </div>
-                    <Field label="Target" suffix="hours" value={streamTarget} onChange={setStreamTarget}
-                        hint="Someone has to watch. An alt account in the channel works."
-                        error={streamHours == null ? `Use 0.1 to ${Farmer.MAX_TARGET_HOURS.toLocaleString()}` : null} />
-                    <TierMeter value={streamHours} tiers={TIME_TIERS} unit="hours" />
+
+                    {noTrackBlocksStream && (
+                        <div className={cl("callout", "callout-danger")}>
+                            NoTrack has badge tracking turned off. Enable "Allow badge tracking" in NoTrack settings and restart Discord so Go Live hours count.
+                        </div>
+                    )}
+
+                    {sharingFullScreen && (
+                        <div className={cl("callout", "callout-warn")}>
+                            Default capture shares your main screen. Pick a single window below or close private tabs before you go live.
+                        </div>
+                    )}
+
+                    <div className={cl("row")}>
+                        <Field
+                            label="Target"
+                            suffix="hours"
+                            value={streamTarget}
+                            disabled={busy}
+                            onChange={setStreamTarget}
+                            hint="An alt watching your stream counts"
+                            error={streamHours == null ? `Use 0.1 to ${Farmer.MAX_TARGET_HOURS.toLocaleString()}` : null}
+                        />
+                        <div className={cl("field")}>
+                            <span className={cl("field-label")}>Capture source</span>
+                            <div className={cl("select-row")}>
+                                <select
+                                    className={cl("select")}
+                                    value={selectedSourceId}
+                                    disabled={busy || streamSources.loading}
+                                    aria-label="Stream capture source"
+                                    onChange={event => setSelectedSourceId(event.currentTarget.value)}
+                                >
+                                    <option value="">Main screen (auto)</option>
+                                    {streamSources.sources.map(source => (
+                                        <option key={source.id} value={source.id}>
+                                            {source.kind === "screen" ? `[Screen] ${source.name}` : source.name}
+                                        </option>
+                                    ))}
+                                </select>
+                                <button
+                                    type="button"
+                                    className={cl("ghost")}
+                                    disabled={busy || streamSources.loading}
+                                    onClick={streamSources.refresh}
+                                >
+                                    {streamSources.loading ? "..." : "Refresh"}
+                                </button>
+                            </div>
+                            <span className={cl("field-note")}>Pick a blank window to avoid sharing your desktop</span>
+                        </div>
+                    </div>
+
+                    <TierMeter
+                        value={streamHours}
+                        tiers={STREAM_TIERS}
+                        unit="hours"
+                        disabled={busy}
+                        onPick={target => setStreamTarget(String(target))}
+                    />
                 </Panel>
             )}
 
             {tab === "all" && (
                 <Panel
                     key="all"
-                    intro="Runs the badges back to back with the top-tier targets. You can close this page once it starts."
+                    intro="Runs all three badges to their top tiers in order. You can close this window once the run starts."
                     action={
                         <StartButton
                             label="Start all three"
-                            eta={`First two take about ${formatDuration(allEta)}`}
+                            eta={`First two take ${formatDuration(allBatches * SECONDS_PER_BATCH)}`}
                             disabled={busy || apps == null}
-                            onClick={() => void Farmer.maxAll(apps!)}
+                            onClick={() => void Farmer.maxAll(apps!, selectedSourceId || undefined)}
                         />
                     }
                 >
@@ -552,18 +803,22 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                         </li>
                         <li className={cl("flow-step")}>
                             <span className={cl("flow-name")}>Game Time</span>
-                            <span className={cl("flow-note")}>5,000 hours on the first of those games</span>
+                            <span className={cl("flow-note")}>5,000 hours on the first game from that batch</span>
                         </li>
                         <li className={cl("flow-step")}>
                             <span className={cl("flow-name")}>Streaming</span>
-                            <span className={cl("flow-note")}>Goes live if you're in a voice channel by then, otherwise it stops after step two</span>
+                            <span className={cl("flow-note")}>
+                                {voice.problem == null
+                                    ? `Goes live in ${voice.channelName} after step two`
+                                    : "Skipped unless you join a voice channel before step two finishes"}
+                            </span>
                         </li>
                     </ol>
                 </Panel>
             )}
 
             <p className={cl("footnote")}>
-                Discord drops these sessions while "Use data to personalize my Discord experience" is off. You'll find it under Data &amp; Privacy. Badges show up after Discord's overnight update.
+                Discord refreshes Game Time and Variety badges overnight, and Streaming within 48 hours. Keep "Use data to personalize my Discord experience" on under Data &amp; Privacy.
             </p>
         </div>
     );
@@ -582,7 +837,7 @@ export function BadgeIcon({
     className?: string;
     size?: string;
     color?: string;
-    [key: string]: any;
+    [key: string]: unknown;
 }) {
     return (
         <svg
@@ -610,19 +865,30 @@ export function BadgeIcon({
     );
 }
 
-export function openBadgeFarmerModal() {
-    return openModal((props: RenderModalProps) => (
-        <ErrorBoundary>
-            <Modal
-                {...props}
-                size="lg"
-                title="Badge Farmer"
-                subtitle="Pick a badge and leave Discord open while it runs."
-            >
-                <div className={cl("modal-body")}>
-                    <BadgeFarmerDashboard isModal />
-                </div>
-            </Modal>
-        </ErrorBoundary>
-    ));
+export function closeBadgeFarmerModal(): void {
+    try {
+        closeModal(MODAL_KEY);
+    } catch {
+        // Ignore if modal is not open.
+    }
+}
+
+export function openBadgeFarmerModal(): string {
+    return openModal(
+        (props: RenderModalProps) => (
+            <ErrorBoundary>
+                <Modal
+                    {...props}
+                    size="lg"
+                    title="Badge Farmer"
+                    subtitle="Pick a badge, start a run, and keep Discord open."
+                >
+                    <div className={cl("modal-body")}>
+                        <BadgeFarmerDashboard isModal />
+                    </div>
+                </Modal>
+            </ErrorBoundary>
+        ),
+        { modalKey: MODAL_KEY }
+    );
 }

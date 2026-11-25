@@ -4,15 +4,16 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { IS_WINDOWS } from "@utils/constants";
+import { Settings } from "@api/Settings";
+import { IS_LINUX, IS_MAC, IS_WINDOWS } from "@utils/constants";
 import { Logger } from "@utils/Logger";
-import { sleep } from "@utils/misc";
 import type { Channel, RunningGame } from "@vencord/discord-types";
 import { findByCodeLazy } from "@webpack";
 import {
     ApplicationStreamingStore,
     ChannelStore,
     FluxDispatcher,
+    GameStore,
     MediaEngineStore,
     PermissionsBits,
     PermissionStore,
@@ -20,13 +21,24 @@ import {
     showToast
 } from "@webpack/common";
 
-import { creditPlaytime, fingerprintFor } from "./science";
+import {
+    creditPlaytimeBatch,
+    fingerprintFor,
+    MAX_SESSION_MS,
+    MAX_SESSIONS_PER_BATCH,
+    MIN_DURATION_MS,
+    type PlaytimeSession
+} from "./science";
 
 const logger = new Logger("BadgeFarmer");
 
-interface DesktopSource {
+const DETECTABLE_APPS_URL = "https://discord.com/api/v10/applications/detectable";
+const CATALOGUE_TIMEOUT_MS = 20_000;
+
+export interface DesktopSource {
     id: string;
     name: string;
+    kind: "screen" | "window";
 }
 
 interface StreamOptions {
@@ -38,15 +50,30 @@ interface StreamOptions {
     previewDisabled: boolean;
 }
 
+type RawDesktopSource = { id?: unknown; name?: unknown; };
+type GetDesktopSources4 = (engine: unknown, isWindows: boolean, types: string[], options: null) => Promise<RawDesktopSource[] | null>;
+type GetDesktopSources3 = (engine: unknown, types: string[], options: null) => Promise<RawDesktopSource[] | null>;
+
 // The same action creators Discord's Go Live button calls.
-const startStream: (guildId: string | null, channelId: string, options: StreamOptions) => void = findByCodeLazy('type:"STREAM_START"');
-const stopStream: (streamKey: string) => void = findByCodeLazy('type:"STREAM_STOP"');
-const getDesktopSources: (engine: unknown, isWindows: boolean, types: string[], options: null) => Promise<DesktopSource[] | null> = findByCodeLazy("desktop sources");
+const startStream: ((guildId: string | null, channelId: string, options: StreamOptions) => void) | undefined =
+    findByCodeLazy('type:"STREAM_START"');
+const stopStream: ((streamKey: string) => void) | undefined =
+    findByCodeLazy('type:"STREAM_STOP"');
+const getDesktopSources: (GetDesktopSources4 & GetDesktopSources3) | undefined =
+    findByCodeLazy("desktop sources");
+
+export interface DetectableExecutable {
+    name: string;
+    os?: string;
+    is_launcher?: boolean;
+    isLauncher?: boolean;
+}
 
 export interface DetectableApp {
     id: string;
     name: string;
-    executables?: Array<{ name: string; os?: string; is_launcher?: boolean; }>;
+    aliases?: string[];
+    executables?: DetectableExecutable[];
 }
 
 export interface SpoofedGame extends Omit<RunningGame, "distributor"> {
@@ -76,28 +103,35 @@ export interface FarmerStatus {
     streamHours: number;
     streamTarget: number;
     streamViewers: number | null;
+    streamPaused: boolean;
     errors: number;
     lastError: string | null;
     finishedMessage: string | null;
 }
 
+export interface VoiceReadiness {
+    channelName: string | null;
+    problem: string | null;
+}
+
 export const ETERNAL_HOURS = 5_000;
 export const UNIVERSALIST_GAMES = 100;
 export const MAX_TARGET_HOURS = 1_000_000;
-export const MAX_CHUNK_HOURS = 500;
+export const MAX_CHUNK_HOURS = 24;
 export const DEFAULT_CHUNK_HOURS = 24;
 export const DEFAULT_VARIETY_MINUTES = 2;
+export const BATCH_SIZE = MAX_SESSIONS_PER_BATCH;
 
-const MIN_CHUNK_MS = 60_000;
-const MAX_BACKDATE_MS = 24 * 60 * 60 * 1_000;
-const REQUEST_DELAY_MS = 600;
+const REQUEST_DELAY_MS = 700;
 const RETRY_DELAY_MS = 3_000;
-const MAX_FAILED_CHUNKS = 5;
+const MAX_RATE_LIMIT_WAIT_MS = 30_000;
+const MAX_FAILED_BATCHES = 5;
 
-// Discord cuts streams off at 5 hours, so the farm restarts at 4.
+// Discord cuts streams off at 5 hours, so BadgeFarmer restarts at 4.
 const STREAM_ROTATE_MS = 4 * 60 * 60 * 1_000;
 const STREAM_REJOIN_GAP_MS = 3_000;
-const STREAM_TICK_MS = 15_000;
+const STREAM_TICK_MS = 10_000;
+const MAX_TICK_DELTA_MS = STREAM_TICK_MS * 3;
 const STREAM_START_TIMEOUT_MS = 10_000;
 const STREAM_RESTART_LIMIT = 3;
 
@@ -110,14 +144,18 @@ let gamesTarget = 0;
 let streamHours = 0;
 let streamTarget = 0;
 let streamViewers: number | null = null;
+let streamPaused = false;
 let errors = 0;
 let lastError: string | null = null;
 let finishedMessage: string | null = null;
 
 let running = false;
 let runId = 0;
+let runAbort: AbortController | null = null;
 let cursor = 0;
 let ownsStream = false;
+
+let cataloguePromise: Promise<DetectableApp[]> | null = null;
 
 const listeners = new Set<() => void>();
 
@@ -147,6 +185,7 @@ export function getStatus(): FarmerStatus {
         streamHours,
         streamTarget,
         streamViewers,
+        streamPaused,
         errors,
         lastError,
         finishedMessage
@@ -164,29 +203,145 @@ export function dismissFinished(): void {
     notify();
 }
 
-/** A run stays alive until Stop is pressed or a newer run replaces it. */
+export function isNoTrackBlockingStream(): boolean {
+    try {
+        const noTrack = Settings.plugins?.NoTrack as
+            | { enabled?: boolean; disableAnalytics?: boolean; allowBadgeTracking?: boolean; }
+            | undefined;
+        if (noTrack == null || noTrack.enabled === false) return false;
+        return noTrack.disableAnalytics === true && noTrack.allowBadgeTracking === false;
+    } catch {
+        return false;
+    }
+}
+
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+    if (ms <= 0 || signal?.aborted) return Promise.resolve();
+    return new Promise(resolve => {
+        const onAbort = () => {
+            clearTimeout(timer);
+            resolve();
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve();
+        }, ms);
+        signal?.addEventListener("abort", onAbort, { once: true });
+    });
+}
+
+/** Keeps a run active until Stop is pressed or a newer run replaces it. */
 function alive(id: number): boolean {
     return running && id === runId;
 }
 
 function describeError(error: unknown): string {
-    if (error instanceof Error) return error.message;
+    if (error instanceof Error) {
+        if (error.name === "AbortError" || error.name === "TimeoutError") {
+            return "Request timed out. Check your connection.";
+        }
+        return error.message;
+    }
     if (error != null && typeof error === "object") {
         const { body, status } = error as { body?: { message?: unknown; }; status?: unknown; };
-        if (typeof body?.message === "string") return body.message;
-        if (typeof status === "number") return `Discord answered with HTTP ${status}`;
+        if (status === 429) return "Discord rate limited requests. Cooling down.";
+        if (status === 401 || status === 403) return "Discord rejected the session token.";
+        if (typeof body?.message === "string" && body.message !== "") return body.message;
+        if (typeof status === "number") return `Discord answered with HTTP ${status}.`;
     }
     return String(error);
 }
 
+function normalizeApps(raw: unknown): DetectableApp[] {
+    if (!Array.isArray(raw)) return [];
+    const seen = new Set<string>();
+    const apps: DetectableApp[] = [];
+
+    for (const item of raw) {
+        if (item == null || typeof item !== "object") continue;
+        const entry = item as { id?: unknown; name?: unknown; aliases?: unknown; executables?: unknown; };
+        if (typeof entry.id !== "string" || typeof entry.name !== "string") continue;
+        const name = entry.name.trim();
+        if (name === "" || seen.has(entry.id)) continue;
+        seen.add(entry.id);
+
+        const aliases = Array.isArray(entry.aliases)
+            ? entry.aliases.filter((alias): alias is string => typeof alias === "string" && alias.trim() !== "")
+            : undefined;
+        const executables = Array.isArray(entry.executables)
+            ? entry.executables.filter((exe): exe is DetectableExecutable =>
+                exe != null && typeof exe === "object" && typeof (exe as { name?: unknown; }).name === "string")
+            : undefined;
+
+        apps.push({ id: entry.id, name, aliases, executables });
+    }
+
+    return apps;
+}
+
+export function clearCatalogueCache(): void {
+    cataloguePromise = null;
+}
+
+/** Loads Discord's detectable games, preferring the in-memory GameStore cache before HTTP. */
+export function loadCatalogue(): Promise<DetectableApp[]> {
+    try {
+        const local = normalizeApps(GameStore?.games);
+        if (local.length > 0) {
+            cataloguePromise = Promise.resolve(local);
+            return cataloguePromise;
+        }
+    } catch (error) {
+        logger.warn("Could not read GameStore cache", error);
+    }
+
+    if (cataloguePromise != null) return cataloguePromise;
+
+    cataloguePromise = (async () => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), CATALOGUE_TIMEOUT_MS);
+        try {
+            const response = await fetch(DETECTABLE_APPS_URL, { signal: controller.signal });
+            if (!response.ok) throw new Error(`Discord answered with HTTP ${response.status}.`);
+            const data: unknown = await response.json();
+            const apps = normalizeApps(data);
+            if (apps.length === 0) throw new Error("Discord returned an empty game list.");
+            return apps;
+        } catch (error) {
+            cataloguePromise = null;
+            throw new Error(describeError(error));
+        } finally {
+            clearTimeout(timer);
+        }
+    })();
+
+    return cataloguePromise;
+}
+
+function preferredOs(): string {
+    if (IS_WINDOWS) return "win32";
+    if (IS_MAC) return "darwin";
+    if (IS_LINUX) return "linux";
+    return "win32";
+}
+
+function isLauncherExe(entry: DetectableExecutable): boolean {
+    return entry.is_launcher === true || entry.isLauncher === true;
+}
+
 export function executableFor(app: DetectableApp): string {
     const executables = app.executables ?? [];
-    const executable = executables.find(entry => entry.os === "win32" && entry.is_launcher !== true)
+    const os = preferredOs();
+    const executable = executables.find(entry => entry.os === os && !isLauncherExe(entry))
+        ?? executables.find(entry => entry.os === "win32" && !isLauncherExe(entry))
+        ?? executables.find(entry => entry.os === os)
         ?? executables.find(entry => entry.os === "win32")
+        ?? executables.find(entry => !isLauncherExe(entry))
         ?? executables[0];
 
     const fallback = `${app.name.replace(/[<>:"/\\|?*]/g, "").trim() || "game"}.exe`;
-    return (executable?.name.replace(/^>/, "") ?? fallback).replace(/^.*[\\/]/, "") || fallback;
+    const cleaned = executable?.name?.replace(/^>/, "").replace(/^.*[\\/]/, "").trim();
+    return cleaned && cleaned !== "" ? cleaned : fallback;
 }
 
 function specFor(app: DetectableApp): GameSpec {
@@ -195,7 +350,7 @@ function specFor(app: DetectableApp): GameSpec {
 
 export function shuffled<T>(items: readonly T[], count = items.length): T[] {
     const pool = [...items];
-    const take = Math.min(count, pool.length);
+    const take = Math.min(Math.max(0, Math.floor(count)), pool.length);
     for (let index = 0; index < take; index++) {
         const picked = index + Math.floor(Math.random() * (pool.length - index));
         [pool[index], pool[picked]] = [pool[picked], pool[index]];
@@ -206,18 +361,19 @@ export function shuffled<T>(items: readonly T[], count = items.length): T[] {
 function buildGame(app: GameSpec, startedAt: number): SpoofedGame {
     const folder = app.name.replace(/[<>:"/\\|?*]/g, "").trim().toLowerCase() || "game";
     const pid = 10_000 + Math.floor(Math.random() * 40_000);
+    const exePath = `c:/program files/${folder}/${app.exeName}`;
 
     return {
         id: app.id,
         name: app.name,
         exeName: app.exeName,
-        exePath: `c:/program files/${folder}/${app.exeName}`,
-        cmdLine: `c:/program files/${folder}/${app.exeName}`,
+        exePath,
+        cmdLine: exePath,
         processName: app.name,
         pid,
         pidPath: [pid],
         start: startedAt,
-        lastFocused: Math.floor(startedAt / 1000),
+        lastFocused: Math.floor(startedAt / 1_000),
         lastLaunched: startedAt,
         nativeProcessObserverId: -1,
         hidden: false,
@@ -237,28 +393,49 @@ function showGame(game: SpoofedGame | null): void {
     }
 }
 
-/** Hands out back-to-back time slots within Discord's 24-hour window so sessions do not overlap. */
+/** Hands out back-to-back slots within Discord's 24-hour window so shorter sessions do not overlap. */
 function nextSlotStart(durationMs: number): number {
-    const floor = Date.now() - MAX_BACKDATE_MS;
+    const now = Date.now();
+    const floor = now - MAX_SESSION_MS;
+    if (durationMs >= MAX_SESSION_MS) {
+        cursor = floor;
+        return floor;
+    }
     if (cursor - durationMs < floor) {
-        cursor = Date.now() - Math.floor(Math.random() * 60_000);
+        cursor = now - Math.floor(Math.random() * 30_000);
     }
     cursor -= durationMs;
     return Math.max(cursor, floor);
 }
 
-function retryDelayMs(error: unknown): number {
-    if (error != null && typeof error === "object") {
-        const retryAfter = (error as { body?: { retry_after?: unknown; }; }).body?.retry_after;
-        if (typeof retryAfter === "number" && retryAfter > 0) {
-            return Math.min(Math.ceil(retryAfter * 1_000), 30_000);
-        }
+function readRetryAfterMs(error: unknown): number | null {
+    if (error == null || typeof error !== "object") return null;
+    const obj = error as {
+        body?: { retry_after?: unknown; };
+        headers?: Record<string, unknown>;
+    };
+
+    const bodySeconds = obj.body?.retry_after;
+    if (typeof bodySeconds === "number" && Number.isFinite(bodySeconds) && bodySeconds > 0) {
+        return Math.min(Math.ceil(bodySeconds * 1_000) + 250, MAX_RATE_LIMIT_WAIT_MS);
     }
-    return RETRY_DELAY_MS;
+
+    const headerRaw = obj.headers?.["retry-after"] ?? obj.headers?.["Retry-After"];
+    const headerSeconds = typeof headerRaw === "string" ? Number(headerRaw) : typeof headerRaw === "number" ? headerRaw : NaN;
+    if (Number.isFinite(headerSeconds) && headerSeconds > 0) {
+        return Math.min(Math.ceil(headerSeconds * 1_000) + 250, MAX_RATE_LIMIT_WAIT_MS);
+    }
+
+    return null;
+}
+
+function isRateLimited(error: unknown): boolean {
+    return error != null && typeof error === "object" && (error as { status?: unknown; }).status === 429;
 }
 
 async function withRetry(id: number, label: string, action: () => Promise<void>): Promise<boolean> {
-    for (let attempt = 1; attempt <= 3 && alive(id); attempt++) {
+    let maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts && alive(id); attempt++) {
         try {
             await action();
             return true;
@@ -267,100 +444,161 @@ async function withRetry(id: number, label: string, action: () => Promise<void>)
             lastError = describeError(error);
             logger.error(`${label} failed on attempt ${attempt}`, error);
             notify();
-            if (attempt < 3) await sleep(retryDelayMs(error));
+
+            if (isRateLimited(error) && maxAttempts < 5) maxAttempts = 5;
+            if (attempt < maxAttempts) {
+                const delay = readRetryAfterMs(error) ?? RETRY_DELAY_MS * attempt;
+                await wait(delay, runAbort?.signal);
+            }
         }
     }
     return false;
 }
 
-async function runGameTime(id: number, app: GameSpec, targetHours: number, chunkHours: number): Promise<void> {
-    const chunkSize = Math.min(Math.max(1, chunkHours), MAX_CHUNK_HOURS);
-    const game = buildGame(app, cursor);
+async function runGameTime(id: number, app: GameSpec, targetHours: number, chunkHours: number): Promise<boolean> {
+    const chunkMs = Math.min(Math.max(1, chunkHours), MAX_CHUNK_HOURS) * 3_600_000;
+    const targetMs = Math.round(targetHours * 3_600_000);
+    let creditedMs = 0;
     let failures = 0;
 
     hoursTarget = targetHours;
-    showGame(game);
+    showGame(buildGame(app, Date.now()));
     notify();
 
-    while (alive(id) && hoursCredited < targetHours) {
-        const chunk = Math.min(chunkSize, targetHours - hoursCredited);
-        const chunkMs = chunk * 3_600_000;
-        // Discord drops sessions shorter than a minute, so a leftover sliver never counts.
-        if (chunkMs < MIN_CHUNK_MS) break;
+    while (alive(id) && targetMs - creditedMs >= MIN_DURATION_MS) {
+        const batch: PlaytimeSession[] = [];
+        let plannedMs = creditedMs;
 
-        const slotStart = nextSlotStart(chunkMs);
-        let creditedMs = 0;
-        const ok = await withRetry(id, `${chunk}h chunk for ${game.name}`, async () => {
-            creditedMs = await creditPlaytime(game, chunkMs, slotStart);
+        while (batch.length < BATCH_SIZE && targetMs - plannedMs >= MIN_DURATION_MS) {
+            const sliceMs = Math.min(chunkMs, targetMs - plannedMs);
+            if (sliceMs < MIN_DURATION_MS) break;
+            batch.push({
+                game: app,
+                durationMs: sliceMs,
+                startedAt: nextSlotStart(sliceMs)
+            });
+            plannedMs += sliceMs;
+        }
+
+        if (batch.length === 0) break;
+
+        let batchCredited = 0;
+        const ok = await withRetry(id, `${batch.length}-session batch for ${app.name}`, async () => {
+            const result = await creditPlaytimeBatch(batch);
+            batchCredited = result.creditedMs;
         });
-        if (!alive(id)) return;
+        if (!alive(id)) return false;
 
         if (!ok) {
-            if (++failures >= MAX_FAILED_CHUNKS) {
-                lastError = `Stopped after ${MAX_FAILED_CHUNKS} failed chunks in a row. Last error: ${lastError ?? "unknown"}`;
-                return;
+            if (++failures >= MAX_FAILED_BATCHES) {
+                lastError = `Stopped after ${MAX_FAILED_BATCHES} failed requests in a row. Last error: ${lastError ?? "unknown"}`;
+                return false;
             }
             continue;
         }
 
         failures = 0;
-        hoursCredited += creditedMs / 3_600_000;
+        creditedMs += batchCredited;
+        hoursCredited = Math.min(creditedMs, targetMs) / 3_600_000;
+        if (lastError != null && errors > 0) lastError = null;
         notify();
-        await sleep(REQUEST_DELAY_MS);
+
+        if (targetMs - creditedMs >= MIN_DURATION_MS) {
+            await wait(REQUEST_DELAY_MS, runAbort?.signal);
+        }
     }
+
+    return alive(id) && targetMs - creditedMs < MIN_DURATION_MS;
 }
 
-async function runVariety(id: number, apps: DetectableApp[], minutesPerGame: number): Promise<void> {
-    const sessionMs = Math.max(MIN_CHUNK_MS, Math.floor(minutesPerGame * 60_000));
+async function runVariety(id: number, apps: DetectableApp[], minutesPerGame: number): Promise<boolean> {
+    const unique: DetectableApp[] = [];
+    const seen = new Set<string>();
+    for (const app of apps) {
+        if (app?.id && !seen.has(app.id)) {
+            seen.add(app.id);
+            unique.push(app);
+        }
+    }
+
+    const sessionMs = Math.min(MAX_SESSION_MS, Math.max(MIN_DURATION_MS, Math.floor(minutesPerGame * 60_000)));
     let failures = 0;
-    gamesTarget = apps.length;
+    gamesTarget = unique.length;
     notify();
 
-    for (const app of apps) {
-        if (!alive(id)) return;
-        const game = buildGame(specFor(app), cursor);
-        showGame(game);
+    for (let offset = 0; offset < unique.length; offset += BATCH_SIZE) {
+        if (!alive(id)) return false;
 
-        const slotStart = nextSlotStart(sessionMs);
-        const ok = await withRetry(id, `Variety session for ${game.name}`, async () => {
-            await creditPlaytime(game, sessionMs, slotStart);
+        const slice = unique.slice(offset, offset + BATCH_SIZE);
+        const specs = slice.map(specFor);
+        showGame(buildGame(specs[0], Date.now()));
+        notify();
+
+        const batch: PlaytimeSession[] = specs.map(spec => ({
+            game: spec,
+            durationMs: sessionMs,
+            startedAt: nextSlotStart(sessionMs)
+        }));
+
+        let sentCount = 0;
+        const ok = await withRetry(id, `Variety batch (${specs[0].name} + ${specs.length - 1} more)`, async () => {
+            const result = await creditPlaytimeBatch(batch);
+            sentCount = result.sessions;
         });
-        if (!alive(id)) return;
+        if (!alive(id)) return false;
 
         if (!ok) {
-            if (++failures >= MAX_FAILED_CHUNKS) {
-                lastError = `Stopped after ${MAX_FAILED_CHUNKS} failed games in a row. Last error: ${lastError ?? "unknown"}`;
-                return;
+            if (++failures >= MAX_FAILED_BATCHES) {
+                lastError = `Stopped after ${MAX_FAILED_BATCHES} failed batches in a row. Last error: ${lastError ?? "unknown"}`;
+                return false;
             }
             continue;
         }
 
         failures = 0;
-        gamesCredited++;
+        gamesCredited += sentCount;
+        if (lastError != null) lastError = null;
         notify();
-        await sleep(REQUEST_DELAY_MS);
+
+        if (offset + BATCH_SIZE < unique.length) {
+            await wait(REQUEST_DELAY_MS, runAbort?.signal);
+        }
     }
 
     showGame(null);
+    return alive(id) && gamesCredited >= unique.length;
 }
 
 function currentVoiceChannel(): Channel | null {
-    const channelId = SelectedChannelStore.getVoiceChannelId();
-    if (channelId == null || channelId === "") return null;
-    return ChannelStore.getChannel(channelId) ?? null;
+    try {
+        const channelId = SelectedChannelStore?.getVoiceChannelId?.();
+        if (channelId == null || channelId === "") return null;
+        return ChannelStore?.getChannel?.(channelId) ?? null;
+    } catch {
+        return null;
+    }
 }
 
 function voiceProblem(channel: Channel | null): string | null {
-    if (channel == null) return "Join a voice channel, then start the stream farm.";
-    // Stage channels use a separate stream flow.
-    if (channel.type === 13) return "Stage channels don't support Go Live. Pick a regular voice channel.";
+    if (channel == null) return "Join a voice channel before starting a stream run.";
+    // Stage channels use a separate broadcast flow.
+    if (channel.type === 13) return "Stage channels do not support Go Live. Pick a regular voice channel.";
     const isDm = typeof channel.isDM === "function" ? channel.isDM() : channel.type === 1;
     const isGroupDm = typeof channel.isGroupDM === "function" ? channel.isGroupDM() : channel.type === 3;
     const isGuild = !isDm && !isGroupDm;
     if (isGuild && PermissionStore?.can && !PermissionStore.can(PermissionsBits.STREAM, channel)) {
-        return "You don't have permission to stream in this voice channel.";
+        return "You lack permission to stream in this voice channel.";
     }
     return null;
+}
+
+export function getVoiceState(): VoiceReadiness {
+    const channel = currentVoiceChannel();
+    const problem = voiceProblem(channel);
+    const channelName = channel == null
+        ? null
+        : (channel.name && channel.name.trim() !== "" ? `#${channel.name}` : "Voice Call");
+    return { channelName, problem };
 }
 
 function streamKeyOf(stream: { guildId: string | null; channelId: string; ownerId: string; }): string {
@@ -371,9 +609,9 @@ function streamKeyOf(stream: { guildId: string | null; channelId: string; ownerI
 
 function readLiveStream(): { viewers: number; } | null {
     try {
-        const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
+        const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
         if (stream == null) return null;
-        const viewerIds = ApplicationStreamingStore.getViewerIds(streamKeyOf(stream));
+        const viewerIds = ApplicationStreamingStore?.getViewerIds?.(streamKeyOf(stream));
         return { viewers: Array.isArray(viewerIds) ? viewerIds.length : 0 };
     } catch (error) {
         logger.warn("Could not read the active stream", error);
@@ -385,20 +623,71 @@ function endOwnedStream(): void {
     if (!ownsStream) return;
     ownsStream = false;
     try {
-        const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
-        if (stream != null) stopStream(streamKeyOf(stream));
+        const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
+        if (stream != null && typeof stopStream === "function") {
+            stopStream(streamKeyOf(stream));
+        }
     } catch (error) {
         logger.error("Could not end the stream", error);
     }
 }
 
-async function goLive(id: number, channel: Channel): Promise<boolean> {
+async function fetchRawSources(types: string[]): Promise<RawDesktopSource[]> {
+    const engine = MediaEngineStore?.getMediaEngine?.();
+    if (engine == null || typeof getDesktopSources !== "function") return [];
+
+    // Try Discord's current 4-argument signature first, then fall back to the 3-argument signature.
     try {
-        const engine = MediaEngineStore?.getMediaEngine?.();
-        const sources = await getDesktopSources(engine, IS_WINDOWS, ["screen"], null) ?? [];
-        const source = sources[0];
+        const list = getDesktopSources.length === 3
+            ? await getDesktopSources(engine, types, null)
+            : await getDesktopSources(engine, IS_WINDOWS, types, null);
+        if (Array.isArray(list) && list.length > 0) return list;
+    } catch {
+        // Fall through to the alternate signature below.
+    }
+
+    try {
+        const list = getDesktopSources.length === 3
+            ? await getDesktopSources(engine, IS_WINDOWS, types, null)
+            : await getDesktopSources(engine, types, null);
+        return Array.isArray(list) ? list : [];
+    } catch (error) {
+        logger.warn("Could not list desktop capture sources", error);
+        return [];
+    }
+}
+
+export async function listStreamSources(): Promise<DesktopSource[]> {
+    const raw = await fetchRawSources(["screen", "window"]);
+    const sources: DesktopSource[] = [];
+    const seen = new Set<string>();
+
+    for (const entry of raw) {
+        if (typeof entry?.id !== "string" || entry.id === "" || seen.has(entry.id)) continue;
+        seen.add(entry.id);
+        const name = typeof entry.name === "string" && entry.name.trim() !== "" ? entry.name.trim() : entry.id;
+        const kind: "screen" | "window" = entry.id.startsWith("window:") ? "window" : "screen";
+        sources.push({ id: entry.id, name, kind });
+    }
+
+    return sources;
+}
+
+async function goLive(id: number, channel: Channel, preferredSourceId?: string): Promise<boolean> {
+    if (typeof startStream !== "function" || typeof getDesktopSources !== "function") {
+        lastError = "Go Live requires the Discord desktop app.";
+        return false;
+    }
+
+    try {
+        const sources = await listStreamSources();
+        const preferred = preferredSourceId != null
+            ? sources.find(item => item.id === preferredSourceId)
+            : undefined;
+        const source = preferred ?? sources.find(item => item.kind === "screen") ?? sources[0];
+
         if (source == null) {
-            lastError = "Discord found no screen to share.";
+            lastError = "Discord found no screen or window to share.";
             return false;
         }
         if (!alive(id)) return false;
@@ -412,20 +701,20 @@ async function goLive(id: number, channel: Channel): Promise<boolean> {
             previewDisabled: false
         });
 
-        // Keep waiting even after Stop, so a stream that comes up late gets ended instead of left running.
+        // Keep polling after Stop so a late stream gets ended instead of staying live.
         const deadline = Date.now() + STREAM_START_TIMEOUT_MS;
         while (Date.now() < deadline) {
-            await sleep(500);
-            const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
+            await wait(500);
+            const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
             if (stream == null) continue;
             if (!alive(id)) {
-                if (!running) stopStream(streamKeyOf(stream));
+                if (!running && typeof stopStream === "function") stopStream(streamKeyOf(stream));
                 return false;
             }
             ownsStream = true;
             return true;
         }
-        lastError = "Go Live didn't start within 10 seconds.";
+        lastError = "Go Live did not start within 10 seconds.";
         return false;
     } catch (error) {
         lastError = `Go Live failed: ${describeError(error)}`;
@@ -434,8 +723,8 @@ async function goLive(id: number, channel: Channel): Promise<boolean> {
     }
 }
 
-async function runStream(id: number, targetHours: number): Promise<boolean> {
-    const targetMs = targetHours * 3_600_000;
+async function runStream(id: number, targetHours: number, sourceId?: string): Promise<boolean> {
+    const targetMs = Math.round(targetHours * 3_600_000);
     streamTarget = targetHours;
 
     const problem = voiceProblem(currentVoiceChannel());
@@ -468,52 +757,58 @@ async function runStream(id: number, targetHours: number): Promise<boolean> {
             }
             restarts++;
             streamViewers = null;
+            streamPaused = false;
             notify();
-            if (await goLive(id, channel!)) {
+
+            if (await goLive(id, channel!, sourceId)) {
                 restarts = 0;
                 segmentStart = Date.now();
                 lastTick = Date.now();
                 if (lastError?.startsWith("Go Live")) lastError = null;
             } else {
                 lastTick = Date.now();
-                await sleep(5_000);
+                await wait(5_000, runAbort?.signal);
             }
             continue;
         }
 
-        liveMs += now - lastTick;
+        // Clamp delta so OS sleep/wake jumps cannot fabricate fake stream hours.
+        const delta = Math.min(Math.max(0, now - lastTick), MAX_TICK_DELTA_MS);
         lastTick = now;
-        streamHours = Math.min(liveMs, targetMs) / 3_600_000;
         streamViewers = live.viewers;
 
-        if (live.viewers === 0) {
-            lastError = "Nobody is watching. Bring an alt into the channel to open your stream.";
-        } else if (lastError?.startsWith("Nobody is watching")) {
-            lastError = null;
+        if (live.viewers > 0) {
+            liveMs += delta;
+            streamHours = Math.min(liveMs, targetMs) / 3_600_000;
+            streamPaused = false;
+            if (lastError?.startsWith("Waiting for a viewer")) lastError = null;
+        } else {
+            streamPaused = true;
+            lastError = "Waiting for a viewer. Bring another account into the channel and open your stream.";
         }
 
         if (now - segmentStart >= STREAM_ROTATE_MS) {
-            logger.info("Restarting the stream before Discord's 5 hour cutoff");
-            // Rotating means the farm owns the stream from here on, even one it adopted.
+            logger.info("Restarting the stream before Discord's 5-hour cutoff");
             ownsStream = true;
             endOwnedStream();
             segmentStart = Date.now();
-            await sleep(STREAM_REJOIN_GAP_MS);
+            await wait(STREAM_REJOIN_GAP_MS, runAbort?.signal);
             lastTick = Date.now();
             continue;
         }
 
         notify();
-        await sleep(Math.min(STREAM_TICK_MS, Math.max(1_000, targetMs - liveMs)));
+        await wait(Math.min(STREAM_TICK_MS, Math.max(1_000, targetMs - liveMs)), runAbort?.signal);
     }
 
     if (alive(id)) {
         endOwnedStream();
         streamViewers = null;
+        streamPaused = false;
         notify();
     }
 
-    return liveMs >= targetMs;
+    return alive(id) && liveMs >= targetMs;
 }
 
 function begin(nextMode: FarmerMode): number | null {
@@ -528,11 +823,13 @@ function begin(nextMode: FarmerMode): number | null {
     streamHours = 0;
     streamTarget = 0;
     streamViewers = null;
+    streamPaused = false;
     errors = 0;
     lastError = null;
     finishedMessage = null;
     cursor = Date.now();
     ownsStream = false;
+    runAbort = new AbortController();
     notify();
     return ++runId;
 }
@@ -541,32 +838,42 @@ function end(id: number): void {
     if (id !== runId) return;
     running = false;
     mode = "IDLE";
+    runAbort?.abort();
+    runAbort = null;
     showGame(null);
     endOwnedStream();
     streamViewers = null;
+    streamPaused = false;
     notify();
 }
 
 function markFinished(message: string): void {
     finishedMessage = message;
-    showToast({ text: message, variant: "success" });
+    try {
+        showToast({ text: message, variant: "success" });
+    } catch (error) {
+        logger.warn("Could not show completion toast", error);
+    }
 }
 
 export async function startGameTime(app: DetectableApp, hours = ETERNAL_HOURS, chunkHours = DEFAULT_CHUNK_HOURS): Promise<void> {
     if (app == null || typeof app.id !== "string" || typeof app.name !== "string") {
-        lastError = "Select a valid game before starting.";
+        lastError = "Pick a valid game before starting.";
         notify();
         return;
     }
-    const safeHours = Math.max(0.1, hours);
-    const safeChunk = Math.min(Math.max(1, chunkHours), MAX_CHUNK_HOURS);
+    const safeHours = Number.isFinite(hours) ? Math.min(Math.max(0.1, hours), MAX_TARGET_HOURS) : ETERNAL_HOURS;
+    const safeChunk = Number.isFinite(chunkHours) ? Math.min(Math.max(1, Math.floor(chunkHours)), MAX_CHUNK_HOURS) : DEFAULT_CHUNK_HOURS;
     const id = begin("GAME_TIME");
     if (id == null) return;
     try {
-        await runGameTime(id, specFor(app), safeHours, safeChunk);
-        if (alive(id) && hoursCredited >= safeHours) {
-            markFinished(`Sent ${Math.round(hoursCredited).toLocaleString()} hours of ${app.name}. Discord updates the badge overnight.`);
+        const completed = await runGameTime(id, specFor(app), safeHours, safeChunk);
+        if (completed) {
+            markFinished(`Sent ${Math.round(hoursCredited).toLocaleString()} hours of ${app.name}. Discord updates badges overnight.`);
         }
+    } catch (error) {
+        lastError = describeError(error);
+        logger.error("Game Time run crashed", error);
     } finally {
         end(id);
     }
@@ -574,40 +881,46 @@ export async function startGameTime(app: DetectableApp, hours = ETERNAL_HOURS, c
 
 export async function startVariety(apps: DetectableApp[], minutesPerGame = DEFAULT_VARIETY_MINUTES): Promise<void> {
     if (!Array.isArray(apps) || apps.length === 0) {
-        lastError = "No games available. Load the catalog and try again.";
+        lastError = "Game catalog is empty. Reload the list and try again.";
         notify();
         return;
     }
-    const safeMinutes = Math.max(1, minutesPerGame);
+    const safeMinutes = Number.isFinite(minutesPerGame) ? Math.min(Math.max(1, minutesPerGame), 1_440) : DEFAULT_VARIETY_MINUTES;
     const id = begin("VARIETY");
     if (id == null) return;
     try {
-        await runVariety(id, apps, safeMinutes);
-        if (alive(id) && gamesCredited >= apps.length) {
-            markFinished(`Sent sessions for ${gamesCredited} games. Discord updates the badge overnight.`);
+        const completed = await runVariety(id, apps, safeMinutes);
+        if (completed) {
+            markFinished(`Sent sessions for ${gamesCredited} games. Discord updates badges overnight.`);
         }
+    } catch (error) {
+        lastError = describeError(error);
+        logger.error("Variety run crashed", error);
     } finally {
         end(id);
     }
 }
 
-export async function startStreamFarm(hours = ETERNAL_HOURS): Promise<void> {
-    const safeHours = Math.max(0.1, hours);
+export async function startStreamFarm(hours = ETERNAL_HOURS, sourceId?: string): Promise<void> {
+    const safeHours = Number.isFinite(hours) ? Math.min(Math.max(0.1, hours), MAX_TARGET_HOURS) : ETERNAL_HOURS;
     const id = begin("STREAM");
     if (id == null) return;
     try {
-        const reached = await runStream(id, safeHours);
-        if (alive(id) && reached) {
+        const reached = await runStream(id, safeHours, sourceId);
+        if (reached) {
             markFinished(`Streamed ${Math.round(streamHours).toLocaleString()} hours. Give Discord a day or two to update the badge.`);
         }
+    } catch (error) {
+        lastError = describeError(error);
+        logger.error("Stream run crashed", error);
     } finally {
         end(id);
     }
 }
 
-export async function maxAll(apps: DetectableApp[]): Promise<void> {
+export async function maxAll(apps: DetectableApp[], sourceId?: string): Promise<void> {
     if (!Array.isArray(apps) || apps.length === 0) {
-        lastError = "Game catalog not ready. Wait for games to load and try again.";
+        lastError = "Game catalog is not ready yet. Wait for it to finish loading.";
         notify();
         return;
     }
@@ -617,14 +930,14 @@ export async function maxAll(apps: DetectableApp[]): Promise<void> {
         const pool = shuffled(apps, UNIVERSALIST_GAMES);
         if (pool.length === 0) {
             lastError = "Could not pick games from the catalog.";
-            notify();
             return;
         }
-        await runVariety(id, pool, DEFAULT_VARIETY_MINUTES);
-        if (!alive(id)) return;
 
-        await runGameTime(id, specFor(pool[0]), ETERNAL_HOURS, DEFAULT_CHUNK_HOURS);
-        if (!alive(id)) return;
+        const varietyOk = await runVariety(id, pool, DEFAULT_VARIETY_MINUTES);
+        if (!varietyOk || !alive(id)) return;
+
+        const timeOk = await runGameTime(id, specFor(pool[0]), ETERNAL_HOURS, DEFAULT_CHUNK_HOURS);
+        if (!timeOk || !alive(id)) return;
 
         const summary = `${gamesCredited} games and ${Math.round(hoursCredited).toLocaleString()} hours of ${pool[0].name}`;
 
@@ -633,11 +946,18 @@ export async function maxAll(apps: DetectableApp[]): Promise<void> {
             return;
         }
 
-        showToast({ text: `Sent ${summary}. Going live for the streaming badge now.`, variant: "success" });
-        const reached = await runStream(id, ETERNAL_HOURS);
-        if (alive(id) && reached) {
-            markFinished(`Done. ${summary}, plus ${Math.round(streamHours).toLocaleString()} hours streamed.`);
+        try {
+            showToast({ text: `Sent ${summary}. Starting Go Live for the streaming badge.`, variant: "success" });
+        } catch {
+            // Toast failures are non-fatal.
         }
+        const reached = await runStream(id, ETERNAL_HOURS, sourceId);
+        if (reached) {
+            markFinished(`Finished ${summary}, plus ${Math.round(streamHours).toLocaleString()} hours streamed.`);
+        }
+    } catch (error) {
+        lastError = describeError(error);
+        logger.error("All three run crashed", error);
     } finally {
         end(id);
     }
