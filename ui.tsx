@@ -1,8 +1,10 @@
 /*
- * Vencord, a Discord client mod
- * Copyright (c) 2026 Vendicated and contributors
- * SPDX-License-Identifier: GPL-3.0-or-later
- */
+Made with ❤️ by rico
+I am not responsible for any damage caused by this plugin; use at your own risk
+Vencord/Equicord does not endorse/support this plugin (Works with Equicord as well)
+dm @wkcp if u need help or have any questions
+https://github.com/aboveproof/BadgeFarmer
+*/
 
 import { Button } from "@components/Button";
 import ErrorBoundary from "@components/ErrorBoundary";
@@ -21,6 +23,7 @@ import {
     useLayoutEffect,
     useMemo,
     useRef,
+    UserProfileStore,
     useState,
     VoiceStateStore
 } from "@webpack/common";
@@ -101,8 +104,15 @@ function useFarmerState(): { status: FarmerStatus; progress: AccountProgress; } 
     const forceUpdate = useForceUpdater();
     useEffect(() => {
         const unsub = Farmer.subscribe(forceUpdate);
+        const dirStore = Farmer.getBadgeDirectoryStore();
+        dirStore?.addChangeListener?.(forceUpdate);
+        UserProfileStore?.addChangeListener?.(forceUpdate);
         void Farmer.syncAccountProgress(false);
-        return unsub;
+        return () => {
+            unsub();
+            dirStore?.removeChangeListener?.(forceUpdate);
+            UserProfileStore?.removeChangeListener?.(forceUpdate);
+        };
     }, [forceUpdate]);
     return {
         status: Farmer.getStatus(),
@@ -265,10 +275,10 @@ function ProgressOverview({
         });
     }
 
-    const cards: Array<{ tab: Tab; title: string; unit: string; data: TrackProgress; maxAt: number; }> = [
-        { tab: "time", title: "Game Time", unit: "hrs", data: progress.time, maxAt: Farmer.ETERNAL_HOURS },
-        { tab: "variety", title: "Variety", unit: "games", data: progress.variety, maxAt: Farmer.UNIVERSALIST_GAMES },
-        { tab: "stream", title: "Streaming", unit: "hrs", data: progress.stream, maxAt: Farmer.ETERNAL_HOURS }
+    const cards: Array<{ tab: Tab; title: string; singular: string; plural: string; data: TrackProgress; maxAt: number; }> = [
+        { tab: "time", title: "Game Time", singular: "hr", plural: "hrs", data: progress.time, maxAt: Farmer.ETERNAL_HOURS },
+        { tab: "variety", title: "Variety", singular: "game", plural: "games", data: progress.variety, maxAt: Farmer.UNIVERSALIST_GAMES },
+        { tab: "stream", title: "Streaming", singular: "hr", plural: "hrs", data: progress.stream, maxAt: Farmer.ETERNAL_HOURS }
     ];
 
     return (
@@ -296,14 +306,15 @@ function ProgressOverview({
             </div>
 
             <div className={cl("tracks")}>
-                {cards.map(({ tab, title, unit, data, maxAt }) => {
+                {cards.map(({ tab, title, singular, plural, data, maxAt }) => {
                     const tierLabel = data.currentTier != null
                         ? `${data.currentTier.name} · T${data.currentTier.level}/10`
                         : "Unranked · T0/10";
                     const ceiling = data.nextTier?.at ?? maxAt;
                     const pct = ceiling > 0 ? Math.min(100, (data.current / ceiling) * 100) : 100;
+                    const nextUnit = data.nextTier?.at === 1 ? singular : plural;
                     const subline = data.nextTier != null
-                        ? `Next: ${data.nextTier.name} (${data.nextTier.at.toLocaleString()} ${unit})`
+                        ? `Next: ${data.nextTier.name} (${data.nextTier.at.toLocaleString()} ${nextUnit})`
                         : "Max tier reached";
 
                     return (
@@ -323,7 +334,7 @@ function ProgressOverview({
 
                             <div className={cl("track-stat")}>
                                 <span className={cl("track-value")}>{formatCount(data.current)}</span>
-                                <span className={cl("track-unit")}>/ {maxAt.toLocaleString()} {unit}</span>
+                                <span className={cl("track-unit")}>/ {maxAt.toLocaleString()} {plural}</span>
                             </div>
 
                             <div className={cl("track-bar")}>

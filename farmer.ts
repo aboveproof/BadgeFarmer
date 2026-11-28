@@ -1,19 +1,22 @@
 /*
- * Vencord, a Discord client mod
- * Copyright (c) 2026 Vendicated and contributors
- * SPDX-License-Identifier: GPL-3.0-or-later
- */
+Made with ❤️ by rico
+I am not responsible for any damage caused by this plugin; use at your own risk
+Vencord/Equicord does not endorse/support this plugin (Works with Equicord as well)
+dm @wkcp if u need help or have any questions
+https://github.com/aboveproof/BadgeFarmer
+*/
 
 import * as DataStore from "@api/DataStore";
 import { Settings } from "@api/Settings";
 import { IS_WINDOWS } from "@utils/constants";
 import { Logger } from "@utils/Logger";
-import type { ApplicationStream, Channel, ProfileBadge, RunningGame } from "@vencord/discord-types";
-import { findByCodeLazy } from "@webpack";
+import type { ApplicationStream, Channel, FluxStore, ProfileBadge, RunningGame } from "@vencord/discord-types";
+import { filters, findAll } from "@webpack";
 import {
     ApplicationStreamingSettingsStore,
     ApplicationStreamingStore,
     ChannelStore,
+    Constants,
     FluxDispatcher,
     GameStore,
     MediaEngineStore,
@@ -32,8 +35,9 @@ import {
 import {
     type BadgeTier,
     type BadgeTrack,
+    type DirectoryBadgeInput,
     nextTierFor,
-    parseProfileBadges,
+    parseAllUserBadges,
     reachedTierIndex,
     tierIconUrl,
     TIME_TIERS,
@@ -54,6 +58,7 @@ import {
 const logger = new Logger("BadgeFarmer");
 
 const CATALOGUE_TIMEOUT_MS = 20_000;
+const DIRECTORY_FETCH_WAIT_MS = 4_500;
 const LEGACY_USED_GAMES_PREFIX = "BadgeFarmer_usedGames_v1_";
 const LEDGER_KEY_PREFIX = "BadgeFarmer_ledger_v2_";
 
@@ -126,18 +131,43 @@ export interface AccountProgress {
     otherBadges: ProfileBadge[];
 }
 
+interface BadgeDirectoryStoreShape extends FluxStore {
+    getBadges?(userId: string): unknown[];
+    getEarnableBadges?(userId: string): unknown[];
+    getUnownedBadges?(userId: string): unknown[];
+    getAllBadges?(userId: string): unknown[];
+    getBadgeById?(badgeId: string, userId: string): unknown;
+    getCurrentTier?(badgeId: string, userId: string): unknown;
+    getState?(): unknown;
+}
+
 type RawDesktopSource = { id?: unknown; name?: unknown; };
 type GetDesktopSources4 = (engine: unknown, isWindows: boolean, types: string[], options: null) => Promise<RawDesktopSource[] | null>;
 type GetDesktopSources3 = (engine: unknown, types: string[], options: null) => Promise<RawDesktopSource[] | null>;
 
-const startStream: ((guildId: string | null, channelId: string, options: StreamOptions) => void) | undefined =
-    findByCodeLazy('type:"STREAM_START"');
-const stopStream: ((streamKey: string) => void) | undefined =
-    findByCodeLazy('type:"STREAM_STOP"');
-const watchStreamAction: ((stream: ApplicationStream | string, allowMultiple?: boolean) => void) | undefined =
-    findByCodeLazy('type:"STREAM_WATCH"');
-const getDesktopSources: (GetDesktopSources4 & GetDesktopSources3) | undefined =
-    findByCodeLazy("desktop sources");
+function resolveStartStream(): ((guildId: string | null, channelId: string, options: StreamOptions) => void) | undefined {
+    return findAll(filters.byCode('type:"STREAM_START"'))[0];
+}
+
+function resolveStopStream(): ((streamKey: string) => void) | undefined {
+    return findAll(filters.byCode('type:"STREAM_STOP"'))[0];
+}
+
+function resolveWatchStream(): ((stream: ApplicationStream | string, allowMultiple?: boolean) => void) | undefined {
+    return findAll(filters.byCode('type:"STREAM_WATCH"'))[0];
+}
+
+function resolveGetDesktopSources(): (GetDesktopSources4 & GetDesktopSources3) | undefined {
+    return findAll(filters.byCode("desktop sources"))[0];
+}
+
+export function getBadgeDirectoryStore(): BadgeDirectoryStoreShape | null {
+    try {
+        return (findAll(filters.byStoreName("BadgeDirectoryStore"))[0] as BadgeDirectoryStoreShape | undefined) ?? null;
+    } catch {
+        return null;
+    }
+}
 
 export interface DetectableExecutable {
     name: string;
@@ -282,6 +312,7 @@ let cataloguePromise: Promise<DetectableApp[]> | null = null;
 const memoryLedgers = new Map<string, StoredProgressLedger>();
 let cachedProfileUserId: string | null = null;
 let cachedRawBadges: ProfileBadge[] = [];
+let cachedFallbackDirectory: DirectoryBadgeInput[] = [];
 let cachedSyncedAt: number | null = null;
 let progressLoading = false;
 
@@ -467,7 +498,7 @@ function persistLedgerSync(userId: string, ledger: StoredProgressLedger): void {
     void DataStore.set(`${LEDGER_KEY_PREFIX}${userId}`, ledger).catch(() => undefined);
 }
 
-/** Reads verified numeric game IDs Discord has already detected locally in RunningGameStore. */
+/** Reads verified numeric game IDs Discord has already detected on this PC in RunningGameStore. */
 export function getClientSeenGameIds(): Set<string> {
     const ids = new Set<string>();
     try {
@@ -484,9 +515,193 @@ export function getClientSeenGameIds(): Set<string> {
     return ids;
 }
 
+/** Reads owned and earnable badges (plus currentTier) from Discord's BadgeDirectoryStore ("Your badges" modal). */
+function readDirectoryEntriesFromStore(userId: string): DirectoryBadgeInput[] {
+    const store = getBadgeDirectoryStore();
+    if (store == null) return [];
+
+    const rawItems: Record<string, unknown>[] = [];
+    const seenIds = new Set<string>();
+
+    const collect = (list: unknown) => {
+        if (!Array.isArray(list)) return;
+        for (const item of list) {
+            if (item == null || typeof item !== "object") continue;
+            const rec = item as Record<string, unknown>;
+            const key = String(rec.badge_id ?? rec.id ?? "");
+            if (key !== "") {
+                if (seenIds.has(key)) continue;
+                seenIds.add(key);
+            }
+            rawItems.push(rec);
+        }
+    };
+
+    try {
+        collect(store.getBadges?.(userId));
+        collect(store.getEarnableBadges?.(userId));
+        collect(store.getUnownedBadges?.(userId));
+        collect(store.getAllBadges?.(userId));
+    } catch {
+        // Ignore partial store method failures.
+    }
+
+    for (const candidateId of ["game_time", "game_variety", "streaming", "evolving_badge_game_time", "evolving_badge_game_variety", "evolving_badge_streaming"]) {
+        if (seenIds.has(candidateId)) continue;
+        try {
+            const direct = store.getBadgeById?.(candidateId, userId);
+            if (direct != null && typeof direct === "object") {
+                seenIds.add(candidateId);
+                rawItems.push(direct as Record<string, unknown>);
+            }
+        } catch {
+            // Ignore lookup failures.
+        }
+    }
+
+    return rawItems.map(badge => {
+        let currentTier: Record<string, unknown> | null = null;
+        const badgeId = typeof badge.badge_id === "string"
+            ? badge.badge_id
+            : typeof badge.id === "string" ? badge.id : null;
+        if (badgeId != null) {
+            try {
+                const resolved = store.getCurrentTier?.(badgeId, userId);
+                if (resolved != null && typeof resolved === "object") {
+                    currentTier = resolved as Record<string, unknown>;
+                }
+            } catch {
+                // Ignore tier lookup errors.
+            }
+        }
+        return { badge, currentTier };
+    });
+}
+
+function discoverBadgeEndpoints(userId: string): string[] {
+    const urls = new Set<string>();
+    try {
+        const endpoints = Constants?.Endpoints as Record<string, unknown> | undefined;
+        if (endpoints != null && typeof endpoints === "object") {
+            for (const [key, entry] of Object.entries(endpoints)) {
+                const upper = key.toUpperCase();
+                if (!upper.includes("BADGE")) continue;
+                if (/(?:SETTING|PIN|ACK|SEEN|GUILD|CLAN|BOOST|PACK|ICON)/.test(upper)) continue;
+                if (typeof entry === "string" && entry.startsWith("/users/")) {
+                    urls.add(entry);
+                } else if (typeof entry === "function" && entry.length <= 1) {
+                    try {
+                        const built = (entry as (id: string) => unknown)(userId);
+                        if (typeof built === "string" && built.startsWith("/users/") && !built.includes("undefined")) {
+                            urls.add(built);
+                        }
+                    } catch {
+                        // Ignore endpoints requiring non-user parameters.
+                    }
+                }
+            }
+        }
+    } catch {
+        // Ignore endpoint discovery failures.
+    }
+    urls.add(`/users/${userId}/badges`);
+    urls.add("/users/@me/badges");
+    return [...urls];
+}
+
+function extractDirectoryListFromBody(body: unknown): DirectoryBadgeInput[] {
+    if (body == null) return [];
+    const collected: Record<string, unknown>[] = [];
+    const pushList = (candidate: unknown) => {
+        if (!Array.isArray(candidate)) return;
+        for (const item of candidate) {
+            if (item != null && typeof item === "object") {
+                collected.push(item as Record<string, unknown>);
+            }
+        }
+    };
+
+    if (Array.isArray(body)) {
+        pushList(body);
+    } else if (typeof body === "object") {
+        const obj = body as Record<string, unknown>;
+        pushList(obj.badges);
+        pushList(obj.directory_badges);
+        pushList(obj.earnable_badges);
+        pushList(obj.owned_badges);
+        pushList(obj.items);
+    }
+
+    return collected.map(badge => {
+        const rawCur = badge.current_tier ?? badge.currentTier;
+        const currentTier = rawCur != null && typeof rawCur === "object" ? rawCur as Record<string, unknown> : null;
+        return { badge, currentTier };
+    });
+}
+
+async function triggerBadgeDirectoryFetch(userId: string, forceNetwork: boolean): Promise<void> {
+    const store = getBadgeDirectoryStore();
+    const existing = readDirectoryEntriesFromStore(userId);
+    if (!forceNetwork && (existing.length > 0 || cachedFallbackDirectory.length > 0)) return;
+
+    const actionFns = findAll(
+        mod => typeof mod === "function"
+            && (String(mod).includes("BADGE_DIRECTORY_FETCH_START") || String(mod).includes("BADGE_DIRECTORY_FETCH_SUCCESS"))
+            && /\.dispatch\s*\(/.test(String(mod))
+    ) as Array<(...args: unknown[]) => unknown>;
+
+    if (actionFns.length > 0) {
+        const waitDispatched = new Promise<void>(resolve => {
+            let settled = false;
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                FluxDispatcher.unsubscribe("BADGE_DIRECTORY_FETCH_SUCCESS", finish);
+                FluxDispatcher.unsubscribe("BADGE_DIRECTORY_FETCH_FAILURE", finish);
+                resolve();
+            };
+            const timer = setTimeout(finish, DIRECTORY_FETCH_WAIT_MS);
+            FluxDispatcher.subscribe("BADGE_DIRECTORY_FETCH_SUCCESS", finish);
+            FluxDispatcher.subscribe("BADGE_DIRECTORY_FETCH_FAILURE", finish);
+        });
+
+        for (const fn of actionFns) {
+            try {
+                const src = String(fn);
+                const result = /^\s*(?:async\s+)?(?:function\s*\w*\s*)?\(\s*\{/.test(src)
+                    ? fn({ userId, force: forceNetwork })
+                    : fn(userId, forceNetwork);
+                if (result instanceof Promise) {
+                    await Promise.race([result.catch(() => undefined), waitDispatched]);
+                } else {
+                    await waitDispatched;
+                }
+                if (store != null && readDirectoryEntriesFromStore(userId).length > 0) return;
+            } catch {
+                // Try next candidate or REST fallback.
+            }
+        }
+    }
+
+    // Fallback when BadgeDirectoryStore's chunk has not loaded yet or returned empty.
+    for (const url of discoverBadgeEndpoints(userId)) {
+        try {
+            const res = await RestAPI.get({ url });
+            const extracted = extractDirectoryListFromBody(res?.body);
+            if (extracted.length > 0) {
+                cachedFallbackDirectory = extracted;
+                return;
+            }
+        } catch {
+            // Endpoint may not exist on older server rollouts; ignore.
+        }
+    }
+}
+
 function buildTrackProgress(
     track: BadgeTrack,
-    parsedBadges: ReturnType<typeof parseProfileBadges>,
+    parsedBadges: ReturnType<typeof parseAllUserBadges>,
     ledger: StoredProgressLedger,
     clientSeenCount: number
 ): TrackProgress {
@@ -519,9 +734,9 @@ function buildTrackProgress(
         ? Math.floor(rawPending)
         : Math.round(rawPending * 10) / 10;
 
-    const currentTierIndex = reachedTierIndex(current, tiers);
+    const currentTierIndex = Math.max(profileTierIndex, reachedTierIndex(current, tiers));
     const currentTier = currentTierIndex >= 0 ? tiers[currentTierIndex] : null;
-    const nextTier = nextTierFor(current, tiers);
+    const nextTier = currentTierIndex >= tiers.length - 1 ? null : nextTierFor(current, tiers);
     const iconUrl = detected?.iconUrl ?? tierIconUrl(currentTier ?? tiers[0]);
 
     return {
@@ -558,7 +773,14 @@ export function getAccountProgress(): AccountProgress {
     const ledger = userId != null ? (memoryLedgers.get(userId) ?? emptyLedger()) : emptyLedger();
     const clientSeenIds = getClientSeenGameIds();
     const unionVarietyIds = new Set<string>([...clientSeenIds, ...ledger.claimedGameIds]);
-    const parsed = parseProfileBadges(cachedProfileUserId === userId ? cachedRawBadges : []);
+
+    const directoryEntries = userId != null
+        ? [...readDirectoryEntriesFromStore(userId), ...cachedFallbackDirectory]
+        : [];
+    const profileBadges = userId != null
+        ? (UserProfileStore?.getUserProfile?.(userId)?.badges ?? (cachedProfileUserId === userId ? cachedRawBadges : []))
+        : [];
+    const parsed = parseAllUserBadges(profileBadges, directoryEntries);
 
     return {
         userId,
@@ -589,6 +811,7 @@ export async function syncAccountProgress(forceNetwork = false): Promise<Account
 
     try {
         await ensureLedger(userId);
+        await triggerBadgeDirectoryFetch(userId, forceNetwork);
 
         let badges: ProfileBadge[] | null = null;
         if (!forceNetwork) {
@@ -616,8 +839,8 @@ export async function syncAccountProgress(forceNetwork = false): Promise<Account
         if (badges != null) {
             cachedProfileUserId = userId;
             cachedRawBadges = badges;
-            cachedSyncedAt = Date.now();
         }
+        cachedSyncedAt = Date.now();
     } finally {
         progressLoading = false;
         notify();
@@ -869,7 +1092,8 @@ export async function selectFreshGames(apps: readonly DetectableApp[], count: nu
     const usedSet = new Set<string>([...clientSeen, ...ledger.claimedGameIds]);
 
     const nonLaunchers = apps.filter(app => !usedSet.has(app.id) && app.executables.some(e => !isLauncherExe(e)));
-    const unusedRest = apps.filter(app => !usedSet.has(app.id) && !nonLaunchers.includes(app));
+    const nonLauncherSet = new Set(nonLaunchers.map(app => app.id));
+    const unusedRest = apps.filter(app => !usedSet.has(app.id) && !nonLauncherSet.has(app.id));
     const chosen: DetectableApp[] = [...shuffled(nonLaunchers), ...shuffled(unusedRest)].slice(0, desired);
 
     if (chosen.length < desired) {
@@ -1422,8 +1646,9 @@ export function endOwnedStream(): void {
     try {
         if (shouldStop) {
             const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
-            if (stream != null && typeof stopStream === "function") {
-                stopStream(streamKeyOf(stream));
+            const stopFn = resolveStopStream();
+            if (stream != null && typeof stopFn === "function") {
+                stopFn(streamKeyOf(stream));
             }
         }
     } catch (error) {
@@ -1435,21 +1660,22 @@ export function endOwnedStream(): void {
 
 async function fetchRawSources(types: string[]): Promise<RawDesktopSource[]> {
     const engine = MediaEngineStore?.getMediaEngine?.();
-    if (engine == null || typeof getDesktopSources !== "function") return [];
+    const getSources = resolveGetDesktopSources();
+    if (engine == null || typeof getSources !== "function") return [];
 
     try {
-        const list = getDesktopSources.length === 3
-            ? await getDesktopSources(engine, types, null)
-            : await getDesktopSources(engine, IS_WINDOWS, types, null);
+        const list = getSources.length === 3
+            ? await getSources(engine, types, null)
+            : await getSources(engine, IS_WINDOWS, types, null);
         if (Array.isArray(list) && list.length > 0) return list;
     } catch {
         // Fall through to the alternate signature below.
     }
 
     try {
-        const list = getDesktopSources.length === 3
-            ? await getDesktopSources(engine, IS_WINDOWS, types, null)
-            : await getDesktopSources(engine, types, null);
+        const list = getSources.length === 3
+            ? await getSources(engine, IS_WINDOWS, types, null)
+            : await getSources(engine, types, null);
         return Array.isArray(list) ? list : [];
     } catch (error) {
         logger.warn("Could not list desktop capture sources", error);
@@ -1474,8 +1700,11 @@ export async function listStreamSources(): Promise<DesktopSource[]> {
 }
 
 async function goLive(id: number, channel: Channel, config: StreamFarmConfig): Promise<boolean> {
-    if (typeof startStream !== "function" || typeof getDesktopSources !== "function") {
-        lastError = "Go Live requires the Discord desktop app.";
+    const startFn = resolveStartStream();
+    const stopFn = resolveStopStream();
+
+    if (typeof startFn !== "function") {
+        lastError = "Start Share Your Screen in Discord's voice panel; BadgeFarmer will manage the stream once live.";
         return false;
     }
 
@@ -1487,7 +1716,7 @@ async function goLive(id: number, channel: Channel, config: StreamFarmConfig): P
         const source = preferred ?? sources.find(item => item.kind === "screen") ?? sources[0];
 
         if (source == null) {
-            lastError = "Discord found no screen or window to share.";
+            lastError = "Click Share Your Screen in Discord's voice panel to pick a window; BadgeFarmer will take over once live.";
             return false;
         }
         if (!alive(id)) return false;
@@ -1495,7 +1724,7 @@ async function goLive(id: number, channel: Channel, config: StreamFarmConfig): P
         const lowPower = config.lowPower !== false;
         if (lowPower) applyLowPowerStreamSettings();
 
-        startStream(channel.guild_id ?? null, channel.id, {
+        startFn(channel.guild_id ?? null, channel.id, {
             pid: null,
             sourceId: source.id,
             sourceName: source.name,
@@ -1511,7 +1740,7 @@ async function goLive(id: number, channel: Channel, config: StreamFarmConfig): P
             if (stream == null) continue;
             const key = streamKeyOf(stream);
             if (!alive(id)) {
-                if (!running && typeof stopStream === "function") stopStream(key);
+                if (!running && typeof stopFn === "function") stopFn(key);
                 restoreStreamSettings();
                 return false;
             }
@@ -1616,16 +1845,18 @@ async function runStream(
                     restarts = 0;
                     segmentStart = Date.now();
                     lastTick = Date.now();
-                    if (lastError?.startsWith("Go Live") || lastError?.startsWith("Voice connection")) {
+                    if (lastError?.startsWith("Go Live") || lastError?.startsWith("Click Share") || lastError?.startsWith("Start Share") || lastError?.startsWith("Voice connection")) {
                         lastError = null;
                     }
                 } else {
+                    notify();
                     lastTick = Date.now();
-                    await wait(5_000, runAbort?.signal);
+                    await wait(6_000, runAbort?.signal);
                 }
                 continue;
             }
 
+            restarts = 0;
             ownsStream = true;
             if (config.lowPower !== false && savedStreamSettings == null) {
                 applyLowPowerStreamSettings();
@@ -1641,9 +1872,7 @@ async function runStream(
                 unsavedDeltaMs += delta;
                 streamHours = Math.min(totalTargetMs, startMs + sessionLiveMs) / 3_600_000;
                 streamPaused = false;
-                if (lastError?.startsWith("Waiting for a viewer") || lastError?.startsWith("Voice connection")) {
-                    lastError = null;
-                }
+                if (lastError != null) lastError = null;
                 if (now - lastSaveAt >= STREAM_SAVE_INTERVAL_MS && unsavedDeltaMs > 0) {
                     recordStreamDeltaSync(unsavedDeltaMs, startMs + sessionLiveMs - unsavedDeltaMs);
                     unsavedDeltaMs = 0;
@@ -1692,6 +1921,7 @@ async function runStream(
 
 async function runViewerHelper(id: number): Promise<void> {
     const myId = UserStore?.getCurrentUser?.()?.id;
+    const watchFn = resolveWatchStream();
 
     while (alive(id)) {
         const channel = currentVoiceChannel();
@@ -1715,8 +1945,8 @@ async function runViewerHelper(id: number): Promise<void> {
                 const key = streamKeyOf(target);
                 const active = ApplicationStreamingStore?.getActiveStreamForStreamKey?.(key);
                 if (active == null) {
-                    if (typeof watchStreamAction === "function") {
-                        watchStreamAction(target, true);
+                    if (typeof watchFn === "function") {
+                        watchFn(target, true);
                     } else {
                         FluxDispatcher.dispatch({ type: "STREAM_WATCH", streamKey: key, allowMultiple: true });
                     }
@@ -1803,7 +2033,7 @@ export async function startSpreadGameTime(
     const neededHours = subtractExisting ? Math.max(0, safeHours - startHours) : safeHours;
 
     if (neededHours * 3_600_000 < MIN_DURATION_MS) {
-        markFinished(`Account is already at ${progress.time.current.toLocaleString()} hours. Switch Goal mode to "Add full amount" to send extra hours.`);
+        markFinished(`Account is at ${progress.time.current.toLocaleString()} hours. Switch Goal mode to "Add full amount on top" to farm extra hours.`);
         notify();
         return;
     }
@@ -1845,7 +2075,7 @@ export async function startSingleGameTime(
     const neededHours = subtractExisting ? Math.max(0, safeHours - startHours) : safeHours;
 
     if (neededHours * 3_600_000 < MIN_DURATION_MS) {
-        markFinished(`Account is already at ${progress.time.current.toLocaleString()} hours.`);
+        markFinished(`Account is at ${progress.time.current.toLocaleString()} hours.`);
         notify();
         return;
     }
@@ -1885,7 +2115,7 @@ export async function startVariety(
     const neededGames = subtractExisting ? Math.max(0, safeCount - startGames) : safeCount;
 
     if (neededGames <= 0) {
-        markFinished(`Account already has ${progress.variety.current.toLocaleString()} unique games recorded. Switch Goal mode to "Add full amount" to claim more.`);
+        markFinished(`Account has ${progress.variety.current.toLocaleString()} unique games recorded. Switch Goal mode to "Add full amount on top" to claim more.`);
         notify();
         return;
     }
@@ -1916,7 +2146,7 @@ export async function startStreamFarm(hours = ETERNAL_HOURS, config: StreamFarmC
     const neededHours = subtractExisting ? Math.max(0, safeHours - startHours) : safeHours;
 
     if (neededHours * 3_600_000 < 30_000) {
-        markFinished(`Account already has ${progress.stream.current.toLocaleString()} stream hours recorded. Pick a higher tier or switch Goal mode to "Add full amount".`);
+        markFinished(`Account has ${progress.stream.current.toLocaleString()} stream hours recorded. Pick a higher tier or switch Goal mode to "Add full amount on top".`);
         notify();
         return;
     }

@@ -1,8 +1,10 @@
 /*
- * Vencord, a Discord client mod
- * Copyright (c) 2026 Vendicated and contributors
- * SPDX-License-Identifier: GPL-3.0-or-later
- */
+Made with ❤️ by rico
+I am not responsible for any damage caused by this plugin; use at your own risk
+Vencord/Equicord does not endorse/support this plugin (Works with Equicord as well)
+dm @wkcp if u need help or have any questions
+https://github.com/aboveproof/BadgeFarmer
+*/
 
 import type { ProfileBadge } from "@vencord/discord-types";
 
@@ -66,7 +68,7 @@ export const TRACK_TIERS: Record<BadgeTrack, readonly BadgeTier[]> = {
 
 export interface DetectedTrackBadge {
     tierIndex: number;
-    tier: BadgeTier;
+    tier: BadgeTier | null;
     parsedFloor: number;
     iconUrl: string;
     rawDescription: string;
@@ -75,6 +77,11 @@ export interface DetectedTrackBadge {
 export interface ParsedProfileBadges {
     tracks: Record<BadgeTrack, DetectedTrackBadge | null>;
     otherBadges: ProfileBadge[];
+}
+
+export interface DirectoryBadgeInput {
+    badge: Record<string, unknown>;
+    currentTier?: Record<string, unknown> | null;
 }
 
 interface HashMatch {
@@ -120,10 +127,22 @@ export function nextTierFor(value: number, tiers: readonly BadgeTier[]): BadgeTi
     return null;
 }
 
-function parseDigits(raw: string | undefined): number | null {
+function parseLocaleNumber(raw: string | undefined, minExpectedTierAt = 0): number | null {
     if (typeof raw !== "string") return null;
-    const num = Number(raw.replace(/,/g, ""));
-    return Number.isFinite(num) && num > 0 ? num : null;
+    const trimmed = raw.trim();
+    if (trimmed === "") return null;
+
+    let normalized = trimmed;
+    if (/^\d{1,3}(?:,\d{3})+(?:\.\d+)?$/.test(trimmed)) {
+        normalized = trimmed.replace(/,/g, "");
+    } else if (/^\d{1,3}(?:\.\d{3})+$/.test(trimmed) && minExpectedTierAt >= 1_000) {
+        normalized = trimmed.replace(/\./g, "");
+    } else {
+        normalized = trimmed.replace(/,/g, "");
+    }
+
+    const num = Number(normalized);
+    return Number.isFinite(num) && num >= 0 ? num : null;
 }
 
 function escapeRegex(text: string): string {
@@ -134,7 +153,237 @@ function containsWholeWord(haystack: string, word: string): boolean {
     return new RegExp(`\\b${escapeRegex(word.toLowerCase())}\\b`, "i").test(haystack);
 }
 
-function matchSingleBadge(raw: Record<string, unknown>): {
+function findHashHit(candidates: readonly unknown[]): HashMatch | null {
+    const joined = candidates
+        .filter((item): item is string => typeof item === "string" && item !== "")
+        .join(" ")
+        .toLowerCase();
+    if (joined === "") return null;
+    for (const [hash, hit] of HASH_INDEX) {
+        if (joined.includes(hash)) return hit;
+    }
+    return null;
+}
+
+function matchTierNameInTrack(text: string, track: BadgeTrack): number {
+    if (text === "") return -1;
+    const tiers = TRACK_TIERS[track];
+    for (let index = tiers.length - 1; index >= 0; index--) {
+        const tier = tiers[index];
+        const names = [tier.name, ...(tier.aliases ?? [])];
+        if (names.some(candidate => containsWholeWord(text, candidate))) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+function identifyDirectoryTrack(
+    badge: Record<string, unknown>,
+    currentTier: Record<string, unknown> | null | undefined
+): BadgeTrack | null {
+    const id = String(badge.badge_id ?? badge.id ?? badge.key ?? "").toLowerCase();
+    const name = String(badge.name ?? badge.title ?? badge.category ?? "").toLowerCase();
+    const infoLabel = String(badge.info_label ?? badge.infoLabel ?? badge.progress_label ?? "").toLowerCase();
+
+    if (id.includes("variety") || id.includes("unique_game") || id.includes("games_played") || name === "game variety") {
+        return "variety";
+    }
+    if (id.includes("stream") || id.includes("go_live") || id.includes("golive") || name === "streaming") {
+        return "stream";
+    }
+    if (id.includes("game_time") || id.includes("gametime") || id.includes("playtime") || id.includes("play_time") || name === "game time") {
+        return "time";
+    }
+
+    const tiersArr = Array.isArray(badge.tiers) ? badge.tiers as Record<string, unknown>[] : [];
+    const hashCandidates: unknown[] = [
+        badge.simple_icon_url,
+        badge.complex_icon_static_url,
+        badge.icon,
+        badge.iconSrc,
+        currentTier?.simple_icon_url,
+        currentTier?.complex_icon_static_url
+    ];
+    for (const t of tiersArr) {
+        if (t != null && typeof t === "object") {
+            hashCandidates.push(t.simple_icon_url, t.complex_icon_static_url, t.icon);
+        }
+    }
+    const hashHit = findHashHit(hashCandidates);
+    if (hashHit != null) return hashHit.track;
+
+    if (/\bgames?\s+played\b/i.test(infoLabel) && !/\b(?:hours?|hrs?|minutes?|mins?)\b/i.test(infoLabel)) {
+        return "variety";
+    }
+    if (/\b(?:hours?|hrs?|minutes?|mins?)\s+of\s+games?\s+played\b/i.test(infoLabel)) {
+        return "time";
+    }
+    if (/\bstream(?:ed|ing)\b/i.test(infoLabel)) {
+        return "stream";
+    }
+
+    const tierNamesJoined = [
+        currentTier?.name,
+        badge.name,
+        ...tiersArr.map(t => (t != null && typeof t === "object" ? t.name : ""))
+    ]
+        .filter((v): v is string => typeof v === "string")
+        .join(" ");
+
+    if (containsWholeWord(tierNamesJoined, "Universalist") || containsWholeWord(tierNamesJoined, "Sampler")) {
+        return "variety";
+    }
+    if (containsWholeWord(tierNamesJoined, "Eternal") || containsWholeWord(tierNamesJoined, "Unshakeable") || containsWholeWord(tierNamesJoined, "Unshakable")) {
+        return "time";
+    }
+    if (containsWholeWord(tierNamesJoined, "Phenomenon") || containsWholeWord(tierNamesJoined, "Fledgling") || containsWholeWord(tierNamesJoined, "Newcomer")) {
+        return "stream";
+    }
+
+    return null;
+}
+
+function extractProgressFromLabel(label: string, track: BadgeTrack, expectedFloor: number): number | null {
+    const trimmed = label.trim();
+    if (trimmed === "") return null;
+
+    if (track === "variety") {
+        const gamesHit = trimmed.match(/(\d[\d,.]*)\+?\s*(?:unique\s+|different\s+)?(?:detectable\s+)?(?:pc\s+)?games?/i)
+            ?? trimmed.match(/^(\d[\d,.]*)\b/);
+        return gamesHit != null ? parseLocaleNumber(gamesHit[1], expectedFloor) : null;
+    }
+
+    const hoursHit = trimmed.match(/(\d[\d,.]*)\+?\s*(?:hours?|hrs?)/i);
+    if (hoursHit != null) {
+        return parseLocaleNumber(hoursHit[1], expectedFloor);
+    }
+
+    const minsHit = trimmed.match(/(\d[\d,.]*)\+?\s*(?:minutes?|mins?)/i);
+    if (minsHit != null) {
+        const mins = parseLocaleNumber(minsHit[1], 0);
+        return mins != null ? Math.round((mins / 60) * 100) / 100 : null;
+    }
+
+    const leading = trimmed.match(/^(\d[\d,.]*)\b/);
+    if (leading != null) {
+        return parseLocaleNumber(leading[1], expectedFloor);
+    }
+
+    return null;
+}
+
+function parseSingleDirectoryEntry(entry: DirectoryBadgeInput): { track: BadgeTrack; detected: DetectedTrackBadge; } | null {
+    const { badge, currentTier } = entry;
+    const track = identifyDirectoryTrack(badge, currentTier);
+    if (track == null) return null;
+
+    const tiers = TRACK_TIERS[track];
+    const explicitlyUnowned = badge.owned === false && currentTier == null;
+
+    let tierIndex = -1;
+    if (!explicitlyUnowned) {
+        if (currentTier != null) {
+            const lvl = typeof currentTier.tier === "number"
+                ? currentTier.tier
+                : typeof currentTier.level === "number" ? currentTier.level : NaN;
+            if (Number.isInteger(lvl) && lvl >= 1 && lvl <= tiers.length) {
+                tierIndex = Math.max(tierIndex, lvl - 1);
+            }
+            const byCurName = matchTierNameInTrack(String(currentTier.name ?? currentTier.title ?? ""), track);
+            tierIndex = Math.max(tierIndex, byCurName);
+            const curHash = findHashHit([currentTier.complex_icon_static_url, currentTier.simple_icon_url, currentTier.icon]);
+            if (curHash != null && curHash.track === track) {
+                tierIndex = Math.max(tierIndex, curHash.tierIndex);
+            }
+        }
+
+        const badgeLvl = typeof badge.current_tier === "number"
+            ? badge.current_tier
+            : typeof badge.tier === "number" ? badge.tier : NaN;
+        if (Number.isInteger(badgeLvl) && badgeLvl >= 1 && badgeLvl <= tiers.length) {
+            tierIndex = Math.max(tierIndex, badgeLvl - 1);
+        }
+
+        const byBadgeName = matchTierNameInTrack(String(badge.name ?? badge.title ?? ""), track);
+        tierIndex = Math.max(tierIndex, byBadgeName);
+
+        const ownHash = findHashHit([badge.complex_icon_static_url, badge.simple_icon_url, badge.icon]);
+        if (ownHash != null && ownHash.track === track) {
+            tierIndex = Math.max(tierIndex, ownHash.tierIndex);
+        }
+
+        if (Array.isArray(badge.tiers)) {
+            const list = badge.tiers as Record<string, unknown>[];
+            for (let idx = 0; idx < list.length && idx < tiers.length; idx++) {
+                const item = list[idx];
+                if (item != null && typeof item === "object") {
+                    const unlocked = item.obtained === true
+                        || item.owned === true
+                        || item.unlocked === true
+                        || item.is_unlocked === true
+                        || (typeof item.obtained_at === "string" && item.obtained_at !== "");
+                    if (unlocked) tierIndex = Math.max(tierIndex, idx);
+                }
+            }
+        }
+    }
+
+    const expectedAt = tierIndex >= 0 ? tiers[tierIndex].at : 0;
+    const infoLabels = [
+        currentTier?.info_label,
+        currentTier?.infoLabel,
+        badge.info_label,
+        badge.infoLabel,
+        badge.progress_label
+    ].filter((v): v is string => typeof v === "string" && v.trim() !== "");
+
+    let parsedAmount: number | null = null;
+    for (const label of infoLabels) {
+        const val = extractProgressFromLabel(label, track, expectedAt);
+        if (val != null && (parsedAmount == null || val > parsedAmount)) {
+            parsedAmount = val;
+        }
+    }
+
+    if (parsedAmount != null) {
+        const fromAmountIdx = reachedTierIndex(parsedAmount, tiers);
+        if (!explicitlyUnowned || fromAmountIdx >= 0) {
+            tierIndex = Math.max(tierIndex, fromAmountIdx);
+        }
+    }
+
+    if (badge.owned === true && tierIndex < 0) {
+        tierIndex = 0;
+    }
+
+    const tier = tierIndex >= 0 ? tiers[tierIndex] : null;
+    const floor = Math.max(tier?.at ?? 0, parsedAmount ?? 0);
+
+    if (tier == null && floor <= 0) return null;
+
+    const rawIcon = [
+        currentTier?.simple_icon_url,
+        badge.simple_icon_url,
+        currentTier?.complex_icon_static_url,
+        badge.complex_icon_static_url,
+        badge.iconSrc,
+        badge.icon
+    ].find((v): v is string => typeof v === "string" && v.trim() !== "");
+
+    return {
+        track,
+        detected: {
+            tierIndex,
+            tier,
+            parsedFloor: floor,
+            iconUrl: resolveBadgeIconUrl(rawIcon, tier ?? tiers[0]),
+            rawDescription: infoLabels[0] ?? tier?.name ?? ""
+        }
+    };
+}
+
+function matchSingleProfileBadge(raw: Record<string, unknown>): {
     track: BadgeTrack;
     tierIndex: number;
     parsedFloor: number;
@@ -143,77 +392,83 @@ function matchSingleBadge(raw: Record<string, unknown>): {
 } | null {
     const id = typeof raw.id === "string" ? raw.id.trim() : "";
     const description = typeof raw.description === "string" ? raw.description.trim() : "";
+    const infoLabel = typeof raw.infoLabel === "string"
+        ? raw.infoLabel.trim()
+        : typeof raw.info_label === "string" ? raw.info_label.trim() : "";
     const title = typeof raw.name === "string" ? raw.name.trim() : typeof raw.title === "string" ? raw.title.trim() : "";
-    const iconCandidates = [raw.icon, raw.icon_asset, raw.asset, raw.image]
+    const iconCandidates = [raw.simple_icon_url, raw.iconSrc, raw.icon, raw.largeIconSrc, raw.icon_asset, raw.asset, raw.image]
         .filter((item): item is string => typeof item === "string" && item.trim() !== "");
-    const iconJoined = iconCandidates.join(" ").toLowerCase();
     const iconRaw = iconCandidates[0] ?? "";
 
-    // 1. Exact SHA-256 content asset match across all 30 official evolving badge icons.
-    for (const [hash, hit] of HASH_INDEX) {
-        if (iconJoined.includes(hash)) {
-            const tier = TRACK_TIERS[hit.track][hit.tierIndex];
-            return {
-                track: hit.track,
-                tierIndex: hit.tierIndex,
-                parsedFloor: tier.at,
-                iconRaw,
-                description: description || tier.name
-            };
-        }
+    const hashHit = findHashHit(iconCandidates);
+    if (hashHit != null) {
+        const tier = TRACK_TIERS[hashHit.track][hashHit.tierIndex];
+        const labelVal = extractProgressFromLabel(infoLabel || description, hashHit.track, tier.at);
+        return {
+            track: hashHit.track,
+            tierIndex: hashHit.tierIndex,
+            parsedFloor: Math.max(tier.at, labelVal ?? 0),
+            iconRaw,
+            description: infoLabel || description || tier.name
+        };
     }
 
-    const combined = `${id} ${title} ${description}`.toLowerCase();
-
-    // 2. Explicit numbered IDs such as game_time_7, evolving_badge_game_variety_10, streaming_3.
-    const idLevelMatch = id.toLowerCase().match(/(?:^|_)(game_time|game_variety|streaming)[_-](\d{1,2})(?:$|_)/);
+    const idLevelMatch = id.toLowerCase().match(/(?:^|_)(game_time|playtime|game_variety|streaming)[_-](\d{1,2})(?:$|_)/);
     if (idLevelMatch != null) {
-        const track: BadgeTrack = idLevelMatch[1] === "game_time"
-            ? "time"
-            : idLevelMatch[1] === "game_variety" ? "variety" : "stream";
+        const track: BadgeTrack = idLevelMatch[1] === "game_variety"
+            ? "variety"
+            : idLevelMatch[1] === "streaming" ? "stream" : "time";
         const level = Number(idLevelMatch[2]);
         const tiers = TRACK_TIERS[track];
         if (level >= 1 && level <= tiers.length) {
             const tierIndex = level - 1;
+            const labelVal = extractProgressFromLabel(infoLabel || description, track, tiers[tierIndex].at);
             return {
                 track,
                 tierIndex,
-                parsedFloor: tiers[tierIndex].at,
+                parsedFloor: Math.max(tiers[tierIndex].at, labelVal ?? 0),
                 iconRaw,
-                description: description || tiers[tierIndex].name
+                description: infoLabel || description || tiers[tierIndex].name
             };
         }
     }
 
-    // 3. Official Discord Earned-By tooltip sentences (extracts exact numeric progress when present).
-    const streamDescMatch = description.match(/stream(?:ed|ing)?(?:\s+to\s+other\s+users)?\s+(?:for\s+)?(\d[\d,]*)\+?\s*(?:hours?|hrs?)/i);
-    if (streamDescMatch != null) {
-        const hours = parseDigits(streamDescMatch[1]);
-        if (hours != null) {
+    const textSample = `${infoLabel} ${description}`.trim();
+
+    // Matches both "5 hours streamed" and "Stream to other users for 5 hours".
+    const streamMatch = textSample.match(/(\d[\d,.]*)\+?\s*(?:hours?|hrs?)\s+(?:of\s+)?stream(?:ed|ing)/i)
+        ?? textSample.match(/stream(?:ed|ing)?(?:\s+to\s+other\s+users)?\s+(?:for\s+)?(\d[\d,.]*)\+?\s*(?:hours?|hrs?)/i);
+    if (streamMatch != null) {
+        const hours = parseLocaleNumber(streamMatch[1], 0);
+        if (hours != null && hours > 0) {
             const idx = Math.max(0, reachedTierIndex(hours, STREAM_TIERS));
-            return { track: "stream", tierIndex: idx, parsedFloor: hours, iconRaw, description };
+            return { track: "stream", tierIndex: idx, parsedFloor: hours, iconRaw, description: textSample };
         }
     }
 
-    const timeDescMatch = description.match(/play(?:ed)?\s+(\d[\d,]*)\+?\s*(?:hours?|hrs?)\s+of\s+(?:detectable\s+)?(?:pc\s+)?games/i);
-    if (timeDescMatch != null) {
-        const hours = parseDigits(timeDescMatch[1]);
-        if (hours != null) {
+    // Matches both "10,065 hours of games played" and "Play 500 hours of detectable PC games".
+    const timeMatch = textSample.match(/(\d[\d,.]*)\+?\s*(?:hours?|hrs?)\s+of\s+(?:detectable\s+)?(?:pc\s+)?games?(?:\s+played)?/i)
+        ?? textSample.match(/play(?:ed)?\s+(\d[\d,.]*)\+?\s*(?:hours?|hrs?)\s+of\s+(?:detectable\s+)?(?:pc\s+)?games?/i);
+    if (timeMatch != null) {
+        const hours = parseLocaleNumber(timeMatch[1], 0);
+        if (hours != null && hours > 0) {
             const idx = Math.max(0, reachedTierIndex(hours, TIME_TIERS));
-            return { track: "time", tierIndex: idx, parsedFloor: hours, iconRaw, description };
+            return { track: "time", tierIndex: idx, parsedFloor: hours, iconRaw, description: textSample };
         }
     }
 
-    const varietyDescMatch = description.match(/play(?:ed)?\s+(\d[\d,]*)\+?\s*(?:unique\s+|different\s+)?(?:detectable\s+)?(?:pc\s+)?games/i);
-    if (varietyDescMatch != null && !/hours?|hrs?/i.test(varietyDescMatch[0])) {
-        const games = parseDigits(varietyDescMatch[1]);
-        if (games != null) {
+    // Matches both "640 games played" and "Play 100+ detectable PC games".
+    const varietyMatch = textSample.match(/(\d[\d,.]*)\+?\s*(?:unique\s+|different\s+)?(?:detectable\s+)?(?:pc\s+)?games?\s+played/i)
+        ?? textSample.match(/play(?:ed)?\s+(\d[\d,.]*)\+?\s*(?:unique\s+|different\s+)?(?:detectable\s+)?(?:pc\s+)?games?/i);
+    if (varietyMatch != null && !/hours?|hrs?/i.test(varietyMatch[0])) {
+        const games = parseLocaleNumber(varietyMatch[1], 0);
+        if (games != null && games > 0) {
             const idx = Math.max(0, reachedTierIndex(games, VARIETY_TIERS));
-            return { track: "variety", tierIndex: idx, parsedFloor: games, iconRaw, description };
+            return { track: "variety", tierIndex: idx, parsedFloor: games, iconRaw, description: textSample };
         }
     }
 
-    // 4. Exact tier title matching (with context guard for "Star" so unrelated badges never collide).
+    const combined = `${id} ${title} ${infoLabel} ${description}`.toLowerCase();
     const hasStreamContext = /stream|go live|broadcast/i.test(combined);
     const hasGameContext = /game|play|detectable|activity|evolving/i.test(combined);
 
@@ -222,15 +477,10 @@ function matchSingleBadge(raw: Record<string, unknown>): {
         for (let index = tiers.length - 1; index >= 0; index--) {
             const tier = tiers[index];
             const names = [tier.name, ...(tier.aliases ?? [])];
-            const matched = names.some(candidate => containsWholeWord(combined, candidate));
-            if (!matched) continue;
+            if (!names.some(candidate => containsWholeWord(combined, candidate))) continue;
 
-            if (tier.name === "Star" && !hasStreamContext && !id.toLowerCase().includes("stream")) {
-                continue;
-            }
-            if ((tier.name === "Casual" || tier.name === "Serious" || tier.name === "Explorer")
-                && !hasGameContext
-                && !id.toLowerCase().includes("game")) {
+            if (tier.name === "Star" && !hasStreamContext) continue;
+            if ((tier.name === "Casual" || tier.name === "Serious" || tier.name === "Explorer") && !hasGameContext) {
                 continue;
             }
 
@@ -247,7 +497,26 @@ function matchSingleBadge(raw: Record<string, unknown>): {
     return null;
 }
 
-export function parseProfileBadges(rawBadges: readonly ProfileBadge[] | readonly unknown[]): ParsedProfileBadges {
+function mergeTrack(prev: DetectedTrackBadge | null, next: DetectedTrackBadge): DetectedTrackBadge {
+    if (prev == null) return next;
+    const tierIndex = Math.max(prev.tierIndex, next.tierIndex);
+    const parsedFloor = Math.max(prev.parsedFloor, next.parsedFloor);
+    const preferNextIcon = next.tierIndex >= prev.tierIndex && next.iconUrl !== "";
+    return {
+        tierIndex,
+        tier: next.tierIndex >= prev.tierIndex ? (next.tier ?? prev.tier) : (prev.tier ?? next.tier),
+        parsedFloor,
+        iconUrl: preferNextIcon ? next.iconUrl : (prev.iconUrl || next.iconUrl),
+        rawDescription: next.parsedFloor >= prev.parsedFloor && next.rawDescription !== ""
+            ? next.rawDescription
+            : prev.rawDescription
+    };
+}
+
+export function parseAllUserBadges(
+    rawProfileBadges: readonly ProfileBadge[] | readonly unknown[],
+    directoryEntries: readonly DirectoryBadgeInput[] = []
+): ParsedProfileBadges {
     const tracks: Record<BadgeTrack, DetectedTrackBadge | null> = {
         time: null,
         variety: null,
@@ -255,29 +524,32 @@ export function parseProfileBadges(rawBadges: readonly ProfileBadge[] | readonly
     };
     const otherBadges: ProfileBadge[] = [];
 
-    if (!Array.isArray(rawBadges)) return { tracks, otherBadges };
-
-    for (const entry of rawBadges) {
-        if (entry == null || typeof entry !== "object") continue;
-        const hit = matchSingleBadge(entry as Record<string, unknown>);
-        if (hit == null) {
-            const b = entry as ProfileBadge;
-            if (typeof b.id === "string" && b.id !== "") otherBadges.push(b);
-            continue;
+    for (const entry of directoryEntries) {
+        if (entry?.badge == null || typeof entry.badge !== "object") continue;
+        const parsed = parseSingleDirectoryEntry(entry);
+        if (parsed != null) {
+            tracks[parsed.track] = mergeTrack(tracks[parsed.track], parsed.detected);
         }
+    }
 
-        const tier = TRACK_TIERS[hit.track][hit.tierIndex];
-        const prev = tracks[hit.track];
-        const floor = Math.max(tier.at, hit.parsedFloor);
+    if (Array.isArray(rawProfileBadges)) {
+        for (const entry of rawProfileBadges) {
+            if (entry == null || typeof entry !== "object") continue;
+            const hit = matchSingleProfileBadge(entry as Record<string, unknown>);
+            if (hit == null) {
+                const b = entry as ProfileBadge;
+                if (typeof b.id === "string" && b.id !== "") otherBadges.push(b);
+                continue;
+            }
 
-        if (prev == null || hit.tierIndex > prev.tierIndex || floor > prev.parsedFloor) {
-            tracks[hit.track] = {
+            const tier = TRACK_TIERS[hit.track][hit.tierIndex];
+            tracks[hit.track] = mergeTrack(tracks[hit.track], {
                 tierIndex: hit.tierIndex,
                 tier,
-                parsedFloor: floor,
+                parsedFloor: Math.max(tier.at, hit.parsedFloor),
                 iconUrl: resolveBadgeIconUrl(hit.iconRaw, tier),
                 rawDescription: hit.description
-            };
+            });
         }
     }
 

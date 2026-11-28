@@ -1,12 +1,14 @@
 /*
- * Vencord, a Discord client mod
- * Copyright (c) 2026 Vendicated and contributors
- * SPDX-License-Identifier: GPL-3.0-or-later
- */
+Made with ❤️ by rico
+I am not responsible for any damage caused by this plugin; use at your own risk
+Vencord/Equicord does not endorse/support this plugin (Works with Equicord as well)
+dm @wkcp if u need help or have any questions
+https://github.com/aboveproof/BadgeFarmer
+*/
 
 import { Logger } from "@utils/Logger";
 import type { RunningGame } from "@vencord/discord-types";
-import { findByPropsLazy, findStoreLazy } from "@webpack";
+import { filters, findAll } from "@webpack";
 import { AuthenticationStore, RestAPI, RunningGameStore, UserStore } from "@webpack/common";
 
 const SCIENCE_URL = "/science";
@@ -26,10 +28,6 @@ const FALLBACK_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
     "(KHTML, like Gecko) discord/1.0.9253 Chrome/148.0.7778.280 Electron/42.7.1 Safari/537.36";
 
-const SuperProperties: { getSuperProperties?(): Record<string, unknown>; } = findByPropsLazy("getSuperProperties");
-const TokenManager: { getToken?(): string | null | undefined; } = findByPropsLazy("getToken", "init");
-const ConsentStore: { hasConsented?(type: string): boolean; } = findStoreLazy("ConsentStore");
-const AnalyticsTrackingStore: { submitEventsImmediately?: (...args: unknown[]) => unknown; } = findStoreLazy("AnalyticsTrackingStore");
 const logger = new Logger("BadgeFarmer");
 
 type DetectedGame = RunningGame & { executableFingerprint?: string; };
@@ -87,13 +85,16 @@ export function apiOrigin(): string {
 function readSessionToken(): string | null {
     try {
         const fromStore = (AuthenticationStore as unknown as { getToken?(): unknown; })?.getToken?.();
-        if (typeof fromStore === "string" && fromStore.length > 10) return fromStore;
+        if (typeof fromStore === "string" && fromStore.length > 20) return fromStore;
     } catch {
-        // Fall through to TokenManager.
+        // Fall through to webpack module scan.
     }
     try {
-        const fromModule = TokenManager?.getToken?.();
-        if (typeof fromModule === "string" && fromModule.length > 10) return fromModule;
+        const candidates = findAll(filters.byProps("getToken"));
+        for (const mod of candidates) {
+            const tok = (mod as { getToken?(): unknown; })?.getToken?.();
+            if (typeof tok === "string" && tok.length > 20) return tok;
+        }
     } catch {
         // Fall back to RestAPI when direct token access is unavailable.
     }
@@ -106,8 +107,9 @@ export function invalidateAnalyticsToken(): void {
 
 export function isPersonalizationEnabled(): boolean | null {
     try {
-        if (typeof ConsentStore?.hasConsented !== "function") return null;
-        return Boolean(ConsentStore.hasConsented("personalization"));
+        const store = findAll(filters.byStoreName("ConsentStore"))[0] as { hasConsented?(type: string): boolean; } | undefined;
+        if (typeof store?.hasConsented !== "function") return null;
+        return Boolean(store.hasConsented("personalization"));
     } catch {
         return null;
     }
@@ -116,7 +118,10 @@ export function isPersonalizationEnabled(): boolean | null {
 /** True when NoTrack's stub store is active in memory and dropping client stream events. */
 export function isAnalyticsStubbed(): boolean {
     try {
-        const fn = AnalyticsTrackingStore?.submitEventsImmediately;
+        const store = findAll(filters.byStoreName("AnalyticsTrackingStore"))[0] as
+            | { submitEventsImmediately?: (...args: unknown[]) => unknown; }
+            | undefined;
+        const fn = store?.submitEventsImmediately;
         return typeof fn === "function" && String(fn).includes("NoTrack");
     } catch {
         return false;
@@ -165,7 +170,10 @@ export function fingerprintFor(gameId: string): string {
 function buildTelemetry(): ClientTelemetry {
     let raw: Record<string, unknown> = {};
     try {
-        raw = SuperProperties?.getSuperProperties?.() ?? {};
+        const superPropsMod = findAll(filters.byProps("getSuperProperties"))[0] as
+            | { getSuperProperties?(): Record<string, unknown>; }
+            | undefined;
+        raw = superPropsMod?.getSuperProperties?.() ?? {};
     } catch (error) {
         logger.warn("Could not read client super properties", error);
     }
@@ -177,9 +185,6 @@ function buildTelemetry(): ClientTelemetry {
     const heartbeatSession = text(raw.client_heartbeat_session_id) ?? sessionHeartbeatId;
     const launchSignature = text(raw.launch_signature) ?? sessionLaunchSignature;
 
-    // Force Windows Desktop Client super properties so Linux, macOS, Vesktop, Equibop, and web builds
-    // match the win32 executables reported in launch_game and running_game_heartbeat without Discord's
-    // superagent interceptor overwriting X-Super-Properties.
     const desktopSuperProps: Record<string, unknown> = {
         os: "Windows",
         browser: "Discord Client",

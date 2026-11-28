@@ -1,8 +1,10 @@
 /*
- * Vencord, a Discord client mod
- * Copyright (c) 2026 Vendicated and contributors
- * SPDX-License-Identifier: GPL-3.0-or-later
- */
+Made with ❤️ by rico
+I am not responsible for any damage caused by this plugin; use at your own risk
+Vencord/Equicord does not endorse/support this plugin (Works with Equicord as well)
+dm @wkcp if u need help or have any questions
+https://github.com/aboveproof/BadgeFarmer
+*/
 
 /**
  * BadgeFarmer Console Edition (desktop and browser DevTools)
@@ -304,8 +306,114 @@
         return idx;
     }
 
-    function parseBadgesProgress(badges) {
+    async function fetchDirectoryEntries(userId) {
+        const dirStore = findStore("BadgeDirectoryStore");
+        const collectFromStore = () => {
+            if (!dirStore) return [];
+            const raw = [
+                ...(dirStore.getBadges?.(userId) ?? []),
+                ...(dirStore.getEarnableBadges?.(userId) ?? [])
+            ];
+            return raw
+                .filter(b => b && typeof b === "object")
+                .map(b => ({
+                    badge: b,
+                    currentTier: dirStore.getCurrentTier?.(b.badge_id ?? b.id, userId) ?? null
+                }));
+        };
+
+        let entries = collectFromStore();
+        if (entries.length === 0) {
+            const fetchFn = findFnByCode("BADGE_DIRECTORY_FETCH_START") ?? findFnByCode("BADGE_DIRECTORY_FETCH_SUCCESS");
+            if (fetchFn && /\.dispatch\s*\(/.test(String(fetchFn))) {
+                try {
+                    const src = String(fetchFn);
+                    const p = /^\s*(?:async\s+)?(?:function\s*\w*\s*)?\(\s*\{/.test(src)
+                        ? fetchFn({ userId })
+                        : fetchFn(userId);
+                    if (p instanceof Promise) await p.catch(() => undefined);
+                    entries = collectFromStore();
+                } catch { /* ignore */ }
+            }
+        }
+        if (entries.length === 0) {
+            for (const path of [`/users/${userId}/badges`, "/users/@me/badges"]) {
+                try {
+                    const res = await fetch(`${API}${path}`, { headers: headers() });
+                    if (!res.ok) continue;
+                    const data = await res.json();
+                    const list = Array.isArray(data) ? data : (Array.isArray(data?.badges) ? data.badges : []);
+                    if (list.length > 0) {
+                        entries = list.map(b => ({ badge: b, currentTier: b?.current_tier ?? b?.currentTier ?? null }));
+                        break;
+                    }
+                } catch { /* ignore */ }
+            }
+        }
+        return entries;
+    }
+
+    function parseBadgesProgress(badges, directoryEntries = []) {
         const out = { time: null, variety: null, stream: null };
+
+        for (const item of directoryEntries) {
+            const b = item?.badge;
+            const ct = item?.currentTier;
+            if (!b) continue;
+            const id = String(b.badge_id ?? b.id ?? "").toLowerCase();
+            const name = String(b.name ?? "").toLowerCase();
+            const label = String(ct?.info_label ?? ct?.infoLabel ?? b.info_label ?? b.infoLabel ?? "");
+            const icons = [ct?.simple_icon_url, ct?.complex_icon_static_url, b.simple_icon_url, b.complex_icon_static_url].filter(Boolean).join(" ").toLowerCase();
+
+            let track = null;
+            if (id.includes("variety") || name === "game variety") track = "variety";
+            else if (id.includes("stream") || name === "streaming") track = "stream";
+            else if (id.includes("game_time") || id.includes("playtime") || name === "game time") track = "time";
+            if (!track) {
+                for (const [hash, info] of HASH_MAP) {
+                    if (icons.includes(hash)) { track = info.track; break; }
+                }
+            }
+            if (!track) {
+                if (/\bgames?\s+played\b/i.test(label) && !/\b(?:hours?|hrs?|minutes?|mins?)\b/i.test(label)) track = "variety";
+                else if (/\b(?:hours?|hrs?|minutes?|mins?)\s+of\s+games?\s+played\b/i.test(label)) track = "time";
+                else if (/\bstream(?:ed|ing)\b/i.test(label)) track = "stream";
+            }
+            if (!track) continue;
+
+            const tiers = TRACK_TIERS[track];
+            let idx = -1;
+            if (b.owned !== false || ct != null) {
+                const lvl = typeof ct?.tier === "number" ? ct.tier : typeof ct?.level === "number" ? ct.level : NaN;
+                if (Number.isInteger(lvl) && lvl >= 1 && lvl <= 10) idx = Math.max(idx, lvl - 1);
+                const tName = String(ct?.name ?? b.name ?? "").toLowerCase();
+                tiers.forEach((t, ti) => {
+                    if ([t.name, ...(t.aliases ?? [])].some(n => tName.includes(n.toLowerCase()))) idx = Math.max(idx, ti);
+                });
+                for (const [hash, info] of HASH_MAP) {
+                    if (info.track === track && icons.includes(hash)) idx = Math.max(idx, info.idx);
+                }
+            }
+
+            let floor = idx >= 0 ? tiers[idx].at : 0;
+            const numMatch = label.match(/(\d[\d,]*)/);
+            if (numMatch) {
+                const val = Number(numMatch[1].replace(/,/g, ""));
+                if (Number.isFinite(val)) {
+                    const minsOnly = /\b(?:minutes?|mins?)\b/i.test(label) && !/\b(?:hours?|hrs?)\b/i.test(label);
+                    const normalized = minsOnly && track !== "variety" ? Math.round((val / 60) * 100) / 100 : val;
+                    floor = Math.max(floor, normalized);
+                    idx = Math.max(idx, reachedTierIdx(floor, tiers));
+                }
+            }
+            if (b.owned === true && idx < 0) idx = 0;
+            if (idx >= 0 || floor > 0) {
+                if (!out[track] || floor > out[track].floor) {
+                    out[track] = { track, idx, floor: Math.max(idx >= 0 ? tiers[idx].at : 0, floor) };
+                }
+            }
+        }
+
         if (!Array.isArray(badges)) return out;
 
         for (const b of badges) {
@@ -321,27 +429,26 @@
             if (!hit) {
                 const id = String(b.id || "").toLowerCase();
                 const desc = String(b.description || "");
-                const idMatch = id.match(/(?:^|_)(game_time|game_variety|streaming)[_-](\d{1,2})(?:$|_)/);
+                const idMatch = id.match(/(?:^|_)(game_time|playtime|game_variety|streaming)[_-](\d{1,2})(?:$|_)/);
                 if (idMatch) {
-                    const track = idMatch[1] === "game_time" ? "time" : idMatch[1] === "game_variety" ? "variety" : "stream";
+                    const track = idMatch[1] === "game_variety" ? "variety" : idMatch[1] === "streaming" ? "stream" : "time";
                     const lvl = Number(idMatch[2]);
-                    if (lvl >= 1 && lvl <= 10) hit = { track, idx: lvl - 1, floor: TRACK_TIERS[track][lvl - 1].at, tier: TRACK_TIERS[track][lvl - 1] };
+                    if (lvl >= 1 && lvl <= 10) hit = { track, idx: lvl - 1, floor: TRACK_TIERS[track][lvl - 1].at };
                 } else {
-                    const sm = desc.match(/stream(?:ed|ing)?(?:\s+to\s+other\s+users)?\s+(?:for\s+)?(\d[\d,]*)\+?\s*(?:hours?|hrs?)/i);
-                    const tm = desc.match(/play(?:ed)?\s+(\d[\d,]*)\+?\s*(?:hours?|hrs?)\s+of\s+(?:detectable\s+)?(?:pc\s+)?games/i);
-                    const vm = desc.match(/play(?:ed)?\s+(\d[\d,]*)\+?\s*(?:unique\s+|different\s+)?(?:detectable\s+)?(?:pc\s+)?games/i);
+                    const sm = desc.match(/(\d[\d,]*)\+?\s*(?:hours?|hrs?)\s+(?:of\s+)?stream(?:ed|ing)/i)
+                        ?? desc.match(/stream(?:ed|ing)?(?:\s+to\s+other\s+users)?\s+(?:for\s+)?(\d[\d,]*)\+?\s*(?:hours?|hrs?)/i);
+                    const tm = desc.match(/(\d[\d,]*)\+?\s*(?:hours?|hrs?)\s+of\s+(?:detectable\s+)?(?:pc\s+)?games?(?:\s+played)?/i)
+                        ?? desc.match(/play(?:ed)?\s+(\d[\d,]*)\+?\s*(?:hours?|hrs?)\s+of\s+(?:detectable\s+)?(?:pc\s+)?games/i);
+                    const vm = desc.match(/(\d[\d,]*)\+?\s*(?:unique\s+|different\s+)?(?:detectable\s+)?(?:pc\s+)?games?(?:\s+played)?/i);
                     if (sm) {
                         const hrs = Number(sm[1].replace(/,/g, ""));
-                        const idx = Math.max(0, reachedTierIdx(hrs, STREAM_TIERS));
-                        hit = { track: "stream", idx, floor: hrs, tier: STREAM_TIERS[idx] };
+                        hit = { track: "stream", idx: Math.max(0, reachedTierIdx(hrs, STREAM_TIERS)), floor: hrs };
                     } else if (tm) {
                         const hrs = Number(tm[1].replace(/,/g, ""));
-                        const idx = Math.max(0, reachedTierIdx(hrs, TIME_TIERS));
-                        hit = { track: "time", idx, floor: hrs, tier: TIME_TIERS[idx] };
+                        hit = { track: "time", idx: Math.max(0, reachedTierIdx(hrs, TIME_TIERS)), floor: hrs };
                     } else if (vm && !/hours?|hrs?/i.test(vm[0])) {
                         const gms = Number(vm[1].replace(/,/g, ""));
-                        const idx = Math.max(0, reachedTierIdx(gms, VARIETY_TIERS));
-                        hit = { track: "variety", idx, floor: gms, tier: VARIETY_TIERS[idx] };
+                        hit = { track: "variety", idx: Math.max(0, reachedTierIdx(gms, VARIETY_TIERS)), floor: gms };
                     }
                 }
             }
@@ -355,6 +462,7 @@
     async function fetchProgressSummary() {
         ensureAuth();
         await ensureAnalyticsToken();
+        const directoryEntries = await fetchDirectoryEntries(state.userId);
         let badges = [];
         try {
             const res = await fetch(`${API}/users/${state.userId}/profile?with_mutual_guilds=false&with_mutual_friends_count=false`, {
@@ -366,7 +474,7 @@
             }
         } catch { /* ignore */ }
 
-        const parsed = parseBadgesProgress(badges);
+        const parsed = parseBadgesProgress(badges, directoryEntries);
         const ledger = readLedger(state.userId);
         const seenIds = getClientSeenIds();
         const allClaimed = new Set([...seenIds, ...(ledger.claimedIds || [])]);
