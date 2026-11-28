@@ -9,7 +9,7 @@ import ErrorBoundary from "@components/ErrorBoundary";
 import { copyToClipboard } from "@utils/clipboard";
 import { classNameFactory } from "@utils/css";
 import { useForceUpdater } from "@utils/react";
-import type { RenderModalProps } from "@vencord/discord-types";
+import type { ProfileBadge, RenderModalProps } from "@vencord/discord-types";
 import {
     closeModal,
     Modal,
@@ -34,8 +34,7 @@ const cl = classNameFactory("vc-badge-farmer-");
 
 const MODAL_KEY = "vc-badge-farmer-modal";
 const MAX_RESULTS = 40;
-// Average cost of one batched /science POST plus the 500ms pacing delay.
-const SECONDS_PER_BATCH = 0.65;
+const SECONDS_PER_BATCH = 0.7;
 
 interface Tier {
     name: string;
@@ -82,6 +81,7 @@ const STREAM_TIERS: Tier[] = [
 ];
 
 type Tab = "time" | "variety" | "stream" | "all";
+type TimeStrategy = "spread" | "single";
 
 const TABS: Array<{ id: Tab; label: string; }> = [
     { id: "time", label: "Game Time" },
@@ -124,6 +124,28 @@ function useCatalogue(): { apps: DetectableApp[] | null; error: string | null; r
     }
 
     return { apps, error, retry };
+}
+
+function useProfileBadges(): { badges: ProfileBadge[]; loading: boolean; refresh: () => void; } {
+    const [badges, setBadges] = useState<ProfileBadge[]>([]);
+    const [loading, setLoading] = useState(false);
+
+    useEffect(() => {
+        let cancelled = false;
+        Farmer.fetchMyBadges(false).then(list => {
+            if (!cancelled) setBadges(list);
+        });
+        return () => { cancelled = true; };
+    }, []);
+
+    function refresh() {
+        setLoading(true);
+        Farmer.fetchMyBadges(true)
+            .then(list => setBadges(list))
+            .finally(() => setLoading(false));
+    }
+
+    return { badges, loading, refresh };
 }
 
 function useFarmerStatus(): FarmerStatus {
@@ -293,6 +315,31 @@ function ToggleOption({ checked, disabled, title, note, onChange }: {
     );
 }
 
+function ModePills<T extends string>({ options, value, disabled, onChange }: {
+    options: Array<{ id: T; label: string; }>;
+    value: T;
+    disabled: boolean;
+    onChange: (next: T) => void;
+}) {
+    return (
+        <div className={cl("subtabs")} role="radiogroup">
+            {options.map(option => (
+                <button
+                    key={option.id}
+                    type="button"
+                    role="radio"
+                    disabled={disabled}
+                    aria-checked={option.id === value}
+                    className={cl("subtab", { "subtab-on": option.id === value })}
+                    onClick={() => onChange(option.id)}
+                >
+                    {option.label}
+                </button>
+            ))}
+        </div>
+    );
+}
+
 function GamePicker({ apps, error, selected, onSelect, disabled }: {
     apps: DetectableApp[] | null;
     error: string | null;
@@ -405,7 +452,7 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
 
     const placeholder = error != null
         ? "Game list unavailable"
-        : apps == null ? "Loading Discord's game list" : `Search ${apps.length.toLocaleString()} games`;
+        : apps == null ? "Loading Discord's game list" : `Search ${apps.length.toLocaleString()} Windows games`;
 
     return (
         <div className={cl("search")} ref={wrapRef}>
@@ -462,7 +509,7 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
                 </div>
             )}
             {open && query.trim().length >= 2 && results.length === 0 && apps != null && (
-                <span className={cl("field-note")}>No game in Discord's catalog matches that name.</span>
+                <span className={cl("field-note")}>No Windows game in Discord's catalog matches that name.</span>
             )}
         </div>
     );
@@ -493,13 +540,17 @@ function liveView(status: FarmerStatus): LiveView {
     }
 
     const game = status.activeGame?.name ?? null;
+    const gameDetail = status.gamesTarget > 0 && status.mode !== "VARIETY"
+        ? `${status.gamesCredited}/${status.gamesTarget} games · ${game ?? "Starting"}`
+        : game;
+
     const viewers = status.streamViewers == null
         ? "Starting Go Live"
         : status.streamPaused
             ? "Paused · waiting for a viewer"
             : status.streamViewers === 1 ? "1 viewer · unpaused" : `${status.streamViewers} viewers · unpaused`;
 
-    const time: LiveView = { title: "Game Time", detail: game, current: status.hoursCredited, target: status.hoursTarget, unit: "hours", paused: false };
+    const time: LiveView = { title: "Game Time", detail: gameDetail, current: status.hoursCredited, target: status.hoursTarget, unit: "hours", paused: false };
     const variety: LiveView = { title: "Variety", detail: game, current: status.gamesCredited, target: status.gamesTarget, unit: "games", paused: false };
     const stream: LiveView = { title: "Streaming", detail: viewers, current: status.streamHours, target: status.streamTarget, unit: "hours", paused: status.streamPaused };
 
@@ -508,8 +559,10 @@ function liveView(status: FarmerStatus): LiveView {
         case "VARIETY": return variety;
         case "STREAM": return stream;
         default: {
-            const [step, view] = status.streamTarget > 0 ? [3, stream] : status.hoursTarget > 0 ? [2, time] : [1, variety];
-            return { ...view, title: `Step ${step} of 3 · ${view.title}` };
+            if (status.streamTarget > 0) {
+                return { ...stream, title: "Step 2 of 2 · Streaming" };
+            }
+            return { ...time, title: "Step 1 of 2 · Game Time & Variety" };
         }
     }
 }
@@ -870,13 +923,17 @@ function SourcePicker({ sources, value, loading, disabled, onChange }: {
 
 export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; } = {}): JSX.Element {
     const { apps, error: catalogueError, retry: retryCatalogue } = useCatalogue();
+    const profileBadges = useProfileBadges();
     const status = useFarmerStatus();
     const refreshView = useForceUpdater();
 
     const [tab, setTab] = useState<Tab>("time");
+    const [timeStrategy, setTimeStrategy] = useState<TimeStrategy>("spread");
     const [selected, setSelected] = useState<DetectableApp | null>(null);
-    const [timeTarget, setTimeTarget] = useState(String(Farmer.ETERNAL_HOURS));
-    const [chunkHours, setChunkHours] = useState(String(Farmer.DEFAULT_CHUNK_HOURS));
+    const [spreadTarget, setSpreadTarget] = useState(String(Farmer.ETERNAL_HOURS));
+    const [hoursPerGame, setHoursPerGame] = useState(String(Farmer.DEFAULT_HOURS_PER_GAME));
+    const [singleTarget, setSingleTarget] = useState(String(Farmer.DEFAULT_SINGLE_GAME_HOURS));
+    const [singleChunk, setSingleChunk] = useState(String(Farmer.MAX_CHUNK_HOURS));
     const [varietyCount, setVarietyCount] = useState(String(Farmer.UNIVERSALIST_GAMES));
     const [varietyMinutes, setVarietyMinutes] = useState(String(Farmer.DEFAULT_VARIETY_MINUTES));
     const [streamTarget, setStreamTarget] = useState("1");
@@ -898,8 +955,13 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
         }
     }, [selectedSourceId, streamSources.loading, streamSources.sources]);
 
-    const hours = parseNumber(timeTarget, 1, Farmer.MAX_TARGET_HOURS, false);
-    const chunk = parseNumber(chunkHours, 1, Farmer.MAX_CHUNK_HOURS, true);
+    const perGame = parseNumber(hoursPerGame, 1, Farmer.MAX_CHUNK_HOURS, true);
+    const maxSpreadHours = apps != null && perGame != null ? apps.length * perGame : Farmer.MAX_TARGET_HOURS;
+    const spreadHours = parseNumber(spreadTarget, 1, Math.max(1, maxSpreadHours), false);
+
+    const singleHours = parseNumber(singleTarget, 1, Farmer.MAX_TARGET_HOURS, false);
+    const chunk = parseNumber(singleChunk, 1, Farmer.MAX_CHUNK_HOURS, true);
+
     const games = parseNumber(varietyCount, 1, apps?.length ?? 1_000, true);
     const minutes = parseNumber(varietyMinutes, 1, 1_440, false);
     const streamHours = parseNumber(streamTarget, 0.1, Farmer.MAX_TARGET_HOURS, false);
@@ -907,12 +969,15 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
     const activeSource = streamSources.sources.find(item => item.id === selectedSourceId) ?? null;
     const sharingFullScreen = activeSource == null || activeSource.kind === "screen";
 
-    const timeBatches = hours != null && chunk != null
-        ? Math.ceil(Math.ceil(hours / chunk) / Farmer.BATCH_SIZE)
+    const spreadGamesCount = spreadHours != null && perGame != null
+        ? Math.min(apps?.length ?? Infinity, Math.max(1, Math.ceil(spreadHours / perGame)))
+        : null;
+    const spreadBatches = spreadGamesCount != null ? Math.ceil(spreadGamesCount / Farmer.BATCH_SIZE) : null;
+    const singleBatches = singleHours != null && chunk != null
+        ? Math.ceil(Math.ceil(singleHours / chunk) / Farmer.BATCH_SIZE)
         : null;
     const varietyBatches = games != null ? Math.ceil(games / Farmer.BATCH_SIZE) : null;
-    const allBatches = Math.ceil(Farmer.UNIVERSALIST_GAMES / Farmer.BATCH_SIZE)
-        + Math.ceil(Math.ceil(Farmer.ETERNAL_HOURS / Farmer.DEFAULT_CHUNK_HOURS) / Farmer.BATCH_SIZE);
+    const allBatches = Math.ceil(Math.ceil(Farmer.ETERNAL_HOURS / Farmer.DEFAULT_HOURS_PER_GAME) / Farmer.BATCH_SIZE);
 
     function copyAltScript() {
         copyToClipboard(Farmer.ALT_WATCH_SNIPPET)
@@ -939,6 +1004,8 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
             ? `Connected to ${voice.channelName} · ${voice.peersInChannel} other ${voice.peersInChannel === 1 ? "person" : "people"} in call`
             : `Connected to ${voice.channelName} · alone in call (bring an alt so hours count)`;
 
+    const activeTimeValue = timeStrategy === "spread" ? spreadHours : singleHours;
+
     return (
         <div className={cl("root", { "root-modal": isModal })}>
             {!isModal && (
@@ -950,6 +1017,29 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                     <span className={cl("status", { "status-on": busy })}>{busy ? "Running" : "Idle"}</span>
                 </header>
             )}
+
+            <div className={cl("badges-bar")}>
+                <div className={cl("badges-list")}>
+                    <span className={cl("badges-label")}>Equipped badges:</span>
+                    {profileBadges.badges.length === 0 ? (
+                        <span className={cl("badges-empty")}>None shown yet</span>
+                    ) : (
+                        profileBadges.badges.map(badge => (
+                            <span key={badge.id} className={cl("badge-chip")} title={badge.id}>
+                                {badge.description || badge.id}
+                            </span>
+                        ))
+                    )}
+                </div>
+                <button
+                    type="button"
+                    className={cl("ghost")}
+                    disabled={profileBadges.loading}
+                    onClick={profileBadges.refresh}
+                >
+                    {profileBadges.loading ? "..." : "Check"}
+                </button>
+            </div>
 
             {personalization === false && (
                 <div className={cl("callout", "callout-danger")}>
@@ -972,42 +1062,108 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
             {tab === "time" && (
                 <Panel
                     key="time"
-                    intro="Posts batched play sessions for one game. Click any tier bar to set the target."
+                    intro={
+                        timeStrategy === "spread"
+                            ? "Discord caps playtime per single game at 24 hours a day and sums across titles. Spreading hours across unique Windows games reaches 5,000 hours in one sync."
+                            : "Logs sessions on one chosen game. Discord caps credit per game at about 24 hours per day."
+                    }
                     action={
-                        <StartButton
-                            label={selected == null ? "Pick a game" : `Start ${selected.name}`}
-                            eta={timeBatches != null ? formatDuration(timeBatches * SECONDS_PER_BATCH) : null}
-                            disabled={busy || selected == null || hours == null || chunk == null}
-                            onClick={() => void Farmer.startGameTime(selected!, hours!, chunk!)}
-                        />
+                        timeStrategy === "spread" ? (
+                            <StartButton
+                                label="Start Game Time"
+                                eta={
+                                    spreadBatches != null && spreadGamesCount != null
+                                        ? `${spreadGamesCount.toLocaleString()} games · ${formatDuration(spreadBatches * SECONDS_PER_BATCH)}`
+                                        : null
+                                }
+                                disabled={busy || apps == null || spreadHours == null || perGame == null}
+                                onClick={() => void Farmer.startSpreadGameTime(apps!, spreadHours!, perGame!)}
+                            />
+                        ) : (
+                            <StartButton
+                                label={selected == null ? "Pick a game" : `Start ${selected.name}`}
+                                eta={singleBatches != null ? formatDuration(singleBatches * SECONDS_PER_BATCH) : null}
+                                disabled={busy || selected == null || singleHours == null || chunk == null}
+                                onClick={() => void Farmer.startSingleGameTime(selected!, singleHours!, chunk!)}
+                            />
+                        )
                     }
                 >
-                    <GamePicker apps={apps} error={catalogueError} selected={selected} onSelect={setSelected} disabled={busy} />
-                    <div className={cl("row")}>
-                        <Field
-                            label="Target"
-                            suffix="hours"
-                            value={timeTarget}
-                            disabled={busy}
-                            onChange={setTimeTarget}
-                            error={hours == null ? `Use 1 to ${Farmer.MAX_TARGET_HOURS.toLocaleString()}` : null}
-                        />
-                        <Field
-                            label="Hours per session"
-                            suffix="hours"
-                            value={chunkHours}
-                            disabled={busy}
-                            onChange={setChunkHours}
-                            hint={`Batches up to ${Farmer.BATCH_SIZE} sessions per request`}
-                            error={chunk == null ? `Whole number, 1 to ${Farmer.MAX_CHUNK_HOURS}` : null}
-                        />
-                    </div>
+                    <ModePills
+                        options={[
+                            { id: "spread", label: "Spread across catalog (Recommended)" },
+                            { id: "single", label: "Single game (24h/day cap)" }
+                        ]}
+                        value={timeStrategy}
+                        disabled={busy}
+                        onChange={setTimeStrategy}
+                    />
+
+                    {timeStrategy === "spread" ? (
+                        <div className={cl("row")}>
+                            <Field
+                                label="Total target"
+                                suffix="hours"
+                                value={spreadTarget}
+                                disabled={busy}
+                                onChange={setSpreadTarget}
+                                hint={
+                                    spreadGamesCount != null
+                                        ? `Uses ${spreadGamesCount.toLocaleString()} unique Windows games`
+                                        : undefined
+                                }
+                                error={spreadHours == null ? `Use 1 to ${maxSpreadHours.toLocaleString()}` : null}
+                            />
+                            <Field
+                                label="Hours per game"
+                                suffix="hours"
+                                value={hoursPerGame}
+                                disabled={busy}
+                                onChange={setHoursPerGame}
+                                hint="Keep at 24 or under so every hour counts"
+                                error={perGame == null ? `Whole number, 1 to ${Farmer.MAX_CHUNK_HOURS}` : null}
+                            />
+                        </div>
+                    ) : (
+                        <>
+                            <GamePicker apps={apps} error={catalogueError} selected={selected} onSelect={setSelected} disabled={busy} />
+                            {singleHours != null && singleHours > 24 && (
+                                <div className={cl("callout", "callout-warn")}>
+                                    Discord discards extra overlapping hours past ~24 hours per game per day. Switch to "Spread across catalog" above to unlock Eternal in one night.
+                                </div>
+                            )}
+                            <div className={cl("row")}>
+                                <Field
+                                    label="Target"
+                                    suffix="hours"
+                                    value={singleTarget}
+                                    disabled={busy}
+                                    onChange={setSingleTarget}
+                                    hint="24 hours max credited per day on one title"
+                                    error={singleHours == null ? `Use 1 to ${Farmer.MAX_TARGET_HOURS.toLocaleString()}` : null}
+                                />
+                                <Field
+                                    label="Hours per session"
+                                    suffix="hours"
+                                    value={singleChunk}
+                                    disabled={busy}
+                                    onChange={setSingleChunk}
+                                    hint={`Batches up to ${Farmer.BATCH_SIZE} sessions per request`}
+                                    error={chunk == null ? `Whole number, 1 to ${Farmer.MAX_CHUNK_HOURS}` : null}
+                                />
+                            </div>
+                        </>
+                    )}
+
                     <TierMeter
-                        value={hours}
+                        value={activeTimeValue}
                         tiers={TIME_TIERS}
                         unit="hours"
                         disabled={busy}
-                        onPick={target => setTimeTarget(String(target))}
+                        onPick={target => {
+                            if (timeStrategy === "spread") setSpreadTarget(String(target));
+                            else setSingleTarget(String(target));
+                        }}
                     />
                 </Panel>
             )}
@@ -1015,13 +1171,13 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
             {tab === "variety" && (
                 <Panel
                     key="variety"
-                    intro="Posts one short session each for random games from Discord's catalog. Universalist needs 100."
+                    intro="Posts one session each for fresh, verified Windows games from Discord's catalog. Universalist needs 100."
                     action={
                         <StartButton
                             label="Start Variety"
                             eta={varietyBatches != null ? formatDuration(varietyBatches * SECONDS_PER_BATCH) : null}
                             disabled={busy || apps == null || games == null || minutes == null}
-                            onClick={() => void Farmer.startVariety(Farmer.shuffled(apps!, games!), minutes!)}
+                            onClick={() => void Farmer.startVariety(apps!, games!, minutes!)}
                         />
                     }
                 >
@@ -1031,6 +1187,7 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                             value={varietyCount}
                             disabled={busy}
                             onChange={setVarietyCount}
+                            hint="Prefers games you have not claimed yet"
                             error={games == null ? `Whole number, 1 to ${(apps?.length ?? 1_000).toLocaleString()}` : null}
                         />
                         <Field
@@ -1039,7 +1196,7 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                             value={varietyMinutes}
                             disabled={busy}
                             onChange={setVarietyMinutes}
-                            hint="Two minutes is enough"
+                            hint="Five minutes is plenty"
                             error={minutes == null ? "Use 1 to 1,440" : null}
                         />
                     </div>
@@ -1143,7 +1300,7 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                             checked={checkpoint}
                             disabled={busy}
                             title="2-hour checkpoints"
-                            note="Restarts Go Live every 2 hours to bank hours along the way. Pair with alt auto-watch below"
+                            note="Restarts Go Live every 2 hours (avoids Discord's 10h stream cap). Pair with alt auto-watch"
                             onChange={setCheckpoint}
                         />
                     </div>
@@ -1187,7 +1344,7 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
             {tab === "all" && (
                 <Panel
                     key="all"
-                    intro="Runs all three badges to their top tiers in order. You can close this window once the run starts."
+                    intro="Unlocks Eternal and Universalist in one pass, then starts Streaming if you sit in a voice channel."
                     action={
                         <StartButton
                             label="Start all three"
@@ -1203,19 +1360,17 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                 >
                     <ol className={cl("flow")}>
                         <li className={cl("flow-step")}>
-                            <span className={cl("flow-name")}>Variety</span>
-                            <span className={cl("flow-note")}>100 random games, two minutes each</span>
-                        </li>
-                        <li className={cl("flow-step")}>
-                            <span className={cl("flow-name")}>Game Time</span>
-                            <span className={cl("flow-note")}>5,000 hours on the first game from that batch</span>
+                            <span className={cl("flow-name")}>Game Time + Variety</span>
+                            <span className={cl("flow-note")}>
+                                250 unique Windows games at 20 hours each (5,000 total hours + Universalist in one run)
+                            </span>
                         </li>
                         <li className={cl("flow-step")}>
                             <span className={cl("flow-name")}>Streaming</span>
                             <span className={cl("flow-note")}>
                                 {voice.problem == null && noTrackState === "ok"
-                                    ? `Goes live in ${voice.channelName} after step two`
-                                    : "Skipped unless you join a voice channel (with NoTrack badge tracking on) before step two finishes"}
+                                    ? `Goes live in ${voice.channelName} right after step one`
+                                    : "Skipped unless you join a voice channel (with NoTrack badge tracking on) before step one finishes"}
                             </span>
                         </li>
                     </ol>
@@ -1223,7 +1378,7 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
             )}
 
             <p className={cl("footnote")}>
-                Discord refreshes Game Time and Variety badges overnight, and Streaming within 48 hours. Keep "Use data to personalize my Discord experience" on under Data &amp; Privacy.
+                Discord syncs Game Time and Variety badges within 24 to 48 hours, and Streaming within 48 hours. Keep "Use data to personalize my Discord experience" on under Data &amp; Privacy.
             </p>
         </div>
     );

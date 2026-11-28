@@ -8,38 +8,62 @@
  * BadgeFarmer Console Edition (desktop and browser DevTools)
  *
  * Commands:
- *   BadgeFarmer.gameTime("Dota 2", 5000)
- *   BadgeFarmer.variety(2, 100)
- *   BadgeFarmer.stream(1)
- *   BadgeFarmer.watch()
- *   BadgeFarmer.maxAll()
+ *   BadgeFarmer.gameTime(5000, 20)        // Spread 5,000h across 250 Windows games (~9s)
+ *   BadgeFarmer.gameTime("Dota 2", 24)    // Single game (Discord caps ~24h/day per title)
+ *   BadgeFarmer.variety(5, 100)           // 100 fresh Windows games, 5 min each
+ *   BadgeFarmer.stream(1)                 // Low-power Go Live farm on desktop
+ *   BadgeFarmer.watch()                   // Alt viewer auto-watch & unpause keepalive
+ *   BadgeFarmer.maxAll()                  // Unlocks Eternal + Universalist in one pass
+ *   BadgeFarmer.badges()                  // Inspect equipped profile badges
  *   BadgeFarmer.search("counter")
  *   BadgeFarmer.stop()
  *   BadgeFarmer.status
  */
 (() => {
-    const API = "https://discord.com/api/v9";
+    function apiOrigin() {
+        try {
+            const { origin, hostname } = location;
+            if (hostname === "discord.com" || hostname.endsWith(".discord.com") || hostname.endsWith(".discordapp.com")) {
+                return origin;
+            }
+        } catch { /* ignore */ }
+        return "https://discord.com";
+    }
+
+    const ORIGIN = apiOrigin();
+    const API = `${ORIGIN}/api/v9`;
     const SCIENCE = `${API}/science`;
-    const DETECTABLE = "https://discord.com/api/v10/applications/detectable";
+    const DETECTABLE_URLS = [
+        `${ORIGIN}/api/v10/applications/detectable`,
+        "https://cdn.discordapp.com/detectables/games.json"
+    ];
 
     const MIN_DURATION_MS = 60_000;
     const MAX_SESSION_MS = 24 * 60 * 60 * 1_000;
-    const BATCH_SIZE = 12;
-    const REQUEST_DELAY_MS = 500;
+    const BATCH_SIZE = 20;
+    const REQUEST_DELAY_MS = 550;
     const RETRY_DELAY_MS = 3_000;
     const MAX_FAILED_BATCHES = 5;
     const STREAM_TICK_MS = 8_000;
     const VIEWER_TICK_MS = 4_000;
     const STREAM_CHECKPOINT_MS = 2 * 60 * 60 * 1_000;
     const MAX_TICK_DELTA_MS = STREAM_TICK_MS * 3;
+    const STORAGE_USED_KEY = "bf_used_games_v1";
+
+    const USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) discord/1.0.9253 Chrome/148.0.7778.280 Electron/42.7.1 Safari/537.36";
 
     const state = {
         token: "",
+        userId: "",
         analyticsToken: "",
         analyticsFetchedAt: 0,
-        sequence: Math.floor(Math.random() * 100_000),
+        sequence: Math.floor(Math.random() * 10_000),
         heartbeatSessionId: crypto.randomUUID(),
         launchSignature: crypto.randomUUID(),
+        clientLaunchId: crypto.randomUUID(),
+        superProps: "",
         running: false,
         mode: "IDLE",
         creditedHours: 0,
@@ -56,6 +80,40 @@
 
     const log = (msg, ok = true) =>
         console.log(`%c[BadgeFarmer] ${msg}`, `color:${ok ? "#57f287" : "#f23f43"};font-weight:bold`);
+
+    function encodeBase64Utf8(text) {
+        const bytes = new TextEncoder().encode(text);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        return btoa(binary);
+    }
+
+    function buildSuperProps() {
+        if (state.superProps) return state.superProps;
+        const props = {
+            os: "Windows",
+            browser: "Discord Client",
+            release_channel: "stable",
+            client_version: "1.0.9253",
+            os_version: "10.0.26200",
+            os_arch: "x64",
+            app_arch: "x64",
+            system_locale: navigator.language || "en-US",
+            has_client_mods: false,
+            browser_user_agent: USER_AGENT,
+            browser_version: "42.7.1",
+            os_sdk_version: "26200",
+            client_build_number: 594031,
+            native_build_number: 88414,
+            client_event_source: null,
+            client_app_state: "focused",
+            client_launch_id: state.clientLaunchId,
+            launch_signature: state.launchSignature,
+            client_heartbeat_session_id: state.heartbeatSessionId
+        };
+        state.superProps = encodeBase64Utf8(JSON.stringify(props));
+        return state.superProps;
+    }
 
     function wait(ms, signal) {
         if (ms <= 0 || signal?.aborted) return Promise.resolve();
@@ -121,7 +179,9 @@
     function headers() {
         return {
             authorization: state.token,
-            "content-type": "application/json"
+            "content-type": "application/json",
+            "x-discord-locale": navigator.language || "en-US",
+            "x-super-properties": buildSuperProps()
         };
     }
 
@@ -141,6 +201,7 @@
         if (typeof body?.analytics_token !== "string" || body.analytics_token === "") {
             throw new Error("Discord returned no analytics_token. Turn on personalization under Data & Privacy.");
         }
+        state.userId = typeof body?.id === "string" ? body.id : "";
         state.analyticsToken = body.analytics_token;
         state.analyticsFetchedAt = Date.now();
         return state.analyticsToken;
@@ -174,30 +235,28 @@
         throw err;
     }
 
-    function executableFor(app) {
-        const list = Array.isArray(app.executables) ? app.executables : [];
-        const pick = list.find(e => e.os === "win32" && !e.is_launcher && !e.isLauncher)
-            ?? list.find(e => e.os === "win32")
-            ?? list[0];
-        const fallback = `${app.name.replace(/[<>:"/\\|?*]/g, "").trim() || "game"}.exe`;
-        const cleaned = pick?.name?.replace(/^>/, "").replace(/^.*[\\/]/, "").trim();
-        return cleaned || fallback;
-    }
-
     function normalizeApps(raw) {
         if (!Array.isArray(raw)) return [];
         const seen = new Set();
         const out = [];
         for (const item of raw) {
             if (!item || typeof item.id !== "string" || typeof item.name !== "string") continue;
+            const id = item.id.trim();
             const name = item.name.trim();
-            if (!name || seen.has(item.id)) continue;
-            seen.add(item.id);
+            if (!/^\d+$/.test(id) || !name || seen.has(id) || !Array.isArray(item.executables)) continue;
+
+            const winExes = item.executables.filter(
+                e => e && e.os === "win32" && typeof e.name === "string" && e.name.replace(/^>/, "").trim() !== ""
+            );
+            if (winExes.length === 0) continue;
+            seen.add(id);
+
+            const pick = winExes.find(e => !e.is_launcher && !e.isLauncher) ?? winExes[0];
             out.push({
-                id: item.id,
+                id,
                 name,
                 aliases: Array.isArray(item.aliases) ? item.aliases.filter(a => typeof a === "string") : [],
-                exeName: executableFor(item)
+                exeName: pick.name.replace(/^>/, "").trim()
             });
         }
         return out;
@@ -215,31 +274,97 @@
             }
         }
 
-        const res = await fetch(DETECTABLE);
-        if (!res.ok) throw new Error(`HTTP ${res.status} loading game catalog`);
-        const apps = normalizeApps(await res.json());
-        if (apps.length === 0) throw new Error("Discord returned an empty game catalog.");
-        state.catalogue = apps;
-        return apps;
+        let lastErr = null;
+        for (const url of DETECTABLE_URLS) {
+            try {
+                const res = await fetch(url);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const apps = normalizeApps(await res.json());
+                if (apps.length > 0) {
+                    state.catalogue = apps;
+                    return apps;
+                }
+            } catch (err) {
+                lastErr = err;
+            }
+        }
+        throw lastErr ?? new Error("Discord returned an empty game catalog.");
     }
 
-    function buildSessionEvents(game, durationMs, startedAt, sendAt) {
-        const clamped = Math.min(Math.max(Math.floor(durationMs), MIN_DURATION_MS), MAX_SESSION_MS);
-        const start = Math.min(Math.max(Math.floor(startedAt), sendAt - MAX_SESSION_MS), sendAt - MIN_DURATION_MS);
-        const end = Math.min(start + clamped, sendAt);
-        const actual = Math.max(end - start, MIN_DURATION_MS);
+    function readUsedIds() {
+        try {
+            const raw = localStorage.getItem(STORAGE_USED_KEY);
+            const parsed = raw ? JSON.parse(raw) : [];
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    }
+
+    function writeUsedIds(ids) {
+        try {
+            localStorage.setItem(STORAGE_USED_KEY, JSON.stringify(ids.slice(-15_000)));
+        } catch { /* ignore */ }
+    }
+
+    function shuffled(items) {
+        const pool = [...items];
+        for (let i = pool.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [pool[i], pool[j]] = [pool[j], pool[i]];
+        }
+        return pool;
+    }
+
+    function selectFreshGames(apps, count) {
+        const desired = Math.min(Math.max(1, Math.floor(count)), apps.length);
+        const usedList = readUsedIds();
+        const usedSet = new Set(usedList);
+        const chosen = shuffled(apps.filter(a => !usedSet.has(a.id))).slice(0, desired);
+
+        if (chosen.length < desired) {
+            const byId = new Map(apps.map(a => [a.id, a]));
+            const chosenIds = new Set(chosen.map(a => a.id));
+            for (const gid of usedList) {
+                const found = byId.get(gid);
+                if (found && !chosenIds.has(found.id)) {
+                    chosen.push(found);
+                    chosenIds.add(found.id);
+                    if (chosen.length >= desired) break;
+                }
+            }
+        }
+
+        return chosen;
+    }
+
+    function recordUsedIds(gameIds) {
+        if (!gameIds.length) return;
+        const usedList = readUsedIds();
+        const pickedSet = new Set(gameIds);
+        writeUsedIds([...usedList.filter(id => !pickedSet.has(id)), ...gameIds]);
+    }
+
+    function buildSessionEvents(game, durationMs, startedAt, now, index) {
+        const duration = Math.min(Math.max(Math.floor(durationMs), MIN_DURATION_MS), MAX_SESSION_MS);
+        const jitter = index * 400 + Math.floor(Math.random() * 350);
+        const end = startedAt != null
+            ? Math.min(Math.max(Math.floor(startedAt) + duration, now - MAX_SESSION_MS + MIN_DURATION_MS), now)
+            : Math.max(MIN_DURATION_MS, now - jitter);
+        const start = Math.max(0, end - duration);
+        const openBeatTs = Math.min(end, start + 50);
         const sessionId = crypto.randomUUID();
-        const exeLower = game.exeName.toLowerCase();
+        const locale = navigator.language || "en-US";
 
         const shared = {
             client_heartbeat_session_id: state.heartbeatSessionId,
             launch_signature: state.launchSignature,
             client_app_state: "focused",
-            client_send_timestamp: sendAt
+            client_send_timestamp: now
         };
 
         return {
-            actual,
+            actual: duration,
             events: [
                 {
                     type: "launch_game",
@@ -254,25 +379,48 @@
                         is_launcher: false,
                         game_platform: "desktop",
                         detection_method: "verified_game",
+                        is_overlay_enabled: false,
+                        is_overlay_game_enabled: true,
+                        is_overlay_game_source: "OOP_DEFAULT_DATABASE",
+                        fullscreen_type: "UNKNOWN",
+                        hardware_display_count: 1,
+                        overlay_method: "Disabled",
                         activity_status_enabled: true,
+                        activity_status_shared_guilds: [],
+                        current_user_status: "online",
                         game_detection_enabled: true,
-                        executable_path: exeLower
+                        executable_path: game.exeName,
+                        voice_channel_id: null,
+                        voice_channel_type: null,
+                        voice_channel_bitrate: null,
+                        voice_channel_guild_id: null,
+                        hidden_by_distributor: false,
+                        game_metadata: null,
+                        client_performance_cpu: null,
+                        client_performance_memory: null,
+                        cpu_core_count: null,
+                        accessibility_features: 0,
+                        rendered_locale: locale,
+                        client_rtc_state: null
                     }
                 },
                 {
                     type: "running_game_heartbeat",
                     properties: {
                         ...shared,
-                        client_track_timestamp: start,
+                        client_track_timestamp: openBeatTs,
                         event_sequence_number: ++state.sequence,
                         game_id: game.id,
                         game_name: game.name,
-                        game_executable: exeLower,
+                        game_metadata: null,
+                        game_executable: game.exeName,
                         game_detection_enabled: true,
                         initial_heartbeat: true,
                         final_heartbeat: false,
                         game_session_id: sessionId,
-                        duration_tracked_ms: 0
+                        duration_tracked_ms: 0,
+                        rtc_connection_id: null,
+                        media_session_id: null
                     }
                 },
                 {
@@ -283,12 +431,15 @@
                         event_sequence_number: ++state.sequence,
                         game_id: game.id,
                         game_name: game.name,
-                        game_executable: exeLower,
+                        game_metadata: null,
+                        game_executable: game.exeName,
                         game_detection_enabled: true,
                         initial_heartbeat: false,
                         final_heartbeat: true,
                         game_session_id: sessionId,
-                        duration_tracked_ms: actual
+                        duration_tracked_ms: duration,
+                        rtc_connection_id: null,
+                        media_session_id: null
                     }
                 }
             ]
@@ -298,11 +449,12 @@
     async function sendBatchWithRetry(sessions, signal) {
         let maxAttempts = 3;
         for (let attempt = 1; attempt <= maxAttempts && !signal.aborted; attempt++) {
-            const sendAt = Date.now();
+            const now = Date.now();
             const events = [];
             let creditedMs = 0;
-            for (const s of sessions) {
-                const built = buildSessionEvents(s.game, s.durationMs, s.startedAt, sendAt);
+            for (let idx = 0; idx < sessions.length; idx++) {
+                const s = sessions[idx];
+                const built = buildSessionEvents(s.game, s.durationMs, s.startedAt, now, idx);
                 events.push(...built.events);
                 creditedMs += built.actual;
             }
@@ -357,7 +509,61 @@
         state.abort = null;
     }
 
-    async function runGameTime(app, hours, chunkHours, signal) {
+    async function runSpreadGameTime(apps, totalHours, hoursPerGame, signal) {
+        const perGame = Math.min(Math.max(1, Math.floor(hoursPerGame)), 24);
+        const perGameMs = perGame * 3_600_000;
+        const effectiveHours = Math.min(Math.max(1, totalHours), apps.length * perGame);
+        const targetMs = Math.round(effectiveHours * 3_600_000);
+        const needed = Math.min(apps.length, Math.max(1, Math.ceil(targetMs / perGameMs)));
+        const pool = selectFreshGames(apps, needed);
+
+        let creditedMs = 0;
+        let failures = 0;
+        state.creditedHours = 0;
+        state.gamesCredited = 0;
+
+        log(`Game Time (spread): ${effectiveHours}h across ${pool.length} Windows games (${perGame}h each)`);
+
+        for (let i = 0; i < pool.length && !signal.aborted && targetMs - creditedMs >= MIN_DURATION_MS; i += BATCH_SIZE) {
+            const batch = [];
+            let planned = creditedMs;
+            for (const game of pool.slice(i, i + BATCH_SIZE)) {
+                const rem = targetMs - planned;
+                if (rem < MIN_DURATION_MS) break;
+                const dur = Math.max(MIN_DURATION_MS, Math.min(perGameMs, rem));
+                batch.push({ game, durationMs: dur });
+                planned += dur;
+            }
+            if (batch.length === 0) break;
+
+            const result = await sendBatchWithRetry(batch, signal);
+            if (signal.aborted) return false;
+            if (!result.ok) {
+                if (++failures >= MAX_FAILED_BATCHES) {
+                    log(`Stopped after ${MAX_FAILED_BATCHES} failed batches in a row.`, false);
+                    return false;
+                }
+                await wait(RETRY_DELAY_MS, signal);
+                i -= BATCH_SIZE;
+                continue;
+            }
+            failures = 0;
+            recordUsedIds(batch.map(entry => entry.game.id));
+            creditedMs += result.creditedMs;
+            state.gamesCredited += result.count;
+            state.creditedHours = Math.round((Math.min(creditedMs, targetMs) / 3_600_000) * 10) / 10;
+            log(`${state.creditedHours}/${effectiveHours}h sent (${state.gamesCredited}/${pool.length} games)`);
+            if (i + BATCH_SIZE < pool.length && targetMs - creditedMs >= MIN_DURATION_MS) {
+                await wait(REQUEST_DELAY_MS, signal);
+            }
+        }
+
+        const done = !signal.aborted && targetMs - creditedMs < MIN_DURATION_MS;
+        if (done) log(`Done: ${state.creditedHours}h across ${state.gamesCredited} games. Discord syncs badges in 24 to 48 hours.`);
+        return done;
+    }
+
+    async function runSingleGameTime(app, hours, chunkHours, signal) {
         const targetMs = Math.round(Math.max(0.1, hours) * 3_600_000);
         const chunkMs = Math.min(Math.max(1, Math.floor(chunkHours)), 24) * 3_600_000;
         const cursorRef = { value: Date.now() };
@@ -365,7 +571,10 @@
         let failures = 0;
         state.creditedHours = 0;
 
-        log(`Game Time: ${hours}h on ${app.name} (${chunkMs / 3_600_000}h sessions, ${BATCH_SIZE} per batch)`);
+        if (hours > 24) {
+            log("Note: Discord caps playtime per single game at ~24h/day. Use BadgeFarmer.gameTime(5000) to spread across games.", false);
+        }
+        log(`Game Time (single): ${hours}h on ${app.name}`);
 
         while (!signal.aborted && targetMs - creditedMs >= MIN_DURATION_MS) {
             const batch = [];
@@ -385,6 +594,7 @@
                     log(`Stopped after ${MAX_FAILED_BATCHES} failed batches in a row.`, false);
                     return false;
                 }
+                await wait(RETRY_DELAY_MS, signal);
                 continue;
             }
             failures = 0;
@@ -395,30 +605,21 @@
         }
 
         const done = !signal.aborted && targetMs - creditedMs < MIN_DURATION_MS;
-        if (done) log(`Game Time done: ${state.creditedHours}h sent. Discord updates badges overnight.`);
+        if (done) log(`Done: ${state.creditedHours}h sent on ${app.name}.`);
         return done;
     }
 
     async function runVariety(games, minutesPerGame, signal) {
-        const unique = [];
-        const seen = new Set();
-        for (const game of games) {
-            if (game?.id && !seen.has(game.id)) {
-                seen.add(game.id);
-                unique.push(game);
-            }
-        }
-
         const sessionMs = Math.min(MAX_SESSION_MS, Math.max(MIN_DURATION_MS, Math.floor(minutesPerGame * 60_000)));
         const cursorRef = { value: Date.now() };
         let failures = 0;
         state.gamesCredited = 0;
 
-        log(`Variety: ${unique.length} games, ${minutesPerGame} min each (${BATCH_SIZE} per batch)`);
+        log(`Variety: ${games.length} Windows games, ${minutesPerGame} min each (${BATCH_SIZE} per batch)`);
 
-        for (let i = 0; i < unique.length; i += BATCH_SIZE) {
+        for (let i = 0; i < games.length; i += BATCH_SIZE) {
             if (signal.aborted) return false;
-            const batch = unique.slice(i, i + BATCH_SIZE).map(game => ({
+            const batch = games.slice(i, i + BATCH_SIZE).map(game => ({
                 game,
                 durationMs: sessionMs,
                 startedAt: nextSlot(cursorRef, sessionMs)
@@ -431,16 +632,19 @@
                     log(`Stopped after ${MAX_FAILED_BATCHES} failed batches in a row.`, false);
                     return false;
                 }
+                await wait(RETRY_DELAY_MS, signal);
+                i -= BATCH_SIZE;
                 continue;
             }
             failures = 0;
+            recordUsedIds(batch.map(entry => entry.game.id));
             state.gamesCredited += result.count;
-            log(`${state.gamesCredited}/${unique.length} games sent`);
-            if (i + BATCH_SIZE < unique.length) await wait(REQUEST_DELAY_MS, signal);
+            log(`${state.gamesCredited}/${games.length} games sent`);
+            if (i + BATCH_SIZE < games.length) await wait(REQUEST_DELAY_MS, signal);
         }
 
-        const done = !signal.aborted && state.gamesCredited >= unique.length;
-        if (done) log(`Variety done: ${state.gamesCredited} games sent. Discord updates badges overnight.`);
+        const done = !signal.aborted && state.gamesCredited >= games.length;
+        if (done) log(`Variety done: ${state.gamesCredited} games sent. Discord syncs badges in 24 to 48 hours.`);
         return done;
     }
 
@@ -540,7 +744,7 @@
                             stream = streamingStore.getCurrentUserActiveStream();
                         }
                     } catch (err) {
-                        log(`Auto-start Go Live failed (${err.message}). Click Go Live manually.`, false);
+                        log(`Auto-start Go Live failed (${err.message}). Click Go Live in Discord.`, false);
                     }
                 }
 
@@ -623,16 +827,6 @@
         }
     }
 
-    function pickRandom(apps, count) {
-        const pool = [...apps];
-        const take = Math.min(Math.max(0, Math.floor(count)), pool.length);
-        for (let i = 0; i < take; i++) {
-            const j = i + Math.floor(Math.random() * (pool.length - i));
-            [pool[i], pool[j]] = [pool[j], pool[i]];
-        }
-        return pool.slice(0, take);
-    }
-
     function rankSearch(apps, query) {
         const needle = query.trim().toLowerCase();
         if (!needle) return [];
@@ -673,31 +867,55 @@
             log("Stopping run...");
         },
 
+        async badges() {
+            ensureAuth();
+            await ensureAnalyticsToken();
+            if (!state.userId) throw new Error("Could not resolve user ID.");
+            const res = await fetch(`${API}/users/${state.userId}/profile?with_mutual_guilds=false&with_mutual_friends_count=false`, {
+                headers: headers()
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            const list = Array.isArray(data?.badges) ? data.badges : [];
+            log(list.length ? `Equipped badges: ${list.map(b => b.description || b.id).join(", ")}` : "No badges equipped yet.");
+            return list;
+        },
+
         async search(name) {
             if (typeof name !== "string" || name.trim() === "") return [];
             const apps = await loadCatalogue();
             return rankSearch(apps, name);
         },
 
-        async gameTime(name, hours = 5_000, chunkHours = 24) {
+        async gameTime(targetOrName = 5_000, hoursOrPerGame = 20, chunkHours = 24) {
             ensureAuth();
-            const matches = await this.search(name);
+            const apps = await loadCatalogue();
+            if (typeof targetOrName === "number") {
+                const signal = begin("GAME_TIME");
+                try {
+                    await runSpreadGameTime(apps, targetOrName, hoursOrPerGame, signal);
+                } finally {
+                    finish();
+                }
+                return;
+            }
+            const matches = rankSearch(apps, String(targetOrName));
             const app = matches[0];
-            if (!app) throw new Error(`No game matched "${name}".`);
+            if (!app) throw new Error(`No Windows game matched "${targetOrName}".`);
             const signal = begin("GAME_TIME");
             try {
-                await runGameTime(app, hours, chunkHours, signal);
+                await runSingleGameTime(app, hoursOrPerGame, chunkHours, signal);
             } finally {
                 finish();
             }
         },
 
-        async variety(minutesPerGame = 2, count = 100) {
+        async variety(minutesPerGame = 5, count = 100) {
             ensureAuth();
             const apps = await loadCatalogue();
             const signal = begin("VARIETY");
             try {
-                await runVariety(pickRandom(apps, count), minutesPerGame, signal);
+                await runVariety(selectFreshGames(apps, count), minutesPerGame, signal);
             } finally {
                 finish();
             }
@@ -724,13 +942,9 @@
         async maxAll() {
             ensureAuth();
             const apps = await loadCatalogue();
-            const pool = pickRandom(apps, 100);
-            if (pool.length === 0) throw new Error("Game catalog is empty.");
             const signal = begin("MAX_ALL");
             try {
-                const ok = await runVariety(pool, 2, signal);
-                if (!ok || signal.aborted) return;
-                await runGameTime(pool[0], 5_000, 24, signal);
+                await runSpreadGameTime(apps, 5_000, 20, signal);
             } finally {
                 finish();
             }
@@ -740,6 +954,6 @@
     if (typeof window !== "undefined") window.BadgeFarmer = BadgeFarmer;
     else globalThis.BadgeFarmer = BadgeFarmer;
 
-    log('Loaded. Try BadgeFarmer.gameTime("Dota 2", 5000), .variety(), .stream(1), .watch(), .maxAll(), .stop()');
+    log("Loaded. Try BadgeFarmer.gameTime(5000), .variety(), .stream(1), .watch(), .badges(), .maxAll(), .stop()");
     return BadgeFarmer;
 })();

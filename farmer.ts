@@ -4,10 +4,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import * as DataStore from "@api/DataStore";
 import { Settings } from "@api/Settings";
-import { IS_LINUX, IS_MAC, IS_WINDOWS } from "@utils/constants";
+import { IS_WINDOWS } from "@utils/constants";
 import { Logger } from "@utils/Logger";
-import type { ApplicationStream, Channel, RunningGame } from "@vencord/discord-types";
+import type { ApplicationStream, Channel, ProfileBadge, RunningGame } from "@vencord/discord-types";
 import { findByCodeLazy } from "@webpack";
 import {
     ApplicationStreamingSettingsStore,
@@ -18,14 +19,17 @@ import {
     MediaEngineStore,
     PermissionsBits,
     PermissionStore,
+    RestAPI,
     RTCConnectionStore,
     SelectedChannelStore,
     showToast,
+    UserProfileStore,
     UserStore,
     VoiceStateStore
 } from "@webpack/common";
 
 import {
+    apiOrigin,
     creditPlaytimeBatch,
     fingerprintFor,
     isAnalyticsStubbed,
@@ -37,8 +41,8 @@ import {
 
 const logger = new Logger("BadgeFarmer");
 
-const DETECTABLE_APPS_URL = "https://discord.com/api/v10/applications/detectable";
 const CATALOGUE_TIMEOUT_MS = 20_000;
+const USED_GAMES_KEY_PREFIX = "BadgeFarmer_usedGames_v1_";
 
 const PRESET_CUSTOM = 3;
 const LOW_POWER_RESOLUTION = 480;
@@ -75,7 +79,6 @@ type RawDesktopSource = { id?: unknown; name?: unknown; };
 type GetDesktopSources4 = (engine: unknown, isWindows: boolean, types: string[], options: null) => Promise<RawDesktopSource[] | null>;
 type GetDesktopSources3 = (engine: unknown, types: string[], options: null) => Promise<RawDesktopSource[] | null>;
 
-// Discord's internal Go Live action creators.
 const startStream: ((guildId: string | null, channelId: string, options: StreamOptions) => void) | undefined =
     findByCodeLazy('type:"STREAM_START"');
 const stopStream: ((streamKey: string) => void) | undefined =
@@ -96,7 +99,7 @@ export interface DetectableApp {
     id: string;
     name: string;
     aliases?: string[];
-    executables?: DetectableExecutable[];
+    executables: DetectableExecutable[];
 }
 
 export interface SpoofedGame extends Omit<RunningGame, "distributor"> {
@@ -145,16 +148,17 @@ export const ETERNAL_HOURS = 5_000;
 export const UNIVERSALIST_GAMES = 100;
 export const MAX_TARGET_HOURS = 1_000_000;
 export const MAX_CHUNK_HOURS = 24;
-export const DEFAULT_CHUNK_HOURS = 24;
-export const DEFAULT_VARIETY_MINUTES = 2;
+export const DEFAULT_HOURS_PER_GAME = 20;
+export const DEFAULT_SINGLE_GAME_HOURS = 24;
+export const DEFAULT_VARIETY_MINUTES = 5;
 export const BATCH_SIZE = MAX_SESSIONS_PER_BATCH;
 
-const REQUEST_DELAY_MS = 500;
+const REQUEST_DELAY_MS = 550;
 const RETRY_DELAY_MS = 3_000;
 const MAX_RATE_LIMIT_WAIT_MS = 30_000;
 const MAX_FAILED_BATCHES = 5;
 
-// Optional periodic checkpoint to flush video_stream_ended when paired with an auto-watching alt.
+// Stays well inside Discord's 10-hour continuous stream session cap when checkpointing is on.
 const STREAM_CHECKPOINT_MS = 2 * 60 * 60 * 1_000;
 const STREAM_REJOIN_GAP_MS = 2_500;
 const STREAM_TICK_MS = 8_000;
@@ -166,7 +170,7 @@ const STREAM_RESTART_LIMIT = 4;
 /** Compact browser console snippet users can paste on an unmodded alt tab to auto-watch and stay unpaused 24/7. */
 export const ALT_WATCH_SNIPPET = `(() => {
   if (window.__bfWatch) clearInterval(window.__bfWatch);
-  let Dispatcher, StreamStore, ChannelStore;
+  let Dispatcher, StreamStore, ChannelStore, UserStore;
   webpackChunkdiscord_app.push([[Symbol()], {}, req => {
     for (const m of Object.values(req.c)) {
       const e = m?.exports;
@@ -175,6 +179,7 @@ export const ALT_WATCH_SNIPPET = `(() => {
         if (c.dispatch && c.subscribe) Dispatcher = c;
         if (c.getName?.() === "ApplicationStreamingStore") StreamStore = c;
         if (c.getName?.() === "SelectedChannelStore") ChannelStore = c;
+        if (c.getName?.() === "UserStore") UserStore = c;
       }
     }
   }]);
@@ -182,8 +187,10 @@ export const ALT_WATCH_SNIPPET = `(() => {
   const tick = () => {
     const ch = ChannelStore.getVoiceChannelId?.();
     if (!ch) return;
+    const myId = UserStore?.getCurrentUser?.()?.id;
     const streams = StreamStore.getAllApplicationStreamsForChannel?.(ch) ?? [];
     for (const s of streams) {
+      if (myId && s.ownerId === myId) continue;
       const key = s.guildId ? \`guild:\${s.guildId}:\${s.channelId}:\${s.ownerId}\` : \`call:\${s.channelId}:\${s.ownerId}\`;
       const active = StreamStore.getActiveStreamForStreamKey?.(key);
       if (!active) Dispatcher.dispatch({ type: "STREAM_WATCH", streamKey: key, allowMultiple: true });
@@ -218,6 +225,7 @@ let ownsStream = false;
 let savedStreamSettings: SavedStreamSettings | null = null;
 
 let cataloguePromise: Promise<DetectableApp[]> | null = null;
+const memoryUsedGames = new Map<string, string[]>();
 
 const listeners = new Set<() => void>();
 
@@ -294,6 +302,31 @@ export function enableNoTrackBadgeTracking(): boolean {
     }
 }
 
+export async function fetchMyBadges(forceNetwork = false): Promise<ProfileBadge[]> {
+    const userId = UserStore?.getCurrentUser?.()?.id;
+    if (userId == null) return [];
+
+    if (!forceNetwork) {
+        try {
+            const cached = UserProfileStore?.getUserProfile?.(userId)?.badges;
+            if (Array.isArray(cached) && cached.length > 0) return cached;
+        } catch {
+            // Fall through to REST query.
+        }
+    }
+
+    try {
+        const res = await RestAPI.get({
+            url: `/users/${userId}/profile`,
+            query: { with_mutual_guilds: false, with_mutual_friends_count: false }
+        });
+        const badges = (res?.body as { badges?: unknown; } | undefined)?.badges;
+        return Array.isArray(badges) ? badges as ProfileBadge[] : [];
+    } catch {
+        return [];
+    }
+}
+
 function wait(ms: number, signal?: AbortSignal): Promise<void> {
     if (ms <= 0 || signal?.aborted) return Promise.resolve();
     return new Promise(resolve => {
@@ -330,6 +363,18 @@ function describeError(error: unknown): string {
     return String(error);
 }
 
+function isLauncherExe(entry: DetectableExecutable): boolean {
+    return entry.is_launcher === true || entry.isLauncher === true;
+}
+
+function cleanExePath(raw: string): string {
+    return raw.replace(/^>/, "").trim();
+}
+
+/**
+ * Keeps verified detectable entries with a numeric snowflake ID and at least one non-empty
+ * win32 executable so Discord's backend recognizes each title for Game Time and Game Variety.
+ */
 function normalizeApps(raw: unknown): DetectableApp[] {
     if (!Array.isArray(raw)) return [];
     const seen = new Set<string>();
@@ -338,20 +383,26 @@ function normalizeApps(raw: unknown): DetectableApp[] {
     for (const item of raw) {
         if (item == null || typeof item !== "object") continue;
         const entry = item as { id?: unknown; name?: unknown; aliases?: unknown; executables?: unknown; };
-        if (typeof entry.id !== "string" || typeof entry.name !== "string") continue;
-        const name = entry.name.trim();
-        if (name === "" || seen.has(entry.id)) continue;
-        seen.add(entry.id);
+        const id = typeof entry.id === "string" ? entry.id.trim() : "";
+        const name = typeof entry.name === "string" ? entry.name.trim() : "";
+        if (!/^\d+$/.test(id) || name === "" || seen.has(id)) continue;
+        if (!Array.isArray(entry.executables)) continue;
+
+        const winExes = entry.executables.filter((exe): exe is DetectableExecutable =>
+            exe != null
+            && typeof exe === "object"
+            && (exe as DetectableExecutable).os === "win32"
+            && typeof (exe as DetectableExecutable).name === "string"
+            && cleanExePath((exe as DetectableExecutable).name) !== "");
+
+        if (winExes.length === 0) continue;
+        seen.add(id);
 
         const aliases = Array.isArray(entry.aliases)
             ? entry.aliases.filter((alias): alias is string => typeof alias === "string" && alias.trim() !== "")
             : undefined;
-        const executables = Array.isArray(entry.executables)
-            ? entry.executables.filter((exe): exe is DetectableExecutable =>
-                exe != null && typeof exe === "object" && typeof (exe as { name?: unknown; }).name === "string")
-            : undefined;
 
-        apps.push({ id: entry.id, name, aliases, executables });
+        apps.push({ id, name, aliases, executables: winExes });
     }
 
     return apps;
@@ -361,7 +412,19 @@ export function clearCatalogueCache(): void {
     cataloguePromise = null;
 }
 
-/** Loads Discord's detectable games, preferring the in-memory GameStore cache before HTTP. */
+async function fetchJsonWithTimeout(url: string): Promise<unknown> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CATALOGUE_TIMEOUT_MS);
+    try {
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json();
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/** Loads Discord's detectable Windows games, preferring GameStore before API and CDN fallbacks. */
 export function loadCatalogue(): Promise<DetectableApp[]> {
     try {
         const local = normalizeApps(GameStore?.games);
@@ -376,50 +439,45 @@ export function loadCatalogue(): Promise<DetectableApp[]> {
     if (cataloguePromise != null) return cataloguePromise;
 
     cataloguePromise = (async () => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), CATALOGUE_TIMEOUT_MS);
+        let lastErr: unknown = null;
+
         try {
-            const response = await fetch(DETECTABLE_APPS_URL, { signal: controller.signal });
-            if (!response.ok) throw new Error(`Discord answered with HTTP ${response.status}.`);
-            const data: unknown = await response.json();
-            const apps = normalizeApps(data);
-            if (apps.length === 0) throw new Error("Discord returned an empty game list.");
-            return apps;
+            const apiRes = await RestAPI.get({ url: "/applications/detectable" });
+            const apps = normalizeApps(apiRes?.body);
+            if (apps.length > 0) return apps;
         } catch (error) {
-            cataloguePromise = null;
-            throw new Error(describeError(error));
-        } finally {
-            clearTimeout(timer);
+            lastErr = error;
         }
+
+        const urls = [
+            `${apiOrigin()}/api/v10/applications/detectable`,
+            "https://cdn.discordapp.com/detectables/games.json"
+        ];
+        for (const url of urls) {
+            try {
+                const data = await fetchJsonWithTimeout(url);
+                const apps = normalizeApps(data);
+                if (apps.length > 0) return apps;
+            } catch (error) {
+                lastErr = error;
+            }
+        }
+        cataloguePromise = null;
+        throw new Error(describeError(lastErr ?? new Error("Discord returned an empty game list.")));
     })();
 
     return cataloguePromise;
 }
 
-function preferredOs(): string {
-    if (IS_WINDOWS) return "win32";
-    if (IS_MAC) return "darwin";
-    if (IS_LINUX) return "linux";
-    return "win32";
-}
-
-function isLauncherExe(entry: DetectableExecutable): boolean {
-    return entry.is_launcher === true || entry.isLauncher === true;
-}
-
+/** Preserves the exact relative executable path from Discord's catalog (for example "bin/win64/cs2.exe"). */
 export function executableFor(app: DetectableApp): string {
     const executables = app.executables ?? [];
-    const os = preferredOs();
-    const executable = executables.find(entry => entry.os === os && !isLauncherExe(entry))
-        ?? executables.find(entry => entry.os === "win32" && !isLauncherExe(entry))
-        ?? executables.find(entry => entry.os === os)
+    const pick = executables.find(entry => entry.os === "win32" && !isLauncherExe(entry))
         ?? executables.find(entry => entry.os === "win32")
-        ?? executables.find(entry => !isLauncherExe(entry))
         ?? executables[0];
 
-    const fallback = `${app.name.replace(/[<>:"/\\|?*]/g, "").trim() || "game"}.exe`;
-    const cleaned = executable?.name?.replace(/^>/, "").replace(/^.*[\\/]/, "").trim();
-    return cleaned && cleaned !== "" ? cleaned : fallback;
+    const cleaned = pick?.name ? cleanExePath(pick.name) : "";
+    return cleaned !== "" ? cleaned : "game.exe";
 }
 
 function specFor(app: DetectableApp): GameSpec {
@@ -434,6 +492,76 @@ export function shuffled<T>(items: readonly T[], count = items.length): T[] {
         [pool[index], pool[picked]] = [pool[picked], pool[index]];
     }
     return pool.slice(0, take);
+}
+
+async function loadUsedGames(userId: string): Promise<string[]> {
+    const mem = memoryUsedGames.get(userId);
+    if (mem != null) return mem;
+    try {
+        const stored = await DataStore.get<string[]>(`${USED_GAMES_KEY_PREFIX}${userId}`);
+        if (Array.isArray(stored)) {
+            memoryUsedGames.set(userId, stored);
+            return stored;
+        }
+    } catch {
+        // Ignore IndexedDB errors and keep in-memory state.
+    }
+    return [];
+}
+
+async function saveUsedGames(userId: string, used: string[]): Promise<void> {
+    const trimmed = used.slice(-15_000);
+    memoryUsedGames.set(userId, trimmed);
+    try {
+        await DataStore.set(`${USED_GAMES_KEY_PREFIX}${userId}`, trimmed);
+    } catch {
+        // Ignore IndexedDB errors.
+    }
+}
+
+/** Selects count unique games, preferring titles not yet claimed by this account and rotating when needed. */
+export async function selectFreshGames(apps: readonly DetectableApp[], count: number): Promise<DetectableApp[]> {
+    const desired = Math.min(Math.max(1, Math.floor(count)), apps.length);
+    const userId = UserStore?.getCurrentUser?.()?.id ?? "anon";
+    const usedList = await loadUsedGames(userId);
+    const usedSet = new Set(usedList);
+
+    const unused = shuffled(apps.filter(app => !usedSet.has(app.id)));
+    const chosen: DetectableApp[] = unused.slice(0, desired);
+
+    if (chosen.length < desired) {
+        const byId = new Map(apps.map(app => [app.id, app]));
+        const needed = desired - chosen.length;
+        const chosenIds = new Set(chosen.map(app => app.id));
+        const recycled: DetectableApp[] = [];
+        for (const gid of usedList) {
+            const found = byId.get(gid);
+            if (found != null && !chosenIds.has(found.id)) {
+                recycled.push(found);
+                if (recycled.length >= needed) break;
+            }
+        }
+        chosen.push(...recycled);
+        if (chosen.length < desired) {
+            for (const app of shuffled(apps)) {
+                if (!chosenIds.has(app.id) && !recycled.some(r => r.id === app.id)) {
+                    chosen.push(app);
+                    if (chosen.length >= desired) break;
+                }
+            }
+        }
+    }
+
+    return chosen;
+}
+
+async function recordUsedGames(gameIds: readonly string[]): Promise<void> {
+    if (gameIds.length === 0) return;
+    const userId = UserStore?.getCurrentUser?.()?.id ?? "anon";
+    const usedList = await loadUsedGames(userId);
+    const pickedSet = new Set(gameIds);
+    const nextUsed = [...usedList.filter(gid => !pickedSet.has(gid)), ...gameIds];
+    await saveUsedGames(userId, nextUsed);
 }
 
 function buildGame(app: GameSpec, startedAt: number): SpoofedGame {
@@ -471,7 +599,6 @@ function showGame(game: SpoofedGame | null): void {
     }
 }
 
-/** Hands out back-to-back slots within Discord's 24-hour window so shorter sessions do not overlap. */
 function nextSlotStart(durationMs: number): number {
     const now = Date.now();
     const floor = now - MAX_SESSION_MS;
@@ -533,7 +660,88 @@ async function withRetry(id: number, label: string, action: () => Promise<void>)
     return false;
 }
 
-async function runGameTime(id: number, app: GameSpec, targetHours: number, chunkHours: number): Promise<boolean> {
+/**
+ * Spreads targetHours across unique detectable Windows games (each <= 24h) so Discord's daily
+ * per-game aggregation cap never discards overlapping sessions on the same title.
+ */
+async function runSpreadGameTime(
+    id: number,
+    apps: readonly DetectableApp[],
+    targetHours: number,
+    hoursPerGame: number
+): Promise<boolean> {
+    const perGameHours = Math.min(Math.max(1, hoursPerGame), MAX_CHUNK_HOURS);
+    const perGameMs = Math.round(perGameHours * 3_600_000);
+    const maxAchievableHours = apps.length * perGameHours;
+    const effectiveTargetHours = Math.min(targetHours, maxAchievableHours);
+    const targetMs = Math.round(effectiveTargetHours * 3_600_000);
+    const gamesNeeded = Math.min(apps.length, Math.max(1, Math.ceil(targetMs / perGameMs)));
+
+    const pool = await selectFreshGames(apps, gamesNeeded);
+    if (!alive(id) || pool.length === 0) return false;
+
+    hoursTarget = effectiveTargetHours;
+    gamesTarget = pool.length;
+    notify();
+
+    let creditedMs = 0;
+    let failures = 0;
+
+    for (let offset = 0; offset < pool.length && alive(id) && targetMs - creditedMs >= MIN_DURATION_MS; offset += BATCH_SIZE) {
+        const slice = pool.slice(offset, offset + BATCH_SIZE);
+        const batch: PlaytimeSession[] = [];
+        let plannedMs = creditedMs;
+
+        for (const app of slice) {
+            const remaining = targetMs - plannedMs;
+            if (remaining < MIN_DURATION_MS) break;
+            const durationMs = Math.max(MIN_DURATION_MS, Math.min(perGameMs, remaining));
+            batch.push({ game: specFor(app), durationMs });
+            plannedMs += durationMs;
+        }
+
+        if (batch.length === 0) break;
+
+        showGame(buildGame(batch[0].game, Date.now()));
+        notify();
+
+        let batchMs = 0;
+        let batchGames = 0;
+        const ok = await withRetry(id, `Playtime batch (${batch.length} games)`, async () => {
+            const result = await creditPlaytimeBatch(batch);
+            batchMs = result.creditedMs;
+            batchGames = result.sessions;
+        });
+        if (!alive(id)) return false;
+
+        if (!ok) {
+            if (++failures >= MAX_FAILED_BATCHES) {
+                lastError = `Stopped after ${MAX_FAILED_BATCHES} failed batches in a row. Last error: ${lastError ?? "unknown"}`;
+                return false;
+            }
+            await wait(RETRY_DELAY_MS, runAbort?.signal);
+            offset -= BATCH_SIZE;
+            continue;
+        }
+
+        failures = 0;
+        await recordUsedGames(batch.map(entry => entry.game.id));
+        creditedMs += batchMs;
+        gamesCredited += batchGames;
+        hoursCredited = Math.min(creditedMs, targetMs) / 3_600_000;
+        if (lastError != null) lastError = null;
+        notify();
+
+        if (offset + BATCH_SIZE < pool.length && targetMs - creditedMs >= MIN_DURATION_MS) {
+            await wait(REQUEST_DELAY_MS, runAbort?.signal);
+        }
+    }
+
+    showGame(null);
+    return alive(id) && targetMs - creditedMs < MIN_DURATION_MS;
+}
+
+async function runSingleGameTime(id: number, app: GameSpec, targetHours: number, chunkHours: number): Promise<boolean> {
     const chunkMs = Math.min(Math.max(1, chunkHours), MAX_CHUNK_HOURS) * 3_600_000;
     const targetMs = Math.round(targetHours * 3_600_000);
     let creditedMs = 0;
@@ -572,6 +780,7 @@ async function runGameTime(id: number, app: GameSpec, targetHours: number, chunk
                 lastError = `Stopped after ${MAX_FAILED_BATCHES} failed requests in a row. Last error: ${lastError ?? "unknown"}`;
                 return false;
             }
+            await wait(RETRY_DELAY_MS, runAbort?.signal);
             continue;
         }
 
@@ -586,6 +795,7 @@ async function runGameTime(id: number, app: GameSpec, targetHours: number, chunk
         }
     }
 
+    showGame(null);
     return alive(id) && targetMs - creditedMs < MIN_DURATION_MS;
 }
 
@@ -630,10 +840,13 @@ async function runVariety(id: number, apps: DetectableApp[], minutesPerGame: num
                 lastError = `Stopped after ${MAX_FAILED_BATCHES} failed batches in a row. Last error: ${lastError ?? "unknown"}`;
                 return false;
             }
+            await wait(RETRY_DELAY_MS, runAbort?.signal);
+            offset -= BATCH_SIZE;
             continue;
         }
 
         failures = 0;
+        await recordUsedGames(specs.map(spec => spec.id));
         gamesCredited += sentCount;
         if (lastError != null) lastError = null;
         notify();
@@ -799,7 +1012,6 @@ async function fetchRawSources(types: string[]): Promise<RawDesktopSource[]> {
     const engine = MediaEngineStore?.getMediaEngine?.();
     if (engine == null || typeof getDesktopSources !== "function") return [];
 
-    // Try Discord's current 4-argument signature first, then fall back to the 3-argument signature.
     try {
         const list = getDesktopSources.length === 3
             ? await getDesktopSources(engine, types, null)
@@ -867,7 +1079,6 @@ async function goLive(id: number, channel: Channel, config: StreamFarmConfig): P
             previewDisabled: lowPower
         });
 
-        // Keep polling after Stop so a late stream gets ended instead of staying live.
         const deadline = Date.now() + STREAM_START_TIMEOUT_MS;
         while (Date.now() < deadline) {
             await wait(500);
@@ -964,14 +1175,12 @@ async function runStream(id: number, targetHours: number, config: StreamFarmConf
             continue;
         }
 
-        // Adopt the active stream so stopping or finishing dispatches STREAM_STOP and flushes video_stream_ended.
         ownsStream = true;
         if (config.lowPower !== false && savedStreamSettings == null) {
             applyLowPowerStreamSettings();
         }
         keepStreamUnpaused(live.key);
 
-        // Clamp delta so OS sleep/wake jumps cannot fabricate fake stream hours.
         const delta = Math.min(Math.max(0, now - lastTick), MAX_TICK_DELTA_MS);
         lastTick = now;
         streamViewers = live.viewers;
@@ -1105,42 +1314,85 @@ function markFinished(message: string): void {
     }
 }
 
-export async function startGameTime(app: DetectableApp, hours = ETERNAL_HOURS, chunkHours = DEFAULT_CHUNK_HOURS): Promise<void> {
-    if (app == null || typeof app.id !== "string" || typeof app.name !== "string") {
-        lastError = "Pick a valid game before starting.";
-        notify();
-        return;
-    }
-    const safeHours = Number.isFinite(hours) ? Math.min(Math.max(0.1, hours), MAX_TARGET_HOURS) : ETERNAL_HOURS;
-    const safeChunk = Number.isFinite(chunkHours) ? Math.min(Math.max(1, Math.floor(chunkHours)), MAX_CHUNK_HOURS) : DEFAULT_CHUNK_HOURS;
-    const id = begin("GAME_TIME");
-    if (id == null) return;
-    try {
-        const completed = await runGameTime(id, specFor(app), safeHours, safeChunk);
-        if (completed) {
-            markFinished(`Sent ${Math.round(hoursCredited).toLocaleString()} hours of ${app.name}. Discord updates badges overnight.`);
-        }
-    } catch (error) {
-        lastError = describeError(error);
-        logger.error("Game Time run crashed", error);
-    } finally {
-        end(id);
-    }
-}
-
-export async function startVariety(apps: DetectableApp[], minutesPerGame = DEFAULT_VARIETY_MINUTES): Promise<void> {
+export async function startSpreadGameTime(
+    apps: readonly DetectableApp[],
+    hours = ETERNAL_HOURS,
+    hoursPerGame = DEFAULT_HOURS_PER_GAME
+): Promise<void> {
     if (!Array.isArray(apps) || apps.length === 0) {
         lastError = "Game catalog is empty. Reload the list and try again.";
         notify();
         return;
     }
+    const safeHours = Number.isFinite(hours) ? Math.min(Math.max(1, hours), MAX_TARGET_HOURS) : ETERNAL_HOURS;
+    const safePerGame = Number.isFinite(hoursPerGame)
+        ? Math.min(Math.max(1, Math.floor(hoursPerGame)), MAX_CHUNK_HOURS)
+        : DEFAULT_HOURS_PER_GAME;
+
+    const id = begin("GAME_TIME");
+    if (id == null) return;
+    try {
+        const completed = await runSpreadGameTime(id, apps, safeHours, safePerGame);
+        if (completed) {
+            markFinished(
+                `Sent ${Math.round(hoursCredited).toLocaleString()} hours across ${gamesCredited.toLocaleString()} Windows games. Discord syncs badges in 24 to 48 hours.`
+            );
+        }
+    } catch (error) {
+        lastError = describeError(error);
+        logger.error("Spread Game Time run crashed", error);
+    } finally {
+        end(id);
+    }
+}
+
+export async function startSingleGameTime(
+    app: DetectableApp,
+    hours = DEFAULT_SINGLE_GAME_HOURS,
+    chunkHours = MAX_CHUNK_HOURS
+): Promise<void> {
+    if (app == null || typeof app.id !== "string" || typeof app.name !== "string") {
+        lastError = "Pick a valid game before starting.";
+        notify();
+        return;
+    }
+    const safeHours = Number.isFinite(hours) ? Math.min(Math.max(0.1, hours), MAX_TARGET_HOURS) : DEFAULT_SINGLE_GAME_HOURS;
+    const safeChunk = Number.isFinite(chunkHours) ? Math.min(Math.max(1, Math.floor(chunkHours)), MAX_CHUNK_HOURS) : MAX_CHUNK_HOURS;
+    const id = begin("GAME_TIME");
+    if (id == null) return;
+    try {
+        const completed = await runSingleGameTime(id, specFor(app), safeHours, safeChunk);
+        if (completed) {
+            markFinished(`Sent ${Math.round(hoursCredited).toLocaleString()} hours of ${app.name}. Discord syncs badges in 24 to 48 hours.`);
+        }
+    } catch (error) {
+        lastError = describeError(error);
+        logger.error("Single Game Time run crashed", error);
+    } finally {
+        end(id);
+    }
+}
+
+export async function startVariety(
+    apps: readonly DetectableApp[],
+    count = UNIVERSALIST_GAMES,
+    minutesPerGame = DEFAULT_VARIETY_MINUTES
+): Promise<void> {
+    if (!Array.isArray(apps) || apps.length === 0) {
+        lastError = "Game catalog is empty. Reload the list and try again.";
+        notify();
+        return;
+    }
+    const safeCount = Number.isFinite(count) ? Math.min(Math.max(1, Math.floor(count)), apps.length) : UNIVERSALIST_GAMES;
     const safeMinutes = Number.isFinite(minutesPerGame) ? Math.min(Math.max(1, minutesPerGame), 1_440) : DEFAULT_VARIETY_MINUTES;
     const id = begin("VARIETY");
     if (id == null) return;
     try {
-        const completed = await runVariety(id, apps, safeMinutes);
+        const pool = await selectFreshGames(apps, safeCount);
+        if (!alive(id) || pool.length === 0) return;
+        const completed = await runVariety(id, pool, safeMinutes);
         if (completed) {
-            markFinished(`Sent sessions for ${gamesCredited} games. Discord updates badges overnight.`);
+            markFinished(`Sent sessions for ${gamesCredited} unique Windows games. Discord syncs badges in 24 to 48 hours.`);
         }
     } catch (error) {
         lastError = describeError(error);
@@ -1187,7 +1439,7 @@ export async function startViewerWatch(): Promise<void> {
     }
 }
 
-export async function maxAll(apps: DetectableApp[], config: StreamFarmConfig = {}): Promise<void> {
+export async function maxAll(apps: readonly DetectableApp[], config: StreamFarmConfig = {}): Promise<void> {
     if (!Array.isArray(apps) || apps.length === 0) {
         lastError = "Game catalog is not ready yet. Wait for it to finish loading.";
         notify();
@@ -1196,22 +1448,14 @@ export async function maxAll(apps: DetectableApp[], config: StreamFarmConfig = {
     const id = begin("MAX_ALL");
     if (id == null) return;
     try {
-        const pool = shuffled(apps, UNIVERSALIST_GAMES);
-        if (pool.length === 0) {
-            lastError = "Could not pick games from the catalog.";
-            return;
-        }
+        // 250 unique games × 20h = 5,000h, unlocking both Universalist (100+ games) and Eternal (5,000h) in one pass.
+        const ok = await runSpreadGameTime(id, apps, ETERNAL_HOURS, DEFAULT_HOURS_PER_GAME);
+        if (!ok || !alive(id)) return;
 
-        const varietyOk = await runVariety(id, pool, DEFAULT_VARIETY_MINUTES);
-        if (!varietyOk || !alive(id)) return;
-
-        const timeOk = await runGameTime(id, specFor(pool[0]), ETERNAL_HOURS, DEFAULT_CHUNK_HOURS);
-        if (!timeOk || !alive(id)) return;
-
-        const summary = `${gamesCredited} games and ${Math.round(hoursCredited).toLocaleString()} hours of ${pool[0].name}`;
+        const summary = `${Math.round(hoursCredited).toLocaleString()} hours across ${gamesCredited} unique games`;
 
         if (voiceProblem(currentVoiceChannel(), true) != null || getNoTrackStreamState() !== "ok") {
-            markFinished(`Sent ${summary}. Join a voice channel and run Streaming on its own for the third badge.`);
+            markFinished(`Sent ${summary} (Eternal + Universalist). Join a voice channel and run Streaming for Phenomenon.`);
             return;
         }
 

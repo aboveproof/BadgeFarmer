@@ -6,18 +6,19 @@
 
 import "./styles.css";
 
-import { HeaderBarButton } from "@api/HeaderBar";
 import { definePluginSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
+import { classes } from "@utils/misc";
 import { useForceUpdater } from "@utils/react";
 import definePlugin, { OptionType } from "@utils/types";
-import { onceReady } from "@webpack";
-import { FluxDispatcher, useEffect, UserStore } from "@webpack/common";
+import { findCssClassesLazy, onceReady } from "@webpack";
+import { Clickable, FluxDispatcher, Tooltip, useEffect, UserStore } from "@webpack/common";
 
 import { endOwnedStream, getStatus, loadCatalogue, maxAll, stop as stopFarmer, subscribe } from "./farmer";
 import { BadgeFarmerDashboard, BadgeIcon, closeBadgeFarmerModal, openBadgeFarmerModal } from "./ui";
 
 const logger = new Logger("BadgeFarmer");
+const HeaderBarClasses = findCssClassesLazy("clickable", "selected", "badge", "badgeContainer");
 
 let enabled = false;
 let pendingConnectionHandler: (() => void) | null = null;
@@ -34,7 +35,7 @@ const settings = definePluginSettings({
     },
     headerButton: {
         type: OptionType.BOOLEAN,
-        description: "Show a badge button in the top right header bar",
+        description: "Show a badge button in the top right header bar (Equicord)",
         default: true
     },
     autoStartMaxAll: {
@@ -66,16 +67,38 @@ function HeaderBadgeButton() {
 
     if (!headerButton) return null;
 
+    const label = busy ? "Badge Farmer (Running)" : "Badge Farmer";
+    const className = classes("vc-badge-farmer-header-btn", busy && "vc-badge-farmer-header-btn-busy");
+
     return (
-        <HeaderBarButton
-            className={`vc-badge-farmer-header-btn ${busy ? "vc-badge-farmer-header-btn-busy" : ""}`}
-            onClick={() => openBadgeFarmerModal()}
-            tooltip={busy ? "Badge Farmer (Running)" : "Badge Farmer"}
-            icon={BadgeIcon}
-            selected={busy}
-        />
+        <Tooltip text={label} position="bottom">
+            {({ onMouseEnter, onMouseLeave }) => (
+                <Clickable
+                    className={classes(HeaderBarClasses?.clickable, className)}
+                    style={{ width: 24, height: 24, boxSizing: "content-box", justifyContent: "center" }}
+                    onClick={() => openBadgeFarmerModal()}
+                    onMouseEnter={onMouseEnter}
+                    onMouseLeave={onMouseLeave}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={label}
+                    aria-expanded={busy}
+                >
+                    <BadgeIcon width={18} height={18} />
+                </Clickable>
+            )}
+        </Tooltip>
     );
 }
+
+// Spread onto definePlugin so upstream Vencord compiles without Equicord's HeaderBarAPI types.
+const equicordHeaderBar = {
+    headerBarButton: {
+        icon: BadgeIcon,
+        render: HeaderBadgeButton,
+        priority: 50
+    }
+};
 
 export default definePlugin({
     name: "BadgeFarmer",
@@ -86,14 +109,15 @@ export default definePlugin({
     }],
     tags: ["Activity", "Customisation", "Utility"],
     searchTerms: ["badges", "farm", "game time", "game variety", "streaming"],
-    dependencies: ["HeaderBarAPI"],
     settings,
 
-    headerBarButton: {
-        icon: BadgeIcon,
-        render: HeaderBadgeButton,
-        priority: 50
+    toolboxActions: {
+        "Open Badge Farmer"() {
+            openBadgeFarmerModal();
+        }
     },
+
+    ...equicordHeaderBar,
 
     start() {
         enabled = true;
