@@ -13,12 +13,10 @@ import { Logger } from "@utils/Logger";
 import type { ApplicationStream, Channel, FluxStore, ProfileBadge, RunningGame } from "@vencord/discord-types";
 import { filters, findAll } from "@webpack";
 import {
-    ApplicationStreamingSettingsStore,
     ApplicationStreamingStore,
     ChannelStore,
     Constants,
     FluxDispatcher,
-    GameStore,
     MediaEngineStore,
     PermissionsBits,
     PermissionStore,
@@ -159,6 +157,38 @@ function resolveWatchStream(): ((stream: ApplicationStream | string, allowMultip
 
 function resolveGetDesktopSources(): (GetDesktopSources4 & GetDesktopSources3) | undefined {
     return findAll(filters.byCode("desktop sources"))[0];
+}
+
+interface GameStoreShape {
+    games?: unknown;
+    getState?(): {
+        blocklistExecutables?: unknown;
+        blocklistPatterns?: unknown;
+    };
+}
+
+interface StreamingSettingsStoreShape {
+    getState?(): {
+        preset: number;
+        resolution: number;
+        fps: number;
+    };
+}
+
+function getGameStore(): GameStoreShape | null {
+    try {
+        return (findAll(filters.byStoreName("GameStore"))[0] as GameStoreShape | undefined) ?? null;
+    } catch {
+        return null;
+    }
+}
+
+function getStreamingSettingsStore(): StreamingSettingsStoreShape | null {
+    try {
+        return (findAll(filters.byStoreName("ApplicationStreamingSettingsStore"))[0] as StreamingSettingsStoreShape | undefined) ?? null;
+    } catch {
+        return null;
+    }
 }
 
 export function getBadgeDirectoryStore(): BadgeDirectoryStoreShape | null {
@@ -926,7 +956,7 @@ function readExecutableBlocklist(): { exact: Set<string>; patterns: RegExp[]; } 
     const exact = new Set<string>();
     const patterns: RegExp[] = [];
     try {
-        const state = GameStore?.getState?.();
+        const state = getGameStore()?.getState?.();
         if (Array.isArray(state?.blocklistExecutables)) {
             for (const exe of state.blocklistExecutables) {
                 if (typeof exe === "string" && exe !== "") exact.add(exe.toLowerCase());
@@ -1013,7 +1043,7 @@ async function fetchJsonWithTimeout(url: string): Promise<unknown> {
 /** Loads Discord's detectable Windows games, preferring GameStore before API and CDN fallbacks. */
 export function loadCatalogue(): Promise<DetectableApp[]> {
     try {
-        const local = normalizeApps(GameStore?.games);
+        const local = normalizeApps(getGameStore()?.games);
         if (local.length > 0) {
             cataloguePromise = Promise.resolve(local);
             return cataloguePromise;
@@ -1579,7 +1609,7 @@ function keepStreamUnpaused(streamKey: string): void {
 function applyLowPowerStreamSettings(): void {
     if (savedStreamSettings != null) return;
     try {
-        const state = ApplicationStreamingSettingsStore?.getState?.();
+        const state = getStreamingSettingsStore()?.getState?.();
         if (state != null) {
             savedStreamSettings = {
                 preset: state.preset,
