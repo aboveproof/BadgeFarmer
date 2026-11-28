@@ -21,6 +21,7 @@ import {
     PermissionStore,
     RestAPI,
     RTCConnectionStore,
+    RunningGameStore,
     SelectedChannelStore,
     showToast,
     UserProfileStore,
@@ -28,6 +29,17 @@ import {
     VoiceStateStore
 } from "@webpack/common";
 
+import {
+    type BadgeTier,
+    type BadgeTrack,
+    nextTierFor,
+    parseProfileBadges,
+    reachedTierIndex,
+    tierIconUrl,
+    TIME_TIERS,
+    TRACK_TIERS,
+    VARIETY_TIERS
+} from "./badges";
 import {
     apiOrigin,
     creditPlaytimeBatch,
@@ -42,7 +54,8 @@ import {
 const logger = new Logger("BadgeFarmer");
 
 const CATALOGUE_TIMEOUT_MS = 20_000;
-const USED_GAMES_KEY_PREFIX = "BadgeFarmer_usedGames_v1_";
+const LEGACY_USED_GAMES_PREFIX = "BadgeFarmer_usedGames_v1_";
+const LEDGER_KEY_PREFIX = "BadgeFarmer_ledger_v2_";
 
 const PRESET_CUSTOM = 3;
 const LOW_POWER_RESOLUTION = 480;
@@ -58,6 +71,7 @@ export interface StreamFarmConfig {
     sourceId?: string;
     lowPower?: boolean;
     checkpoint?: boolean;
+    subtractExisting?: boolean;
 }
 
 interface StreamOptions {
@@ -73,6 +87,43 @@ interface SavedStreamSettings {
     preset: number;
     resolution: number;
     fps: number;
+}
+
+interface StoredProgressLedger {
+    gameHours: number;
+    varietyGames: number;
+    streamMs: number;
+    claimedGameIds: string[];
+    manualTimeHours: number | null;
+    manualVarietyGames: number | null;
+    manualStreamHours: number | null;
+    dailySingleGame: Record<string, Record<string, number>>;
+}
+
+export interface TrackProgress {
+    track: BadgeTrack;
+    profileTierIndex: number;
+    profileTier: BadgeTier | null;
+    profileFloor: number;
+    clientSeenGames: number;
+    trackedTotal: number;
+    manualBaseline: number | null;
+    current: number;
+    pendingSync: number;
+    currentTierIndex: number;
+    currentTier: BadgeTier | null;
+    nextTier: BadgeTier | null;
+    iconUrl: string;
+}
+
+export interface AccountProgress {
+    userId: string | null;
+    syncedAt: number | null;
+    loading: boolean;
+    time: TrackProgress;
+    variety: TrackProgress;
+    stream: TrackProgress;
+    otherBadges: ProfileBadge[];
 }
 
 type RawDesktopSource = { id?: unknown; name?: unknown; };
@@ -144,8 +195,8 @@ export interface VoiceReadiness {
 
 export type NoTrackStreamState = "ok" | "disabled_in_settings" | "needs_restart";
 
-export const ETERNAL_HOURS = 5_000;
-export const UNIVERSALIST_GAMES = 100;
+export const ETERNAL_HOURS = TIME_TIERS[TIME_TIERS.length - 1].at;
+export const UNIVERSALIST_GAMES = VARIETY_TIERS[VARIETY_TIERS.length - 1].at;
 export const MAX_TARGET_HOURS = 1_000_000;
 export const MAX_CHUNK_HOURS = 24;
 export const DEFAULT_HOURS_PER_GAME = 20;
@@ -158,7 +209,6 @@ const RETRY_DELAY_MS = 3_000;
 const MAX_RATE_LIMIT_WAIT_MS = 30_000;
 const MAX_FAILED_BATCHES = 5;
 
-// Stays well inside Discord's 10-hour continuous stream session cap when checkpointing is on.
 const STREAM_CHECKPOINT_MS = 2 * 60 * 60 * 1_000;
 const STREAM_REJOIN_GAP_MS = 2_500;
 const STREAM_TICK_MS = 8_000;
@@ -166,6 +216,8 @@ const VIEWER_TICK_MS = 4_000;
 const MAX_TICK_DELTA_MS = STREAM_TICK_MS * 3;
 const STREAM_START_TIMEOUT_MS = 10_000;
 const STREAM_RESTART_LIMIT = 4;
+const VOICE_RECONNECT_GRACE_MS = 30_000;
+const STREAM_SAVE_INTERVAL_MS = 24_000;
 
 /** Compact browser console snippet users can paste on an unmodded alt tab to auto-watch and stay unpaused 24/7. */
 export const ALT_WATCH_SNIPPET = `(() => {
@@ -222,12 +274,30 @@ let runId = 0;
 let runAbort: AbortController | null = null;
 let cursor = 0;
 let ownsStream = false;
+let dispatchedDebugPresence = false;
+let showSpoofedPresence = false;
 let savedStreamSettings: SavedStreamSettings | null = null;
 
 let cataloguePromise: Promise<DetectableApp[]> | null = null;
-const memoryUsedGames = new Map<string, string[]>();
+const memoryLedgers = new Map<string, StoredProgressLedger>();
+let cachedProfileUserId: string | null = null;
+let cachedRawBadges: ProfileBadge[] = [];
+let cachedSyncedAt: number | null = null;
+let progressLoading = false;
 
 const listeners = new Set<() => void>();
+
+export function setShowSpoofedPresence(show: boolean): void {
+    showSpoofedPresence = show;
+    if (!show && dispatchedDebugPresence) {
+        dispatchedDebugPresence = false;
+        try {
+            FluxDispatcher.dispatch({ type: "RUNNING_GAME_SET_DEBUG_GAME", game: null });
+        } catch {
+            // Ignore cleanup errors.
+        }
+    }
+}
 
 export function subscribe(listener: () => void): () => void {
     listeners.add(listener);
@@ -302,29 +372,287 @@ export function enableNoTrackBadgeTracking(): boolean {
     }
 }
 
-export async function fetchMyBadges(forceNetwork = false): Promise<ProfileBadge[]> {
-    const userId = UserStore?.getCurrentUser?.()?.id;
-    if (userId == null) return [];
+function emptyLedger(): StoredProgressLedger {
+    return {
+        gameHours: 0,
+        varietyGames: 0,
+        streamMs: 0,
+        claimedGameIds: [],
+        manualTimeHours: null,
+        manualVarietyGames: null,
+        manualStreamHours: null,
+        dailySingleGame: {}
+    };
+}
 
-    if (!forceNetwork) {
-        try {
-            const cached = UserProfileStore?.getUserProfile?.(userId)?.badges;
-            if (Array.isArray(cached) && cached.length > 0) return cached;
-        } catch {
-            // Fall through to REST query.
+function utcDayKey(): string {
+    return new Date().toISOString().slice(0, 10);
+}
+
+function sanitizeLedger(raw: unknown): StoredProgressLedger {
+    if (raw == null || typeof raw !== "object") return emptyLedger();
+    const obj = raw as Partial<StoredProgressLedger>;
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0);
+    const optNum = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null);
+
+    const claimed = Array.isArray(obj.claimedGameIds)
+        ? obj.claimedGameIds.filter((id): id is string => typeof id === "string" && /^\d+$/.test(id))
+        : [];
+
+    const today = utcDayKey();
+    const daily: Record<string, Record<string, number>> = {};
+    if (obj.dailySingleGame != null && typeof obj.dailySingleGame === "object") {
+        const todayBucket = (obj.dailySingleGame as Record<string, unknown>)[today];
+        if (todayBucket != null && typeof todayBucket === "object") {
+            const cleanBucket: Record<string, number> = {};
+            for (const [gid, hrs] of Object.entries(todayBucket as Record<string, unknown>)) {
+                if (/^\d+$/.test(gid) && typeof hrs === "number" && Number.isFinite(hrs) && hrs > 0) {
+                    cleanBucket[gid] = hrs;
+                }
+            }
+            daily[today] = cleanBucket;
         }
     }
 
+    return {
+        gameHours: num(obj.gameHours),
+        varietyGames: Math.max(num(obj.varietyGames), claimed.length),
+        streamMs: num(obj.streamMs),
+        claimedGameIds: claimed.slice(-15_000),
+        manualTimeHours: optNum(obj.manualTimeHours),
+        manualVarietyGames: optNum(obj.manualVarietyGames),
+        manualStreamHours: optNum(obj.manualStreamHours),
+        dailySingleGame: daily
+    };
+}
+
+async function ensureLedger(userId: string): Promise<StoredProgressLedger> {
+    const existing = memoryLedgers.get(userId);
+    if (existing != null) return existing;
+
+    let ledger = emptyLedger();
     try {
-        const res = await RestAPI.get({
-            url: `/users/${userId}/profile`,
-            query: { with_mutual_guilds: false, with_mutual_friends_count: false }
-        });
-        const badges = (res?.body as { badges?: unknown; } | undefined)?.badges;
-        return Array.isArray(badges) ? badges as ProfileBadge[] : [];
+        const stored = await DataStore.get<unknown>(`${LEDGER_KEY_PREFIX}${userId}`);
+        if (stored != null) {
+            ledger = sanitizeLedger(stored);
+        } else {
+            const legacyUsed = await DataStore.get<unknown>(`${LEGACY_USED_GAMES_PREFIX}${userId}`);
+            if (Array.isArray(legacyUsed)) {
+                const validIds = legacyUsed.filter((id): id is string => typeof id === "string" && /^\d+$/.test(id));
+                ledger.claimedGameIds = validIds.slice(-15_000);
+                ledger.varietyGames = ledger.claimedGameIds.length;
+            }
+        }
     } catch {
-        return [];
+        // Keep in-memory ledger if IndexedDB fails.
     }
+
+    memoryLedgers.set(userId, ledger);
+    return ledger;
+}
+
+async function persistLedger(userId: string, ledger: StoredProgressLedger): Promise<void> {
+    ledger.claimedGameIds = ledger.claimedGameIds.slice(-15_000);
+    memoryLedgers.set(userId, ledger);
+    try {
+        await DataStore.set(`${LEDGER_KEY_PREFIX}${userId}`, ledger);
+    } catch {
+        // Ignore IndexedDB errors.
+    }
+}
+
+function persistLedgerSync(userId: string, ledger: StoredProgressLedger): void {
+    ledger.claimedGameIds = ledger.claimedGameIds.slice(-15_000);
+    memoryLedgers.set(userId, ledger);
+    void DataStore.set(`${LEDGER_KEY_PREFIX}${userId}`, ledger).catch(() => undefined);
+}
+
+/** Reads verified numeric game IDs Discord has already detected locally in RunningGameStore. */
+export function getClientSeenGameIds(): Set<string> {
+    const ids = new Set<string>();
+    try {
+        const seen = RunningGameStore?.getGamesSeen?.(true) ?? [];
+        const runningGames = RunningGameStore?.getRunningGames?.() ?? [];
+        for (const item of [...(Array.isArray(seen) ? seen : []), ...(Array.isArray(runningGames) ? runningGames : [])]) {
+            if (item != null && !item.isLauncher && typeof item.id === "string" && /^\d+$/.test(item.id)) {
+                ids.add(item.id);
+            }
+        }
+    } catch {
+        // Ignore store access errors.
+    }
+    return ids;
+}
+
+function buildTrackProgress(
+    track: BadgeTrack,
+    parsedBadges: ReturnType<typeof parseProfileBadges>,
+    ledger: StoredProgressLedger,
+    clientSeenCount: number
+): TrackProgress {
+    const tiers = TRACK_TIERS[track];
+    const detected = parsedBadges.tracks[track];
+    const profileTierIndex = detected?.tierIndex ?? -1;
+    const profileTier = detected?.tier ?? null;
+    const profileFloor = detected?.parsedFloor ?? 0;
+
+    const seenFloor = track === "variety" ? clientSeenCount : 0;
+    const trackedTotal = track === "time"
+        ? ledger.gameHours
+        : track === "variety"
+            ? Math.max(ledger.varietyGames, ledger.claimedGameIds.length)
+            : ledger.streamMs / 3_600_000;
+    const manualBaseline = track === "time"
+        ? ledger.manualTimeHours
+        : track === "variety"
+            ? ledger.manualVarietyGames
+            : ledger.manualStreamHours;
+
+    const rawCurrent = Math.max(profileFloor, seenFloor, trackedTotal, manualBaseline ?? 0);
+    const current = track === "variety"
+        ? Math.floor(rawCurrent)
+        : Math.round(rawCurrent * 10) / 10;
+
+    const baselineFloor = Math.max(profileFloor, seenFloor, manualBaseline ?? 0);
+    const rawPending = Math.max(0, trackedTotal - baselineFloor);
+    const pendingSync = track === "variety"
+        ? Math.floor(rawPending)
+        : Math.round(rawPending * 10) / 10;
+
+    const currentTierIndex = reachedTierIndex(current, tiers);
+    const currentTier = currentTierIndex >= 0 ? tiers[currentTierIndex] : null;
+    const nextTier = nextTierFor(current, tiers);
+    const iconUrl = detected?.iconUrl ?? tierIconUrl(currentTier ?? tiers[0]);
+
+    return {
+        track,
+        profileTierIndex,
+        profileTier,
+        profileFloor,
+        clientSeenGames: seenFloor,
+        trackedTotal,
+        manualBaseline,
+        current,
+        pendingSync,
+        currentTierIndex,
+        currentTier,
+        nextTier,
+        iconUrl
+    };
+}
+
+export function getAccountProgress(): AccountProgress {
+    const userId = UserStore?.getCurrentUser?.()?.id ?? null;
+    if (userId != null && cachedProfileUserId !== userId) {
+        try {
+            const storeBadges = UserProfileStore?.getUserProfile?.(userId)?.badges;
+            if (Array.isArray(storeBadges)) {
+                cachedProfileUserId = userId;
+                cachedRawBadges = storeBadges;
+            }
+        } catch {
+            // Ignore store lookup failures.
+        }
+    }
+
+    const ledger = userId != null ? (memoryLedgers.get(userId) ?? emptyLedger()) : emptyLedger();
+    const clientSeenIds = getClientSeenGameIds();
+    const unionVarietyIds = new Set<string>([...clientSeenIds, ...ledger.claimedGameIds]);
+    const parsed = parseProfileBadges(cachedProfileUserId === userId ? cachedRawBadges : []);
+
+    return {
+        userId,
+        syncedAt: cachedProfileUserId === userId ? cachedSyncedAt : null,
+        loading: progressLoading,
+        time: buildTrackProgress("time", parsed, ledger, 0),
+        variety: buildTrackProgress("variety", parsed, ledger, unionVarietyIds.size),
+        stream: buildTrackProgress("stream", parsed, ledger, 0),
+        otherBadges: parsed.otherBadges
+    };
+}
+
+export function getTodaySingleGameHours(gameId: string): number {
+    const userId = UserStore?.getCurrentUser?.()?.id;
+    if (userId == null) return 0;
+    const ledger = memoryLedgers.get(userId);
+    if (ledger == null) return 0;
+    const hours = ledger.dailySingleGame[utcDayKey()]?.[gameId] ?? 0;
+    return Math.round(hours * 10) / 10;
+}
+
+export async function syncAccountProgress(forceNetwork = false): Promise<AccountProgress> {
+    const userId = UserStore?.getCurrentUser?.()?.id ?? null;
+    if (userId == null) return getAccountProgress();
+
+    progressLoading = true;
+    notify();
+
+    try {
+        await ensureLedger(userId);
+
+        let badges: ProfileBadge[] | null = null;
+        if (!forceNetwork) {
+            try {
+                const cached = UserProfileStore?.getUserProfile?.(userId)?.badges;
+                if (Array.isArray(cached) && cached.length > 0) badges = cached;
+            } catch {
+                // Fall through to REST fetch.
+            }
+        }
+
+        if (badges == null) {
+            try {
+                const res = await RestAPI.get({
+                    url: `/users/${userId}/profile`,
+                    query: { with_mutual_guilds: false, with_mutual_friends_count: false }
+                });
+                const raw = (res?.body as { badges?: unknown; } | undefined)?.badges;
+                if (Array.isArray(raw)) badges = raw as ProfileBadge[];
+            } catch (error) {
+                logger.warn("Could not fetch profile badges", error);
+            }
+        }
+
+        if (badges != null) {
+            cachedProfileUserId = userId;
+            cachedRawBadges = badges;
+            cachedSyncedAt = Date.now();
+        }
+    } finally {
+        progressLoading = false;
+        notify();
+    }
+
+    return getAccountProgress();
+}
+
+export async function updateManualBaselines(baselines: {
+    timeHours?: number | null;
+    varietyGames?: number | null;
+    streamHours?: number | null;
+}): Promise<void> {
+    const userId = UserStore?.getCurrentUser?.()?.id;
+    if (userId == null) return;
+    const ledger = await ensureLedger(userId);
+    if (baselines.timeHours !== undefined) ledger.manualTimeHours = baselines.timeHours;
+    if (baselines.varietyGames !== undefined) ledger.manualVarietyGames = baselines.varietyGames;
+    if (baselines.streamHours !== undefined) ledger.manualStreamHours = baselines.streamHours;
+    await persistLedger(userId, ledger);
+    notify();
+}
+
+export async function resetLocalProgressCache(): Promise<void> {
+    const userId = UserStore?.getCurrentUser?.()?.id;
+    if (userId == null) return;
+    const clean = emptyLedger();
+    memoryLedgers.set(userId, clean);
+    try {
+        await DataStore.del(`${LEDGER_KEY_PREFIX}${userId}`);
+        await DataStore.del(`${LEGACY_USED_GAMES_PREFIX}${userId}`);
+    } catch {
+        // Ignore IndexedDB errors.
+    }
+    notify();
 }
 
 function wait(ms: number, signal?: AbortSignal): Promise<void> {
@@ -371,12 +699,46 @@ function cleanExePath(raw: string): string {
     return raw.replace(/^>/, "").trim();
 }
 
+function readExecutableBlocklist(): { exact: Set<string>; patterns: RegExp[]; } {
+    const exact = new Set<string>();
+    const patterns: RegExp[] = [];
+    try {
+        const state = GameStore?.getState?.();
+        if (Array.isArray(state?.blocklistExecutables)) {
+            for (const exe of state.blocklistExecutables) {
+                if (typeof exe === "string" && exe !== "") exact.add(exe.toLowerCase());
+            }
+        }
+        if (Array.isArray(state?.blocklistPatterns)) {
+            for (const pat of state.blocklistPatterns) {
+                if (typeof pat !== "string" || pat === "") continue;
+                try {
+                    patterns.push(new RegExp(pat, "i"));
+                } catch {
+                    // Ignore malformed regex entries.
+                }
+            }
+        }
+    } catch {
+        // Ignore GameStore state read failures.
+    }
+    return { exact, patterns };
+}
+
+function isBlockedExe(exePath: string, blocklist: { exact: Set<string>; patterns: RegExp[]; }): boolean {
+    const lower = exePath.toLowerCase();
+    const baseName = lower.replace(/^.*[\\/]/, "");
+    if (blocklist.exact.has(lower) || blocklist.exact.has(baseName)) return true;
+    return blocklist.patterns.some(rx => rx.test(exePath));
+}
+
 /**
- * Keeps verified detectable entries with a numeric snowflake ID and at least one non-empty
+ * Keeps verified detectable entries with a numeric snowflake ID and at least one non-blocked
  * win32 executable so Discord's backend recognizes each title for Game Time and Game Variety.
  */
 function normalizeApps(raw: unknown): DetectableApp[] {
     if (!Array.isArray(raw)) return [];
+    const blocklist = readExecutableBlocklist();
     const seen = new Set<string>();
     const apps: DetectableApp[] = [];
 
@@ -388,12 +750,13 @@ function normalizeApps(raw: unknown): DetectableApp[] {
         if (!/^\d+$/.test(id) || name === "" || seen.has(id)) continue;
         if (!Array.isArray(entry.executables)) continue;
 
-        const winExes = entry.executables.filter((exe): exe is DetectableExecutable =>
-            exe != null
-            && typeof exe === "object"
-            && (exe as DetectableExecutable).os === "win32"
-            && typeof (exe as DetectableExecutable).name === "string"
-            && cleanExePath((exe as DetectableExecutable).name) !== "");
+        const winExes = entry.executables.filter((exe): exe is DetectableExecutable => {
+            if (exe == null || typeof exe !== "object") return false;
+            const candidate = exe as DetectableExecutable;
+            if (candidate.os !== "win32" || typeof candidate.name !== "string") return false;
+            const cleaned = cleanExePath(candidate.name);
+            return cleaned !== "" && !isBlockedExe(cleaned, blocklist);
+        });
 
         if (winExes.length === 0) continue;
         seen.add(id);
@@ -469,7 +832,7 @@ export function loadCatalogue(): Promise<DetectableApp[]> {
     return cataloguePromise;
 }
 
-/** Preserves the exact relative executable path from Discord's catalog (for example "bin/win64/cs2.exe"). */
+/** Preserves the relative executable path from Discord's catalog (such as "bin/win64/cs2.exe"). */
 export function executableFor(app: DetectableApp): string {
     const executables = app.executables ?? [];
     const pick = executables.find(entry => entry.os === "win32" && !isLauncherExe(entry))
@@ -494,58 +857,37 @@ export function shuffled<T>(items: readonly T[], count = items.length): T[] {
     return pool.slice(0, take);
 }
 
-async function loadUsedGames(userId: string): Promise<string[]> {
-    const mem = memoryUsedGames.get(userId);
-    if (mem != null) return mem;
-    try {
-        const stored = await DataStore.get<string[]>(`${USED_GAMES_KEY_PREFIX}${userId}`);
-        if (Array.isArray(stored)) {
-            memoryUsedGames.set(userId, stored);
-            return stored;
-        }
-    } catch {
-        // Ignore IndexedDB errors and keep in-memory state.
-    }
-    return [];
-}
-
-async function saveUsedGames(userId: string, used: string[]): Promise<void> {
-    const trimmed = used.slice(-15_000);
-    memoryUsedGames.set(userId, trimmed);
-    try {
-        await DataStore.set(`${USED_GAMES_KEY_PREFIX}${userId}`, trimmed);
-    } catch {
-        // Ignore IndexedDB errors.
-    }
-}
-
-/** Selects count unique games, preferring titles not yet claimed by this account and rotating when needed. */
+/**
+ * Selects count unique games, skipping both RunningGameStore seen games and prior claimed
+ * IDs first so neither real games nor prior runs get double-farmed.
+ */
 export async function selectFreshGames(apps: readonly DetectableApp[], count: number): Promise<DetectableApp[]> {
     const desired = Math.min(Math.max(1, Math.floor(count)), apps.length);
     const userId = UserStore?.getCurrentUser?.()?.id ?? "anon";
-    const usedList = await loadUsedGames(userId);
-    const usedSet = new Set(usedList);
+    const ledger = await ensureLedger(userId);
+    const clientSeen = getClientSeenGameIds();
+    const usedSet = new Set<string>([...clientSeen, ...ledger.claimedGameIds]);
 
-    const unused = shuffled(apps.filter(app => !usedSet.has(app.id)));
-    const chosen: DetectableApp[] = unused.slice(0, desired);
+    const nonLaunchers = apps.filter(app => !usedSet.has(app.id) && app.executables.some(e => !isLauncherExe(e)));
+    const unusedRest = apps.filter(app => !usedSet.has(app.id) && !nonLaunchers.includes(app));
+    const chosen: DetectableApp[] = [...shuffled(nonLaunchers), ...shuffled(unusedRest)].slice(0, desired);
 
     if (chosen.length < desired) {
         const byId = new Map(apps.map(app => [app.id, app]));
-        const needed = desired - chosen.length;
         const chosenIds = new Set(chosen.map(app => app.id));
-        const recycled: DetectableApp[] = [];
-        for (const gid of usedList) {
+        for (const gid of ledger.claimedGameIds) {
             const found = byId.get(gid);
-            if (found != null && !chosenIds.has(found.id)) {
-                recycled.push(found);
-                if (recycled.length >= needed) break;
+            if (found != null && !chosenIds.has(found.id) && !clientSeen.has(found.id)) {
+                chosen.push(found);
+                chosenIds.add(found.id);
+                if (chosen.length >= desired) break;
             }
         }
-        chosen.push(...recycled);
         if (chosen.length < desired) {
             for (const app of shuffled(apps)) {
-                if (!chosenIds.has(app.id) && !recycled.some(r => r.id === app.id)) {
+                if (!chosenIds.has(app.id)) {
                     chosen.push(app);
+                    chosenIds.add(app.id);
                     if (chosen.length >= desired) break;
                 }
             }
@@ -555,13 +897,51 @@ export async function selectFreshGames(apps: readonly DetectableApp[], count: nu
     return chosen;
 }
 
-async function recordUsedGames(gameIds: readonly string[]): Promise<void> {
-    if (gameIds.length === 0) return;
-    const userId = UserStore?.getCurrentUser?.()?.id ?? "anon";
-    const usedList = await loadUsedGames(userId);
-    const pickedSet = new Set(gameIds);
-    const nextUsed = [...usedList.filter(gid => !pickedSet.has(gid)), ...gameIds];
-    await saveUsedGames(userId, nextUsed);
+async function recordBatchProgress(options: {
+    addedHours: number;
+    claimedIds: readonly string[];
+    singleGameId?: string;
+}): Promise<void> {
+    const userId = UserStore?.getCurrentUser?.()?.id;
+    if (userId == null) return;
+
+    const currentProgress = getAccountProgress();
+    const ledger = await ensureLedger(userId);
+
+    if (options.addedHours > 0) {
+        const baseHours = Math.max(ledger.gameHours, currentProgress.time.current);
+        ledger.gameHours = Math.round((baseHours + options.addedHours) * 100) / 100;
+    }
+
+    if (options.singleGameId != null && options.addedHours > 0) {
+        const day = utcDayKey();
+        const bucket = ledger.dailySingleGame[day] ?? {};
+        bucket[options.singleGameId] = Math.round(((bucket[options.singleGameId] ?? 0) + options.addedHours) * 100) / 100;
+        ledger.dailySingleGame = { [day]: bucket };
+    }
+
+    if (options.claimedIds.length > 0) {
+        const pickedSet = new Set(options.claimedIds);
+        const existingSet = new Set(ledger.claimedGameIds);
+        let newlyAdded = 0;
+        for (const id of options.claimedIds) {
+            if (!existingSet.has(id)) newlyAdded++;
+        }
+        ledger.claimedGameIds = [...ledger.claimedGameIds.filter(gid => !pickedSet.has(gid)), ...options.claimedIds];
+        const baseVariety = Math.max(ledger.varietyGames, currentProgress.variety.current);
+        ledger.varietyGames = Math.max(ledger.claimedGameIds.length, baseVariety + newlyAdded);
+    }
+
+    await persistLedger(userId, ledger);
+}
+
+function recordStreamDeltaSync(deltaMs: number, floorMs: number): void {
+    if (deltaMs <= 0) return;
+    const userId = UserStore?.getCurrentUser?.()?.id;
+    if (userId == null) return;
+    const ledger = memoryLedgers.get(userId) ?? emptyLedger();
+    ledger.streamMs = Math.max(ledger.streamMs, floorMs) + deltaMs;
+    persistLedgerSync(userId, ledger);
 }
 
 function buildGame(app: GameSpec, startedAt: number): SpoofedGame {
@@ -592,10 +972,15 @@ function buildGame(app: GameSpec, startedAt: number): SpoofedGame {
 function showGame(game: SpoofedGame | null): void {
     if (game != null) fingerprintFor(game.id);
     activeGame = game;
+
+    if (game != null && !showSpoofedPresence) return;
+    if (game == null && !dispatchedDebugPresence) return;
+
     try {
         FluxDispatcher.dispatch({ type: "RUNNING_GAME_SET_DEBUG_GAME", game });
+        dispatchedDebugPresence = game != null;
     } catch (error) {
-        logger.warn("Could not set debug game on presence", error);
+        logger.warn("Could not update debug game presence", error);
     }
 }
 
@@ -661,42 +1046,53 @@ async function withRetry(id: number, label: string, action: () => Promise<void>)
 }
 
 /**
- * Spreads targetHours across unique detectable Windows games (each <= 24h) so Discord's daily
- * per-game aggregation cap never discards overlapping sessions on the same title.
+ * Spreads neededHours across unique detectable Windows games (each <= 24h) starting from startHours
+ * so Discord's daily per-game aggregation cap never discards overlapping sessions and prior progress is preserved.
  */
 async function runSpreadGameTime(
     id: number,
     apps: readonly DetectableApp[],
-    targetHours: number,
-    hoursPerGame: number
+    startHours: number,
+    neededHours: number,
+    hoursPerGame: number,
+    minUniqueGames = 1
 ): Promise<boolean> {
-    const perGameHours = Math.min(Math.max(1, hoursPerGame), MAX_CHUNK_HOURS);
-    const perGameMs = Math.round(perGameHours * 3_600_000);
-    const maxAchievableHours = apps.length * perGameHours;
-    const effectiveTargetHours = Math.min(targetHours, maxAchievableHours);
-    const targetMs = Math.round(effectiveTargetHours * 3_600_000);
-    const gamesNeeded = Math.min(apps.length, Math.max(1, Math.ceil(targetMs / perGameMs)));
+    const cappedPerGame = Math.min(Math.max(1, hoursPerGame), MAX_CHUNK_HOURS);
+    const maxAchievableDelta = apps.length * cappedPerGame;
+    const effectiveNeededHours = Math.min(neededHours, maxAchievableDelta);
+    const neededMs = Math.round(effectiveNeededHours * 3_600_000);
+
+    const byHoursCount = Math.max(1, Math.ceil(neededMs / Math.round(cappedPerGame * 3_600_000)));
+    const gamesNeeded = Math.min(apps.length, Math.max(byHoursCount, minUniqueGames));
+    const perGameMs = Math.min(
+        MAX_SESSION_MS,
+        Math.max(MIN_DURATION_MS, Math.ceil(neededMs / gamesNeeded))
+    );
 
     const pool = await selectFreshGames(apps, gamesNeeded);
     if (!alive(id) || pool.length === 0) return false;
 
-    hoursTarget = effectiveTargetHours;
+    hoursCredited = startHours;
+    hoursTarget = Math.round((startHours + effectiveNeededHours) * 10) / 10;
+    gamesCredited = 0;
     gamesTarget = pool.length;
     notify();
 
-    let creditedMs = 0;
+    let sentMs = 0;
     let failures = 0;
 
-    for (let offset = 0; offset < pool.length && alive(id) && targetMs - creditedMs >= MIN_DURATION_MS; offset += BATCH_SIZE) {
+    for (let offset = 0; offset < pool.length && alive(id); offset += BATCH_SIZE) {
         const slice = pool.slice(offset, offset + BATCH_SIZE);
         const batch: PlaytimeSession[] = [];
-        let plannedMs = creditedMs;
+        let plannedMs = sentMs;
 
-        for (const app of slice) {
-            const remaining = targetMs - plannedMs;
-            if (remaining < MIN_DURATION_MS) break;
-            const durationMs = Math.max(MIN_DURATION_MS, Math.min(perGameMs, remaining));
-            batch.push({ game: specFor(app), durationMs });
+        for (let idx = 0; idx < slice.length; idx++) {
+            const remainingGames = pool.length - (offset + idx);
+            const remainingMs = neededMs - plannedMs;
+            if (remainingMs < MIN_DURATION_MS && offset + idx >= minUniqueGames) break;
+            const fairShareMs = remainingGames > 0 ? Math.ceil(remainingMs / remainingGames) : perGameMs;
+            const durationMs = Math.min(MAX_SESSION_MS, Math.max(MIN_DURATION_MS, Math.min(perGameMs, Math.max(fairShareMs, MIN_DURATION_MS))));
+            batch.push({ game: specFor(slice[idx]), durationMs });
             plannedMs += durationMs;
         }
 
@@ -725,38 +1121,48 @@ async function runSpreadGameTime(
         }
 
         failures = 0;
-        await recordUsedGames(batch.map(entry => entry.game.id));
-        creditedMs += batchMs;
+        sentMs += batchMs;
         gamesCredited += batchGames;
-        hoursCredited = Math.min(creditedMs, targetMs) / 3_600_000;
+        hoursCredited = Math.min(hoursTarget, startHours + sentMs / 3_600_000);
+        await recordBatchProgress({
+            addedHours: batchMs / 3_600_000,
+            claimedIds: batch.map(entry => entry.game.id)
+        });
         if (lastError != null) lastError = null;
         notify();
 
-        if (offset + BATCH_SIZE < pool.length && targetMs - creditedMs >= MIN_DURATION_MS) {
+        if (offset + BATCH_SIZE < pool.length && (neededMs - sentMs >= MIN_DURATION_MS || gamesCredited < minUniqueGames)) {
             await wait(REQUEST_DELAY_MS, runAbort?.signal);
         }
     }
 
     showGame(null);
-    return alive(id) && targetMs - creditedMs < MIN_DURATION_MS;
+    return alive(id) && neededMs - sentMs < MIN_DURATION_MS;
 }
 
-async function runSingleGameTime(id: number, app: GameSpec, targetHours: number, chunkHours: number): Promise<boolean> {
+async function runSingleGameTime(
+    id: number,
+    app: GameSpec,
+    startHours: number,
+    neededHours: number,
+    chunkHours: number
+): Promise<boolean> {
     const chunkMs = Math.min(Math.max(1, chunkHours), MAX_CHUNK_HOURS) * 3_600_000;
-    const targetMs = Math.round(targetHours * 3_600_000);
-    let creditedMs = 0;
+    const neededMs = Math.round(neededHours * 3_600_000);
+    let sentMs = 0;
     let failures = 0;
 
-    hoursTarget = targetHours;
+    hoursCredited = startHours;
+    hoursTarget = Math.round((startHours + neededHours) * 10) / 10;
     showGame(buildGame(app, Date.now()));
     notify();
 
-    while (alive(id) && targetMs - creditedMs >= MIN_DURATION_MS) {
+    while (alive(id) && neededMs - sentMs >= MIN_DURATION_MS) {
         const batch: PlaytimeSession[] = [];
-        let plannedMs = creditedMs;
+        let plannedMs = sentMs;
 
-        while (batch.length < BATCH_SIZE && targetMs - plannedMs >= MIN_DURATION_MS) {
-            const sliceMs = Math.min(chunkMs, targetMs - plannedMs);
+        while (batch.length < BATCH_SIZE && neededMs - plannedMs >= MIN_DURATION_MS) {
+            const sliceMs = Math.min(chunkMs, neededMs - plannedMs);
             if (sliceMs < MIN_DURATION_MS) break;
             batch.push({
                 game: app,
@@ -785,21 +1191,31 @@ async function runSingleGameTime(id: number, app: GameSpec, targetHours: number,
         }
 
         failures = 0;
-        creditedMs += batchCredited;
-        hoursCredited = Math.min(creditedMs, targetMs) / 3_600_000;
+        sentMs += batchCredited;
+        hoursCredited = Math.min(hoursTarget, startHours + sentMs / 3_600_000);
+        await recordBatchProgress({
+            addedHours: batchCredited / 3_600_000,
+            claimedIds: [app.id],
+            singleGameId: app.id
+        });
         if (lastError != null && errors > 0) lastError = null;
         notify();
 
-        if (targetMs - creditedMs >= MIN_DURATION_MS) {
+        if (neededMs - sentMs >= MIN_DURATION_MS) {
             await wait(REQUEST_DELAY_MS, runAbort?.signal);
         }
     }
 
     showGame(null);
-    return alive(id) && targetMs - creditedMs < MIN_DURATION_MS;
+    return alive(id) && neededMs - sentMs < MIN_DURATION_MS;
 }
 
-async function runVariety(id: number, apps: DetectableApp[], minutesPerGame: number): Promise<boolean> {
+async function runVariety(
+    id: number,
+    apps: DetectableApp[],
+    startGames: number,
+    minutesPerGame: number
+): Promise<boolean> {
     const unique: DetectableApp[] = [];
     const seen = new Set<string>();
     for (const app of apps) {
@@ -810,8 +1226,11 @@ async function runVariety(id: number, apps: DetectableApp[], minutesPerGame: num
     }
 
     const sessionMs = Math.min(MAX_SESSION_MS, Math.max(MIN_DURATION_MS, Math.floor(minutesPerGame * 60_000)));
+    let sentGames = 0;
     let failures = 0;
-    gamesTarget = unique.length;
+
+    gamesCredited = startGames;
+    gamesTarget = startGames + unique.length;
     notify();
 
     for (let offset = 0; offset < unique.length; offset += BATCH_SIZE) {
@@ -829,9 +1248,11 @@ async function runVariety(id: number, apps: DetectableApp[], minutesPerGame: num
         }));
 
         let sentCount = 0;
+        let sentMs = 0;
         const ok = await withRetry(id, `Variety batch (${specs[0].name} + ${specs.length - 1} more)`, async () => {
             const result = await creditPlaytimeBatch(batch);
             sentCount = result.sessions;
+            sentMs = result.creditedMs;
         });
         if (!alive(id)) return false;
 
@@ -846,8 +1267,12 @@ async function runVariety(id: number, apps: DetectableApp[], minutesPerGame: num
         }
 
         failures = 0;
-        await recordUsedGames(specs.map(spec => spec.id));
-        gamesCredited += sentCount;
+        sentGames += sentCount;
+        gamesCredited = startGames + sentGames;
+        await recordBatchProgress({
+            addedHours: sentMs / 3_600_000,
+            claimedIds: specs.map(spec => spec.id)
+        });
         if (lastError != null) lastError = null;
         notify();
 
@@ -857,7 +1282,7 @@ async function runVariety(id: number, apps: DetectableApp[], minutesPerGame: num
     }
 
     showGame(null);
-    return alive(id) && gamesCredited >= unique.length;
+    return alive(id) && sentGames >= unique.length;
 }
 
 function currentVoiceChannel(): Channel | null {
@@ -1103,9 +1528,18 @@ async function goLive(id: number, channel: Channel, config: StreamFarmConfig): P
     }
 }
 
-async function runStream(id: number, targetHours: number, config: StreamFarmConfig = {}): Promise<boolean> {
-    const targetMs = Math.round(targetHours * 3_600_000);
-    streamTarget = targetHours;
+async function runStream(
+    id: number,
+    startHours: number,
+    neededHours: number,
+    config: StreamFarmConfig = {}
+): Promise<boolean> {
+    const startMs = Math.round(startHours * 3_600_000);
+    const neededMs = Math.round(neededHours * 3_600_000);
+    const totalTargetMs = startMs + neededMs;
+
+    streamHours = startHours;
+    streamTarget = Math.round((totalTargetMs / 3_600_000) * 10) / 10;
 
     const noTrackState = getNoTrackStreamState();
     if (noTrackState === "disabled_in_settings") {
@@ -1126,91 +1560,124 @@ async function runStream(id: number, targetHours: number, config: StreamFarmConf
         return false;
     }
 
-    let liveMs = 0;
+    let sessionLiveMs = 0;
+    let unsavedDeltaMs = 0;
+    let lastSaveAt = Date.now();
     let lastTick = Date.now();
     let segmentStart = Date.now();
+    let voiceLostSince: number | null = null;
     let restarts = 0;
 
-    while (alive(id) && liveMs < targetMs) {
-        const channel = currentVoiceChannel();
-        const issue = voiceProblem(channel, true);
-        if (issue != null) {
-            lastError = issue;
-            break;
-        }
+    try {
+        while (alive(id) && sessionLiveMs < neededMs) {
+            const now = Date.now();
+            const channel = currentVoiceChannel();
+            const issue = voiceProblem(channel, true);
 
-        const now = Date.now();
-        if (!isRtcReady()) {
-            lastTick = now;
-            streamPaused = true;
-            lastError = "Voice connection is reconnecting. Waiting for RTC...";
-            notify();
-            await wait(3_000, runAbort?.signal);
-            continue;
-        }
-
-        const live = readLiveStream();
-
-        if (live == null) {
-            if (restarts >= STREAM_RESTART_LIMIT) {
-                lastError = `Go Live failed ${STREAM_RESTART_LIMIT} times in a row. ${lastError ?? ""}`.trim();
+            if (issue != null) {
+                if (ownsStream || sessionLiveMs > 0) {
+                    voiceLostSince ??= now;
+                    if (now - voiceLostSince < VOICE_RECONNECT_GRACE_MS) {
+                        lastTick = now;
+                        streamPaused = true;
+                        lastError = "Voice connection dropped. Waiting up to 30 seconds to reconnect...";
+                        notify();
+                        await wait(3_000, runAbort?.signal);
+                        continue;
+                    }
+                }
+                lastError = issue;
                 break;
             }
-            restarts++;
-            streamViewers = null;
-            streamPaused = false;
-            notify();
+            voiceLostSince = null;
 
-            if (await goLive(id, channel!, config)) {
-                restarts = 0;
-                segmentStart = Date.now();
-                lastTick = Date.now();
-                if (lastError?.startsWith("Go Live") || lastError?.startsWith("Voice connection")) {
+            if (!isRtcReady()) {
+                lastTick = now;
+                streamPaused = true;
+                lastError = "Voice connection is reconnecting. Waiting for RTC...";
+                notify();
+                await wait(3_000, runAbort?.signal);
+                continue;
+            }
+
+            const live = readLiveStream();
+
+            if (live == null) {
+                if (restarts >= STREAM_RESTART_LIMIT) {
+                    lastError = `Go Live failed ${STREAM_RESTART_LIMIT} times in a row. ${lastError ?? ""}`.trim();
+                    break;
+                }
+                restarts++;
+                streamViewers = null;
+                streamPaused = false;
+                notify();
+
+                if (await goLive(id, channel!, config)) {
+                    restarts = 0;
+                    segmentStart = Date.now();
+                    lastTick = Date.now();
+                    if (lastError?.startsWith("Go Live") || lastError?.startsWith("Voice connection")) {
+                        lastError = null;
+                    }
+                } else {
+                    lastTick = Date.now();
+                    await wait(5_000, runAbort?.signal);
+                }
+                continue;
+            }
+
+            ownsStream = true;
+            if (config.lowPower !== false && savedStreamSettings == null) {
+                applyLowPowerStreamSettings();
+            }
+            keepStreamUnpaused(live.key);
+
+            const delta = Math.min(Math.max(0, now - lastTick), MAX_TICK_DELTA_MS);
+            lastTick = now;
+            streamViewers = live.viewers;
+
+            if (live.viewers > 0) {
+                sessionLiveMs += delta;
+                unsavedDeltaMs += delta;
+                streamHours = Math.min(totalTargetMs, startMs + sessionLiveMs) / 3_600_000;
+                streamPaused = false;
+                if (lastError?.startsWith("Waiting for a viewer") || lastError?.startsWith("Voice connection")) {
                     lastError = null;
                 }
+                if (now - lastSaveAt >= STREAM_SAVE_INTERVAL_MS && unsavedDeltaMs > 0) {
+                    recordStreamDeltaSync(unsavedDeltaMs, startMs + sessionLiveMs - unsavedDeltaMs);
+                    unsavedDeltaMs = 0;
+                    lastSaveAt = now;
+                }
             } else {
+                streamPaused = true;
+                const others = countOtherChannelMembers(channel!.id);
+                lastError = others > 0
+                    ? "Waiting for a viewer. Have the other person in call click Watch Stream (or run Auto-watch on your alt)."
+                    : "Waiting for a viewer. Bring an alt into this voice channel and watch your stream.";
+            }
+
+            if (config.checkpoint === true && now - segmentStart >= STREAM_CHECKPOINT_MS && sessionLiveMs < neededMs) {
+                if (unsavedDeltaMs > 0) {
+                    recordStreamDeltaSync(unsavedDeltaMs, startMs + sessionLiveMs - unsavedDeltaMs);
+                    unsavedDeltaMs = 0;
+                    lastSaveAt = now;
+                }
+                logger.info("Checkpointing stream so Discord flushes video_stream_ended");
+                endOwnedStream();
+                segmentStart = Date.now();
+                await wait(STREAM_REJOIN_GAP_MS, runAbort?.signal);
                 lastTick = Date.now();
-                await wait(5_000, runAbort?.signal);
+                continue;
             }
-            continue;
+
+            notify();
+            await wait(Math.min(STREAM_TICK_MS, Math.max(1_000, neededMs - sessionLiveMs)), runAbort?.signal);
         }
-
-        ownsStream = true;
-        if (config.lowPower !== false && savedStreamSettings == null) {
-            applyLowPowerStreamSettings();
+    } finally {
+        if (unsavedDeltaMs > 0) {
+            recordStreamDeltaSync(unsavedDeltaMs, startMs + sessionLiveMs - unsavedDeltaMs);
         }
-        keepStreamUnpaused(live.key);
-
-        const delta = Math.min(Math.max(0, now - lastTick), MAX_TICK_DELTA_MS);
-        lastTick = now;
-        streamViewers = live.viewers;
-
-        if (live.viewers > 0) {
-            liveMs += delta;
-            streamHours = Math.min(liveMs, targetMs) / 3_600_000;
-            streamPaused = false;
-            if (lastError?.startsWith("Waiting for a viewer") || lastError?.startsWith("Voice connection")) {
-                lastError = null;
-            }
-        } else {
-            streamPaused = true;
-            const others = countOtherChannelMembers(channel!.id);
-            lastError = others > 0
-                ? "Waiting for a viewer. Have the other person in call click Watch Stream (or run Auto-watch on your alt)."
-                : "Waiting for a viewer. Bring an alt into this voice channel and watch your stream.";
-        }
-
-        if (config.checkpoint === true && now - segmentStart >= STREAM_CHECKPOINT_MS && liveMs < targetMs) {
-            logger.info("Checkpointing stream so Discord flushes video_stream_ended");
-            endOwnedStream();
-            segmentStart = Date.now();
-            await wait(STREAM_REJOIN_GAP_MS, runAbort?.signal);
-            lastTick = Date.now();
-            continue;
-        }
-
-        notify();
-        await wait(Math.min(STREAM_TICK_MS, Math.max(1_000, targetMs - liveMs)), runAbort?.signal);
     }
 
     if (alive(id)) {
@@ -1220,7 +1687,7 @@ async function runStream(id: number, targetHours: number, config: StreamFarmConf
         notify();
     }
 
-    return alive(id) && liveMs >= targetMs;
+    return alive(id) && sessionLiveMs >= neededMs;
 }
 
 async function runViewerHelper(id: number): Promise<void> {
@@ -1317,25 +1784,37 @@ function markFinished(message: string): void {
 export async function startSpreadGameTime(
     apps: readonly DetectableApp[],
     hours = ETERNAL_HOURS,
-    hoursPerGame = DEFAULT_HOURS_PER_GAME
+    hoursPerGame = DEFAULT_HOURS_PER_GAME,
+    subtractExisting = true
 ): Promise<void> {
     if (!Array.isArray(apps) || apps.length === 0) {
         lastError = "Game catalog is empty. Reload the list and try again.";
         notify();
         return;
     }
+
     const safeHours = Number.isFinite(hours) ? Math.min(Math.max(1, hours), MAX_TARGET_HOURS) : ETERNAL_HOURS;
     const safePerGame = Number.isFinite(hoursPerGame)
         ? Math.min(Math.max(1, Math.floor(hoursPerGame)), MAX_CHUNK_HOURS)
         : DEFAULT_HOURS_PER_GAME;
 
+    const progress = await syncAccountProgress(false);
+    const startHours = subtractExisting ? Math.min(safeHours, progress.time.current) : progress.time.current;
+    const neededHours = subtractExisting ? Math.max(0, safeHours - startHours) : safeHours;
+
+    if (neededHours * 3_600_000 < MIN_DURATION_MS) {
+        markFinished(`Account is already at ${progress.time.current.toLocaleString()} hours. Switch Goal mode to "Add full amount" to send extra hours.`);
+        notify();
+        return;
+    }
+
     const id = begin("GAME_TIME");
     if (id == null) return;
     try {
-        const completed = await runSpreadGameTime(id, apps, safeHours, safePerGame);
+        const completed = await runSpreadGameTime(id, apps, startHours, neededHours, safePerGame);
         if (completed) {
             markFinished(
-                `Sent ${Math.round(hoursCredited).toLocaleString()} hours across ${gamesCredited.toLocaleString()} Windows games. Discord syncs badges in 24 to 48 hours.`
+                `Reached ${Math.round(hoursCredited).toLocaleString()} hours (+${Math.round(neededHours).toLocaleString()}h across ${gamesCredited.toLocaleString()} games). Discord syncs badges in 24 to 48 hours.`
             );
         }
     } catch (error) {
@@ -1349,21 +1828,34 @@ export async function startSpreadGameTime(
 export async function startSingleGameTime(
     app: DetectableApp,
     hours = DEFAULT_SINGLE_GAME_HOURS,
-    chunkHours = MAX_CHUNK_HOURS
+    chunkHours = MAX_CHUNK_HOURS,
+    subtractExisting = false
 ): Promise<void> {
     if (app == null || typeof app.id !== "string" || typeof app.name !== "string") {
         lastError = "Pick a valid game before starting.";
         notify();
         return;
     }
+
     const safeHours = Number.isFinite(hours) ? Math.min(Math.max(0.1, hours), MAX_TARGET_HOURS) : DEFAULT_SINGLE_GAME_HOURS;
     const safeChunk = Number.isFinite(chunkHours) ? Math.min(Math.max(1, Math.floor(chunkHours)), MAX_CHUNK_HOURS) : MAX_CHUNK_HOURS;
+
+    const progress = await syncAccountProgress(false);
+    const startHours = subtractExisting ? Math.min(safeHours, progress.time.current) : progress.time.current;
+    const neededHours = subtractExisting ? Math.max(0, safeHours - startHours) : safeHours;
+
+    if (neededHours * 3_600_000 < MIN_DURATION_MS) {
+        markFinished(`Account is already at ${progress.time.current.toLocaleString()} hours.`);
+        notify();
+        return;
+    }
+
     const id = begin("GAME_TIME");
     if (id == null) return;
     try {
-        const completed = await runSingleGameTime(id, specFor(app), safeHours, safeChunk);
+        const completed = await runSingleGameTime(id, specFor(app), startHours, neededHours, safeChunk);
         if (completed) {
-            markFinished(`Sent ${Math.round(hoursCredited).toLocaleString()} hours of ${app.name}. Discord syncs badges in 24 to 48 hours.`);
+            markFinished(`Sent ${Math.round(neededHours).toLocaleString()} hours on ${app.name} (${Math.round(hoursCredited).toLocaleString()}h total). Discord syncs badges in 24 to 48 hours.`);
         }
     } catch (error) {
         lastError = describeError(error);
@@ -1376,23 +1868,36 @@ export async function startSingleGameTime(
 export async function startVariety(
     apps: readonly DetectableApp[],
     count = UNIVERSALIST_GAMES,
-    minutesPerGame = DEFAULT_VARIETY_MINUTES
+    minutesPerGame = DEFAULT_VARIETY_MINUTES,
+    subtractExisting = true
 ): Promise<void> {
     if (!Array.isArray(apps) || apps.length === 0) {
         lastError = "Game catalog is empty. Reload the list and try again.";
         notify();
         return;
     }
+
     const safeCount = Number.isFinite(count) ? Math.min(Math.max(1, Math.floor(count)), apps.length) : UNIVERSALIST_GAMES;
     const safeMinutes = Number.isFinite(minutesPerGame) ? Math.min(Math.max(1, minutesPerGame), 1_440) : DEFAULT_VARIETY_MINUTES;
+
+    const progress = await syncAccountProgress(false);
+    const startGames = subtractExisting ? Math.min(safeCount, progress.variety.current) : progress.variety.current;
+    const neededGames = subtractExisting ? Math.max(0, safeCount - startGames) : safeCount;
+
+    if (neededGames <= 0) {
+        markFinished(`Account already has ${progress.variety.current.toLocaleString()} unique games recorded. Switch Goal mode to "Add full amount" to claim more.`);
+        notify();
+        return;
+    }
+
     const id = begin("VARIETY");
     if (id == null) return;
     try {
-        const pool = await selectFreshGames(apps, safeCount);
+        const pool = await selectFreshGames(apps, neededGames);
         if (!alive(id) || pool.length === 0) return;
-        const completed = await runVariety(id, pool, safeMinutes);
+        const completed = await runVariety(id, pool, startGames, safeMinutes);
         if (completed) {
-            markFinished(`Sent sessions for ${gamesCredited} unique Windows games. Discord syncs badges in 24 to 48 hours.`);
+            markFinished(`Reached ${gamesCredited.toLocaleString()} unique Windows games (+${pool.length} new). Discord syncs badges in 24 to 48 hours.`);
         }
     } catch (error) {
         lastError = describeError(error);
@@ -1404,12 +1909,24 @@ export async function startVariety(
 
 export async function startStreamFarm(hours = ETERNAL_HOURS, config: StreamFarmConfig = {}): Promise<void> {
     const safeHours = Number.isFinite(hours) ? Math.min(Math.max(0.1, hours), MAX_TARGET_HOURS) : ETERNAL_HOURS;
+    const subtractExisting = config.subtractExisting !== false;
+
+    const progress = await syncAccountProgress(false);
+    const startHours = subtractExisting ? Math.min(safeHours, progress.stream.current) : progress.stream.current;
+    const neededHours = subtractExisting ? Math.max(0, safeHours - startHours) : safeHours;
+
+    if (neededHours * 3_600_000 < 30_000) {
+        markFinished(`Account already has ${progress.stream.current.toLocaleString()} stream hours recorded. Pick a higher tier or switch Goal mode to "Add full amount".`);
+        notify();
+        return;
+    }
+
     const id = begin("STREAM");
     if (id == null) return;
     try {
-        const reached = await runStream(id, safeHours, config);
+        const reached = await runStream(id, startHours, neededHours, config);
         if (reached) {
-            markFinished(`Streamed ${Math.round(streamHours).toLocaleString()} hours. Give Discord up to 48 hours to update the badge.`);
+            markFinished(`Reached ${Math.round(streamHours).toLocaleString()} stream hours (+${(Math.round(neededHours * 10) / 10).toLocaleString()}h this run). Give Discord up to 48 hours to update the badge.`);
         }
     } catch (error) {
         lastError = describeError(error);
@@ -1445,28 +1962,60 @@ export async function maxAll(apps: readonly DetectableApp[], config: StreamFarmC
         notify();
         return;
     }
+
+    const progress = await syncAccountProgress(false);
+    const missingHours = Math.max(0, ETERNAL_HOURS - progress.time.current);
+    const missingGames = Math.max(0, UNIVERSALIST_GAMES - progress.variety.current);
+    const missingStreamHours = Math.max(0, ETERNAL_HOURS - progress.stream.current);
+
+    if (missingHours * 3_600_000 < MIN_DURATION_MS && missingGames <= 0 && missingStreamHours * 3_600_000 < 30_000) {
+        markFinished("Eternal, Universalist, and Phenomenon are all reached on this account.");
+        notify();
+        return;
+    }
+
     const id = begin("MAX_ALL");
     if (id == null) return;
     try {
-        // 250 unique games × 20h = 5,000h, unlocking both Universalist (100+ games) and Eternal (5,000h) in one pass.
-        const ok = await runSpreadGameTime(id, apps, ETERNAL_HOURS, DEFAULT_HOURS_PER_GAME);
-        if (!ok || !alive(id)) return;
+        let stepOneSummary = "Eternal + Universalist already reached";
 
-        const summary = `${Math.round(hoursCredited).toLocaleString()} hours across ${gamesCredited} unique games`;
+        if (missingHours * 3_600_000 >= MIN_DURATION_MS) {
+            const ok = await runSpreadGameTime(
+                id,
+                apps,
+                progress.time.current,
+                missingHours,
+                DEFAULT_HOURS_PER_GAME,
+                Math.max(1, missingGames)
+            );
+            if (!ok || !alive(id)) return;
+            stepOneSummary = `+${Math.round(missingHours).toLocaleString()}h across ${gamesCredited} games`;
+        } else if (missingGames > 0) {
+            const pool = await selectFreshGames(apps, missingGames);
+            if (!alive(id) || pool.length === 0) return;
+            const ok = await runVariety(id, pool, progress.variety.current, DEFAULT_VARIETY_MINUTES);
+            if (!ok || !alive(id)) return;
+            stepOneSummary = `+${pool.length} games for Universalist`;
+        }
+
+        if (missingStreamHours * 3_600_000 < 30_000) {
+            markFinished(`Completed ${stepOneSummary}. Phenomenon is already reached.`);
+            return;
+        }
 
         if (voiceProblem(currentVoiceChannel(), true) != null || getNoTrackStreamState() !== "ok") {
-            markFinished(`Sent ${summary} (Eternal + Universalist). Join a voice channel and run Streaming for Phenomenon.`);
+            markFinished(`Completed ${stepOneSummary}. Join a voice channel and run Streaming for the remaining ${Math.ceil(missingStreamHours).toLocaleString()}h.`);
             return;
         }
 
         try {
-            showToast({ text: `Sent ${summary}. Starting Go Live for the streaming badge.`, variant: "success" });
+            showToast({ text: `${stepOneSummary}. Starting Go Live (${Math.ceil(missingStreamHours).toLocaleString()}h remaining).`, variant: "success" });
         } catch {
             // Toast failures are non-fatal.
         }
-        const reached = await runStream(id, ETERNAL_HOURS, config);
+        const reached = await runStream(id, progress.stream.current, missingStreamHours, config);
         if (reached) {
-            markFinished(`Finished ${summary}, plus ${Math.round(streamHours).toLocaleString()} hours streamed.`);
+            markFinished(`Completed ${stepOneSummary} and reached ${Math.round(streamHours).toLocaleString()} stream hours.`);
         }
     } catch (error) {
         lastError = describeError(error);

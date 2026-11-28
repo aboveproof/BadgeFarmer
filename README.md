@@ -8,7 +8,7 @@
 [![Vencord compatible](https://img.shields.io/badge/Vencord-userplugin-ED4245?logo=vencord&logoColor=white)](https://github.com/Vendicated/Vencord)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 
-[Install](#install) · [Requirements](#requirements) · [Modes](#modes) · [Badge tiers](#badge-tiers) · [Architecture](#architecture) · [Console script](#console-script) · [FAQ](#faq)
+[Install](#install) · [Progress detection](#progress-detection) · [Requirements](#requirements) · [Modes](#modes) · [Badge tiers](#badge-tiers) · [Architecture](#architecture) · [Console script](#console-script) · [FAQ](#faq)
 
 </div>
 
@@ -16,7 +16,7 @@
 
 Discord tracks three evolving activity badges: **Game Time**, **Game Variety**, and **Streaming**. Top tiers require 5,000 hours played, 100 unique games, and 5,000 hours streamed.
 
-BadgeFarmer unlocks Game Time and Variety in under 15 seconds using batched `/science` telemetry, and runs a low-power, unpaused Go Live setup with an alt viewer helper so Streaming hours count. You can build it without changes on **Equicord** or **Vencord**, and run it on Windows, macOS, Linux, Vesktop, and Equibop.
+BadgeFarmer reads your unlocked profile badge tiers and local game history first, subtracts the hours and games you already hold so nothing gets double-farmed, unlocks remaining Game Time and Variety milestones in seconds via `/science`, and runs a resumable low-power Go Live broadcast with an alt viewer helper for Streaming. You can build it without changes on **Equicord** or **Vencord**, and run it on Windows, macOS, Linux, Vesktop, and Equibop.
 
 ## Install
 
@@ -36,6 +36,16 @@ Inject if needed (`pnpm inject` on Vencord or Equicord), restart Discord, and tu
 - **Equicord**: click the badge icon in Discord's top-right header bar, open the Equicord Toolbox menu, or visit **Settings › Plugins › BadgeFarmer**.
 - **Vencord**: open **Settings › Vencord › Plugins › BadgeFarmer** (or pick **Open Badge Farmer** inside `VencordToolbox`).
 
+## Progress detection
+
+Opening the dashboard syncs three sources so runs start from your real progress instead of zero:
+
+1. **Discord profile badges**: matches all 30 official evolving tier icons, badge IDs, and tooltip descriptions from `GET /users/{id}/profile` (for example `Seasoned` = `500h`, `Voyager` = `40 games`, `Breakout` = `20h`).
+2. **Local client history**: reads `RunningGameStore.getGamesSeen(true)` to count verified Windows games Discord already saw you play on this PC and excludes them from random Variety and Spread runs.
+3. **Per-account `DataStore` ledger**: saves sent Game Time hours, claimed game IDs, per-day single-game hours, and live viewer-verified Streaming time every 24 seconds so multi-day runs resume right where you stopped.
+
+Click **Set baseline** on the progress card if you know exact hours above your current badge floor (for example `640` hours played on another PC), or switch **Goal mode** between **Reach target** (subtracts existing progress) and **Add full amount on top**.
+
 ## Requirements
 
 Check these settings before starting a run:
@@ -48,10 +58,10 @@ Check these settings before starting a run:
 
 | Mode | Action | Time to top tier |
 | --- | --- | --- |
-| **Game Time** | Spreads hours across unique verified Windows games (`250 games × 20h = 5,000h`), or logs up to 24h/day on one chosen title. | About 9 seconds |
-| **Variety** | Sends one session each across fresh verified Windows games from Discord's catalog. Universalist needs 100 games. | About 4 seconds |
-| **Streaming** | Runs a low-power Go Live broadcast with SFU unpause keepalive and alt auto-watch support. Phenomenon needs 5,000 hours. | Real time |
-| **All three** | Unlocks Eternal (5,000h) and Universalist (250 games) in one pass, then starts Streaming if you sit in a voice channel. | About 9 seconds for the first two |
+| **Game Time** | Subtracts existing hours and spreads the remainder across unused Windows games (`20h` each), or logs up to 24h/day on one title. | About 9 seconds |
+| **Variety** | Claims missing unique Windows games from Discord's catalog while skipping PC-detected and prior games. Universalist needs 100. | About 4 seconds |
+| **Streaming** | Resumes from your saved hours with SFU unpause keepalive, 30s voice reconnect recovery, and alt auto-watch. Phenomenon needs 5,000h. | Real time |
+| **All three** | Computes missing hours and games, finishes Eternal and Universalist first (skipping completed tracks), then transitions into Streaming. | About 9 seconds for the first two |
 
 ### Game Time and the 24-hour per-game cap
 
@@ -59,12 +69,12 @@ Discord's scheduled badge job caps playtime per single `(user, game, day)` at ar
 
 BadgeFarmer gives you two options in the Game Time tab:
 
-- **Spread across catalog (Recommended, default)**: distributes your target across fresh, verified `win32` games at 20 hours per game (`250 unique games × 20h = 5,000 hours`), unlocking **Eternal** and **Universalist** in one sync.
-- **Single game (24h/day cap)**: logs sessions on one favorite game if you want to build hours on a single title day by day.
+- **Spread across catalog (Recommended, default)**: subtracts your known hours and distributes the remaining delta across unused `win32` games at 20 hours per game, unlocking **Eternal** and **Universalist** in one sync.
+- **Single game (24h/day cap)**: logs sessions on one favorite game and tracks how many hours you already sent on that title today (UTC) so you do not waste overlapping sessions.
 
-### Variety
+### Silent status
 
-BadgeFarmer filters Discord's catalog down to verified numeric application IDs with valid `win32` executables (skipping console SKUs and empty entries), preserves relative executable paths from Discord's database (such as `bin/win64/cs2.exe`), and records claimed IDs in `DataStore` after each accepted batch so repeat runs pick unused games first.
+Game Time and Variety runs stay hidden from your live Discord Rich Presence by default so friends do not see random games flash on your status. Toggle **Show farmed games on your live Discord status** in plugin settings if you want to preview them.
 
 ### Streaming
 
@@ -73,6 +83,7 @@ Discord validates Streaming hours against active WebRTC media sessions on its Se
 BadgeFarmer prevents the failure modes that stall live Go Live sessions:
 
 - **Active SFU unpause keepalive**: dispatches `STREAM_SET_PAUSED` (`paused: false`) on each tick so minimizing Discord, sharing a background window, or locking your screen does not pause RTP transmission (`op: 22`).
+- **Overnight voice reconnect grace**: waits up to 30 seconds for Discord to finish reconnecting during brief network drops before stopping a live stream run, saving accumulated viewer time every 24 seconds.
 - **Low-power 480p / 15 FPS mode** (on by default): switches `ApplicationStreamingSettingsStore` to `480p @ 15 FPS` with audio off and local preview disabled (~90% less GPU and upload load), then restores your prior stream quality on Stop or client close.
 - **Optional 2-hour checkpoints**: Discord can cap single continuous streams past ~10 hours and commits `video_stream_ended` when a stream ends. Turning on **2-hour checkpoints** restarts Go Live every 2 hours to bank hours along the way when paired with alt auto-watch.
 - **Alt viewer auto-watch**: click **Watch this call** on a second Equicord or Vencord client, or click **Copy alt script** and paste it into an unmodded browser tab's DevTools console. Your alt joins new or restarted streams via `STREAM_WATCH` within seconds and stays unpaused in background tabs.
@@ -83,7 +94,7 @@ BadgeFarmer prevents the failure modes that stall live Go Live sessions:
 
 ## Badge tiers
 
-Each badge progresses through 10 tiers. Clicking any segment on the tier bar in the dashboard sets your target input to that tier, and the **Equipped badges** bar at the top checks your live profile badges.
+Each badge progresses through 10 tiers. Earned tiers light up green on the tier bar, planned tiers light up blurple, and clicking any segment sets your target input to that tier.
 
 | Tier | Game Time (hours) | Game Variety (games) | Streaming (hours) |
 | --- | --- | --- | --- |
@@ -95,48 +106,50 @@ Each badge progresses through 10 tiers. Clicking any segment on the tier bar in 
 | 6 | Devoted (300) | Adventurer (30) | Headliner (300) |
 | 7 | Seasoned (500) | Voyager (40) | Star (500) |
 | 8 | Ironclad (1,000) | Maverick (60) | Sensation (1,000) |
-| 9 | Unshakable (2,000) | Polymath (80) | Visionary (2,000) |
+| 9 | Unshakeable (2,000) | Polymath (80) | Visionary (2,000) |
 | 10 | Eternal (5,000) | Universalist (100) | Phenomenon (5,000) |
 
 ## Architecture
 
 1. **Desktop `X-Super-Properties` sync**: constructs a Base64 Windows `Discord Client` `X-Super-Properties` header (`os: "Windows"`, `browser: "Discord Client"`, `has_client_mods: false`) paired with the same `launch_signature` and `client_heartbeat_session_id` inside each event, and sends `/science` requests via `fetch` on the active client origin (`discord.com`, `ptb.discord.com`, or `canary.discord.com`) so Discord's internal request wrapper cannot overwrite the OS header on Linux, macOS, Vesktop, Equibop, or web.
-2. **Catalog and executable accuracy**: reads `GameStore.games` in memory first, then falls back to `/applications/detectable` and `cdn.discordapp.com/detectables/games.json`. Keeps numeric IDs with valid `win32` executables and preserves relative executable paths so titles match Discord's detector database.
+2. **Catalog and blocklist filtering**: reads `GameStore.games` in memory first, checks `GameStore`'s executable blocklist, and falls back to `/applications/detectable` and `cdn.discordapp.com/detectables/games.json`. Keeps numeric IDs with non-blocked `win32` executables and preserves relative executable paths so titles match Discord's detector database.
 3. **Session payloads**: sends `launch_game` (attaching any real `executableFingerprint` captured by `RunningGameStore`), `running_game_heartbeat` (`0ms`, `initial_heartbeat: true`), and `running_game_heartbeat` (`duration_tracked_ms`, `final_heartbeat: true`) in batches of 20 sessions per `POST /science` with HTTP 429 `retry-after` backoff and 401/403 token refresh.
 
 ### Project layout
 
 | File | Responsibility |
 | --- | --- |
-| [index.tsx](index.tsx) | Cross-client plugin entry (Equicord HeaderBar + Vencord Toolbox), startup and `beforeunload` hooks |
-| [farmer.ts](farmer.ts) | Spread & single Game Time, Variety rotation (`DataStore`), Go Live controller, alt viewer helper |
+| [index.tsx](index.tsx) | Cross-client plugin entry (Equicord HeaderBar + Vencord Toolbox), silent status setting, startup hooks |
+| [badges.ts](badges.ts) | Official 30-tier catalog, Discord CDN icon hashes, and profile badge parser |
+| [farmer.ts](farmer.ts) | Account progress ledger (`DataStore`), smart delta calculator, `/science` runners, Go Live controller |
 | [science.ts](science.ts) | Desktop `X-Super-Properties` builder, analytics token cache, `/science` batch poster |
-| [ui.tsx](ui.tsx) | Dashboard modal and settings UI, live badge checker, strategy pills, custom source dropdown |
+| [ui.tsx](ui.tsx) | 3-track progress cards, baseline editor, tier meters, custom source dropdown, and live ETA view |
 | [styles.css](styles.css) | Theme-aware styles using Discord's CSS variables for dark and light themes |
-| [console.js](console.js) | Standalone DevTools script with Desktop `X-Super-Properties`, spread Game Time, and `.watch()` |
+| [console.js](console.js) | Standalone DevTools script with `.progress()`, smart delta calculation, and `.watch()` |
 
 ## Console script
 
 If you do not run Equicord or Vencord, paste [console.js](console.js) into Discord's DevTools console (`Ctrl+Shift+I` › Console):
 
 ```js
-BadgeFarmer.gameTime(5000, 20);         // Spread 5,000h across 250 Windows games (~9s)
+BadgeFarmer.progress();                 // Inspect current badge tiers, hours, and remaining milestones
+BadgeFarmer.gameTime(5000, 20);         // Farm remaining hours up to 5,000h across unused Windows games
 BadgeFarmer.gameTime("Dota 2", 24);     // Single game (24h/day per-game cap)
-BadgeFarmer.variety(5, 100);            // 100 fresh Windows games, 5 min each (~4s)
-BadgeFarmer.stream(1);                  // Low-power Go Live farm on desktop
+BadgeFarmer.variety(5, 100);            // Claim remaining unique Windows games up to 100
+BadgeFarmer.stream(20);                 // Resume low-power Go Live farm up to 20h
 BadgeFarmer.watch();                    // Run on your alt to auto-watch and stay unpaused 24/7
-BadgeFarmer.maxAll();                   // Eternal (5,000h) + Universalist (250 games)
-BadgeFarmer.badges();                   // Check equipped profile badges
+BadgeFarmer.maxAll();                   // Complete remaining Eternal + Universalist milestones
+BadgeFarmer.setBaseline({ time: 640 }); // Optional manual baseline override
 BadgeFarmer.stop();                     // Stop active run and restore stream settings
 ```
 
 ## FAQ
 
 **Badge update schedule**
-Discord runs badge aggregation every 24 to 48 hours. Click **Check** on the **Equipped badges** bar in the dashboard to inspect your profile badges.
+Discord runs badge aggregation every 24 to 48 hours. Click **Sync profile** on the progress overview to inspect your live profile badges, while the `+queued` pill tracks hours sent ahead of Discord's sync.
 
 **Game Time stuck at a few hours**
-Older builds sent 5,000 hours on a single game ID in one day, hitting Discord's ~24-hour daily per-game cap, or let Discord's client wrapper send non-Windows `X-Super-Properties` on Linux, Vesktop, or web. Keep **Spread across catalog** selected so each unique Windows game claims 20 hours (`250 × 20h = 5,000h`).
+Older builds sent 5,000 hours on a single game ID in one day, hitting Discord's ~24-hour daily per-game cap, or let Discord's client wrapper send non-Windows `X-Super-Properties` on Linux, Vesktop, or web. Keep **Spread across catalog** selected so each unique Windows game claims 20 hours.
 
 **Detection and Terms of Service**
 Client mods violate Discord's Terms of Service, and sending synthetic telemetry carries more risk than visual tweaks. Test on a secondary account if you want zero risk to your main profile.

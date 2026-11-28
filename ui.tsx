@@ -9,7 +9,7 @@ import ErrorBoundary from "@components/ErrorBoundary";
 import { copyToClipboard } from "@utils/clipboard";
 import { classNameFactory } from "@utils/css";
 import { useForceUpdater } from "@utils/react";
-import type { ProfileBadge, RenderModalProps } from "@vencord/discord-types";
+import type { RenderModalProps } from "@vencord/discord-types";
 import {
     closeModal,
     Modal,
@@ -26,7 +26,21 @@ import {
 } from "@webpack/common";
 import type { JSX, KeyboardEvent, ReactNode } from "react";
 
-import type { DesktopSource, DetectableApp, FarmerStatus, VoiceReadiness } from "./farmer";
+import {
+    type BadgeTier,
+    reachedTierIndex,
+    STREAM_TIERS,
+    TIME_TIERS,
+    VARIETY_TIERS
+} from "./badges";
+import type {
+    AccountProgress,
+    DesktopSource,
+    DetectableApp,
+    FarmerStatus,
+    TrackProgress,
+    VoiceReadiness
+} from "./farmer";
 import * as Farmer from "./farmer";
 import { isPersonalizationEnabled } from "./science";
 
@@ -36,52 +50,9 @@ const MODAL_KEY = "vc-badge-farmer-modal";
 const MAX_RESULTS = 40;
 const SECONDS_PER_BATCH = 0.7;
 
-interface Tier {
-    name: string;
-    at: number;
-}
-
-const TIME_TIERS: Tier[] = [
-    { name: "Casual", at: 1 },
-    { name: "Recreational", at: 5 },
-    { name: "Dedicated", at: 20 },
-    { name: "Committed", at: 75 },
-    { name: "Serious", at: 150 },
-    { name: "Devoted", at: 300 },
-    { name: "Seasoned", at: 500 },
-    { name: "Ironclad", at: 1_000 },
-    { name: "Unshakable", at: 2_000 },
-    { name: "Eternal", at: 5_000 }
-];
-
-const VARIETY_TIERS: Tier[] = [
-    { name: "Sampler", at: 2 },
-    { name: "Dabbler", at: 5 },
-    { name: "Enthusiast", at: 10 },
-    { name: "Ranger", at: 15 },
-    { name: "Explorer", at: 20 },
-    { name: "Adventurer", at: 30 },
-    { name: "Voyager", at: 40 },
-    { name: "Maverick", at: 60 },
-    { name: "Polymath", at: 80 },
-    { name: "Universalist", at: 100 }
-];
-
-const STREAM_TIERS: Tier[] = [
-    { name: "Newcomer", at: 1 },
-    { name: "Fledgling", at: 5 },
-    { name: "Breakout", at: 20 },
-    { name: "Standout", at: 75 },
-    { name: "Trendsetter", at: 150 },
-    { name: "Headliner", at: 300 },
-    { name: "Star", at: 500 },
-    { name: "Sensation", at: 1_000 },
-    { name: "Visionary", at: 2_000 },
-    { name: "Phenomenon", at: 5_000 }
-];
-
 type Tab = "time" | "variety" | "stream" | "all";
 type TimeStrategy = "spread" | "single";
+type GoalMode = "delta" | "add";
 
 const TABS: Array<{ id: Tab; label: string; }> = [
     { id: "time", label: "Game Time" },
@@ -126,32 +97,17 @@ function useCatalogue(): { apps: DetectableApp[] | null; error: string | null; r
     return { apps, error, retry };
 }
 
-function useProfileBadges(): { badges: ProfileBadge[]; loading: boolean; refresh: () => void; } {
-    const [badges, setBadges] = useState<ProfileBadge[]>([]);
-    const [loading, setLoading] = useState(false);
-
-    useEffect(() => {
-        let cancelled = false;
-        Farmer.fetchMyBadges(false).then(list => {
-            if (!cancelled) setBadges(list);
-        });
-        return () => { cancelled = true; };
-    }, []);
-
-    function refresh() {
-        setLoading(true);
-        Farmer.fetchMyBadges(true)
-            .then(list => setBadges(list))
-            .finally(() => setLoading(false));
-    }
-
-    return { badges, loading, refresh };
-}
-
-function useFarmerStatus(): FarmerStatus {
+function useFarmerState(): { status: FarmerStatus; progress: AccountProgress; } {
     const forceUpdate = useForceUpdater();
-    useEffect(() => Farmer.subscribe(forceUpdate), [forceUpdate]);
-    return Farmer.getStatus();
+    useEffect(() => {
+        const unsub = Farmer.subscribe(forceUpdate);
+        void Farmer.syncAccountProgress(false);
+        return unsub;
+    }, [forceUpdate]);
+    return {
+        status: Farmer.getStatus(),
+        progress: Farmer.getAccountProgress()
+    };
 }
 
 function useVoiceReadiness(active: boolean): VoiceReadiness {
@@ -208,61 +164,282 @@ function parseNumber(value: string, min: number, max: number, integer: boolean):
     return parsed;
 }
 
+function parseOptionalBaseline(value: string, max: number, integer: boolean): { ok: boolean; num: number | null; } {
+    const trimmed = value.trim();
+    if (trimmed === "") return { ok: true, num: null };
+    const parsed = Number(trimmed.replace(/[,_\s]/g, ""));
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > max) return { ok: false, num: null };
+    if (integer && !Number.isInteger(parsed)) return { ok: false, num: null };
+    return { ok: true, num: parsed };
+}
+
 function formatCount(value: number): string {
-    return value >= 10 ? Math.floor(value).toLocaleString() : (Math.floor(value * 10) / 10).toString();
+    return value >= 10 ? Math.floor(value).toLocaleString() : (Math.round(value * 10) / 10).toString();
 }
 
 function formatDuration(seconds: number): string {
     if (seconds < 60) return `about ${Math.max(1, Math.ceil(seconds))} sec`;
     if (seconds < 3_600) return `about ${Math.ceil(seconds / 60)} min`;
-    if (seconds < 172_800) return `about ${Math.round(seconds / 3_600)} hr`;
+    if (seconds < 172_800) {
+        const hrs = Math.floor(seconds / 3_600);
+        const mins = Math.round((seconds % 3_600) / 60);
+        return mins > 0 && hrs < 12 ? `about ${hrs}h ${mins}m` : `about ${Math.round(seconds / 3_600)} hr`;
+    }
     return `about ${Math.round(seconds / 86_400).toLocaleString()} days`;
 }
 
-function reachedTier(value: number, tiers: Tier[]): number {
-    let reached = -1;
-    for (let index = 0; index < tiers.length; index++) {
-        if (value >= tiers[index].at) reached = index;
+function TrackIcon({ src, earned }: { src: string; earned: boolean; }) {
+    const [broken, setBroken] = useState(false);
+
+    useEffect(() => {
+        setBroken(false);
+    }, [src]);
+
+    if (broken) {
+        return (
+            <span className={cl("track-fallback", { "track-fallback-dim": !earned })}>
+                <BadgeIcon width={20} height={20} />
+            </span>
+        );
     }
-    return reached;
+
+    return (
+        <img
+            src={src}
+            alt=""
+            width={28}
+            height={28}
+            className={cl("track-img", { "track-img-dim": !earned })}
+            onError={() => setBroken(true)}
+        />
+    );
 }
 
-function TierMeter({ value, tiers, unit, onPick, disabled }: {
+function ProgressOverview({
+    progress,
+    activeTab,
+    busy,
+    onSelectTab
+}: {
+    progress: AccountProgress;
+    activeTab: Tab;
+    busy: boolean;
+    onSelectTab: (tab: Tab) => void;
+}) {
+    const [editing, setEditing] = useState(false);
+    const [baseTime, setBaseTime] = useState("");
+    const [baseVariety, setBaseVariety] = useState("");
+    const [baseStream, setBaseStream] = useState("");
+
+    function openEditor() {
+        setBaseTime(progress.time.manualBaseline != null ? String(progress.time.manualBaseline) : "");
+        setBaseVariety(progress.variety.manualBaseline != null ? String(progress.variety.manualBaseline) : "");
+        setBaseStream(progress.stream.manualBaseline != null ? String(progress.stream.manualBaseline) : "");
+        setEditing(prev => !prev);
+    }
+
+    const parsedTime = parseOptionalBaseline(baseTime, Farmer.MAX_TARGET_HOURS, false);
+    const parsedVariety = parseOptionalBaseline(baseVariety, 20_000, true);
+    const parsedStream = parseOptionalBaseline(baseStream, Farmer.MAX_TARGET_HOURS, false);
+    const canSave = parsedTime.ok && parsedVariety.ok && parsedStream.ok;
+
+    function saveBaselines() {
+        if (!canSave) return;
+        void Farmer.updateManualBaselines({
+            timeHours: parsedTime.num,
+            varietyGames: parsedVariety.num,
+            streamHours: parsedStream.num
+        }).then(() => {
+            setEditing(false);
+            showToast({ text: "Saved your starting progress baseline.", variant: "success" });
+        });
+    }
+
+    function resetCache() {
+        void Farmer.resetLocalProgressCache().then(() => {
+            setBaseTime("");
+            setBaseVariety("");
+            setBaseStream("");
+            setEditing(false);
+            showToast({ text: "Cleared local BadgeFarmer progress cache.", variant: "success" });
+        });
+    }
+
+    const cards: Array<{ tab: Tab; title: string; unit: string; data: TrackProgress; maxAt: number; }> = [
+        { tab: "time", title: "Game Time", unit: "hrs", data: progress.time, maxAt: Farmer.ETERNAL_HOURS },
+        { tab: "variety", title: "Variety", unit: "games", data: progress.variety, maxAt: Farmer.UNIVERSALIST_GAMES },
+        { tab: "stream", title: "Streaming", unit: "hrs", data: progress.stream, maxAt: Farmer.ETERNAL_HOURS }
+    ];
+
+    return (
+        <section className={cl("overview")} aria-label="Account badge progress">
+            <div className={cl("overview-head")}>
+                <span className={cl("overview-title")}>Your badge progress</span>
+                <div className={cl("overview-actions")}>
+                    <button
+                        type="button"
+                        className={cl("ghost", "ghost-sm")}
+                        disabled={busy}
+                        onClick={openEditor}
+                    >
+                        {editing ? "Close" : "Set baseline"}
+                    </button>
+                    <button
+                        type="button"
+                        className={cl("ghost", "ghost-sm")}
+                        disabled={progress.loading}
+                        onClick={() => void Farmer.syncAccountProgress(true)}
+                    >
+                        {progress.loading ? "Syncing..." : "Sync profile"}
+                    </button>
+                </div>
+            </div>
+
+            <div className={cl("tracks")}>
+                {cards.map(({ tab, title, unit, data, maxAt }) => {
+                    const tierLabel = data.currentTier != null
+                        ? `${data.currentTier.name} · T${data.currentTier.level}/10`
+                        : "Unranked · T0/10";
+                    const ceiling = data.nextTier?.at ?? maxAt;
+                    const pct = ceiling > 0 ? Math.min(100, (data.current / ceiling) * 100) : 100;
+                    const subline = data.nextTier != null
+                        ? `Next: ${data.nextTier.name} (${data.nextTier.at.toLocaleString()} ${unit})`
+                        : "Max tier reached";
+
+                    return (
+                        <button
+                            key={tab}
+                            type="button"
+                            className={cl("track-card", { "track-card-active": activeTab === tab })}
+                            onClick={() => onSelectTab(tab)}
+                        >
+                            <div className={cl("track-top")}>
+                                <TrackIcon src={data.iconUrl} earned={data.currentTier != null} />
+                                <div className={cl("track-meta")}>
+                                    <span className={cl("track-name")}>{title}</span>
+                                    <span className={cl("track-tier")}>{tierLabel}</span>
+                                </div>
+                            </div>
+
+                            <div className={cl("track-stat")}>
+                                <span className={cl("track-value")}>{formatCount(data.current)}</span>
+                                <span className={cl("track-unit")}>/ {maxAt.toLocaleString()} {unit}</span>
+                            </div>
+
+                            <div className={cl("track-bar")}>
+                                <div className={cl("track-bar-fill")} style={{ width: `${pct}%` }} />
+                            </div>
+
+                            <div className={cl("track-foot")}>
+                                <span className={cl("track-next")}>{subline}</span>
+                                {data.pendingSync > 0 && (
+                                    <span className={cl("track-pending")} title="Sent by BadgeFarmer and awaiting Discord's 24 to 48 hour badge sync">
+                                        +{formatCount(data.pendingSync)} queued
+                                    </span>
+                                )}
+                            </div>
+                        </button>
+                    );
+                })}
+            </div>
+
+            {editing && (
+                <div className={cl("baseline-box")}>
+                    <p className={cl("baseline-note")}>
+                        Discord profiles expose your unlocked badge tier (for example Seasoned = 500+ hrs) rather than exact minutes. Enter exact totals if you played or streamed more on another PC, or reset BadgeFarmer's local ledger.
+                    </p>
+                    <div className={cl("baseline-grid")}>
+                        <Field
+                            label="Game Time floor"
+                            suffix="hrs"
+                            value={baseTime}
+                            disabled={busy}
+                            placeholder={String(progress.time.profileFloor)}
+                            onChange={setBaseTime}
+                            error={parsedTime.ok ? null : "Invalid hours"}
+                        />
+                        <Field
+                            label="Variety floor"
+                            suffix="games"
+                            value={baseVariety}
+                            disabled={busy}
+                            placeholder={String(Math.max(progress.variety.profileFloor, progress.variety.clientSeenGames))}
+                            onChange={setBaseVariety}
+                            error={parsedVariety.ok ? null : "Whole number"}
+                        />
+                        <Field
+                            label="Stream floor"
+                            suffix="hrs"
+                            value={baseStream}
+                            disabled={busy}
+                            placeholder={String(progress.stream.profileFloor)}
+                            onChange={setBaseStream}
+                            error={parsedStream.ok ? null : "Invalid hours"}
+                        />
+                    </div>
+                    <div className={cl("baseline-actions")}>
+                        <button
+                            type="button"
+                            className={cl("ghost", "ghost-danger")}
+                            disabled={busy}
+                            onClick={resetCache}
+                        >
+                            Reset local cache
+                        </button>
+                        <Button size="small" disabled={busy || !canSave} onClick={saveBaselines}>
+                            Save baseline
+                        </Button>
+                    </div>
+                </div>
+            )}
+        </section>
+    );
+}
+
+function TierMeter({ value, current, tiers, unit, onPick, disabled }: {
     value: number | null;
-    tiers: Tier[];
+    current: number;
+    tiers: readonly BadgeTier[];
     unit: string;
     onPick: (target: number) => void;
     disabled: boolean;
 }) {
-    const reached = value == null ? -1 : reachedTier(value, tiers);
+    const earnedIdx = reachedTierIndex(current, tiers);
+    const targetIdx = value == null ? -1 : reachedTierIndex(value, tiers);
     const label = value == null
         ? "Invalid target"
-        : reached >= 0 ? tiers[reached].name : `Below ${tiers[0].name}`;
+        : targetIdx >= 0 ? tiers[targetIdx].name : `Below ${tiers[0].name}`;
 
     return (
         <div className={cl("tiers")}>
             <div className={cl("tiers-track")} role="group" aria-label="Badge tier presets">
-                {tiers.map((tier, index) => (
-                    <button
-                        key={tier.name}
-                        type="button"
-                        disabled={disabled}
-                        className={cl("tier", { "tier-on": index <= reached })}
-                        title={`${tier.name}: ${tier.at.toLocaleString()} ${unit}`}
-                        aria-label={`Set target to ${tier.name} (${tier.at.toLocaleString()} ${unit})`}
-                        onClick={() => onPick(tier.at)}
-                    />
-                ))}
+                {tiers.map((tier, index) => {
+                    const isEarned = index <= earnedIdx;
+                    const isPlanned = !isEarned && index <= targetIdx;
+                    const stateNote = isEarned ? " (already reached)" : "";
+                    return (
+                        <button
+                            key={tier.name}
+                            type="button"
+                            disabled={disabled}
+                            className={cl("tier", { "tier-earned": isEarned, "tier-on": isPlanned })}
+                            title={`${tier.name}: ${tier.at.toLocaleString()} ${unit}${stateNote}`}
+                            aria-label={`Set target to ${tier.name} (${tier.at.toLocaleString()} ${unit})`}
+                            onClick={() => onPick(tier.at)}
+                        />
+                    );
+                })}
             </div>
             <span className={cl("tiers-label")}>{label}</span>
         </div>
     );
 }
 
-function Field({ label, hint, value, onChange, error, suffix, disabled }: {
+function Field({ label, hint, value, placeholder, onChange, error, suffix, disabled }: {
     label: string;
     hint?: string;
     value: string;
+    placeholder?: string;
     onChange: (value: string) => void;
     error: string | null;
     suffix?: string;
@@ -275,6 +452,7 @@ function Field({ label, hint, value, onChange, error, suffix, disabled }: {
                 <input
                     className={cl("input")}
                     value={value}
+                    placeholder={placeholder}
                     disabled={disabled}
                     inputMode="decimal"
                     spellCheck={false}
@@ -283,7 +461,9 @@ function Field({ label, hint, value, onChange, error, suffix, disabled }: {
                 />
                 {suffix != null && <span className={cl("input-suffix")}>{suffix}</span>}
             </span>
-            <span className={cl("field-note", { "field-error": error != null })}>{error ?? hint ?? "\u00a0"}</span>
+            {(error != null || hint != null) && (
+                <span className={cl("field-note", { "field-error": error != null })}>{error ?? hint}</span>
+            )}
         </label>
     );
 }
@@ -518,6 +698,7 @@ function GamePicker({ apps, error, selected, onSelect, disabled }: {
 interface LiveView {
     title: string;
     detail: string | null;
+    rightNote: string | null;
     current: number;
     target: number;
     unit: string;
@@ -531,6 +712,7 @@ function liveView(status: FarmerStatus): LiveView {
         return {
             title: "Viewer Helper",
             detail: active ? "Keeping incoming stream active and unpaused" : "Standing by for a Go Live stream in this call",
+            rightNote: null,
             current: 0,
             target: 0,
             unit: "",
@@ -541,8 +723,13 @@ function liveView(status: FarmerStatus): LiveView {
 
     const game = status.activeGame?.name ?? null;
     const gameDetail = status.gamesTarget > 0 && status.mode !== "VARIETY"
-        ? `${status.gamesCredited}/${status.gamesTarget} games · ${game ?? "Starting"}`
+        ? `${status.gamesCredited}/${status.gamesTarget} batch games · ${game ?? "Starting"}`
         : game;
+
+    const streamRemainingSec = Math.max(0, (status.streamTarget - status.streamHours) * 3_600);
+    const streamRightNote = !status.streamPaused && (status.streamViewers ?? 0) > 0 && streamRemainingSec > 0
+        ? `${formatDuration(streamRemainingSec).replace(/^about /, "~")} left`
+        : null;
 
     const viewers = status.streamViewers == null
         ? "Starting Go Live"
@@ -550,9 +737,37 @@ function liveView(status: FarmerStatus): LiveView {
             ? "Paused · waiting for a viewer"
             : status.streamViewers === 1 ? "1 viewer · unpaused" : `${status.streamViewers} viewers · unpaused`;
 
-    const time: LiveView = { title: "Game Time", detail: gameDetail, current: status.hoursCredited, target: status.hoursTarget, unit: "hours", paused: false };
-    const variety: LiveView = { title: "Variety", detail: game, current: status.gamesCredited, target: status.gamesTarget, unit: "games", paused: false };
-    const stream: LiveView = { title: "Streaming", detail: viewers, current: status.streamHours, target: status.streamTarget, unit: "hours", paused: status.streamPaused };
+    const errorNote = status.errors > 0
+        ? `${status.errors} failed ${status.errors === 1 ? "request" : "requests"}`
+        : null;
+
+    const time: LiveView = {
+        title: "Game Time",
+        detail: gameDetail,
+        rightNote: errorNote,
+        current: status.hoursCredited,
+        target: status.hoursTarget,
+        unit: "hours",
+        paused: false
+    };
+    const variety: LiveView = {
+        title: "Variety",
+        detail: game,
+        rightNote: errorNote,
+        current: status.gamesCredited,
+        target: status.gamesTarget,
+        unit: "games",
+        paused: false
+    };
+    const stream: LiveView = {
+        title: "Streaming",
+        detail: viewers,
+        rightNote: streamRightNote ?? errorNote,
+        current: status.streamHours,
+        target: status.streamTarget,
+        unit: "hours",
+        paused: status.streamPaused
+    };
 
     switch (status.mode) {
         case "GAME_TIME": return time;
@@ -603,9 +818,7 @@ function LiveCard({ status }: { status: FarmerStatus; }) {
 
             <div className={cl("live-foot")}>
                 <span className={cl("live-detail")}>{view.detail ?? "Starting"}</span>
-                {status.errors > 0 && (
-                    <span className={cl("live-detail")}>{status.errors} failed {status.errors === 1 ? "request" : "requests"}</span>
-                )}
+                {view.rightNote != null && <span className={cl("live-detail", "live-right-note")}>{view.rightNote}</span>}
             </div>
 
             {status.lastError != null && <div className={cl("callout", "callout-warn")}>{status.lastError}</div>}
@@ -923,12 +1136,12 @@ function SourcePicker({ sources, value, loading, disabled, onChange }: {
 
 export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; } = {}): JSX.Element {
     const { apps, error: catalogueError, retry: retryCatalogue } = useCatalogue();
-    const profileBadges = useProfileBadges();
-    const status = useFarmerStatus();
+    const { status, progress } = useFarmerState();
     const refreshView = useForceUpdater();
 
     const [tab, setTab] = useState<Tab>("time");
     const [timeStrategy, setTimeStrategy] = useState<TimeStrategy>("spread");
+    const [goalMode, setGoalMode] = useState<GoalMode>("delta");
     const [selected, setSelected] = useState<DetectableApp | null>(null);
     const [spreadTarget, setSpreadTarget] = useState(String(Farmer.ETERNAL_HOURS));
     const [hoursPerGame, setHoursPerGame] = useState(String(Farmer.DEFAULT_HOURS_PER_GAME));
@@ -937,16 +1150,25 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
     const [varietyCount, setVarietyCount] = useState(String(Farmer.UNIVERSALIST_GAMES));
     const [varietyMinutes, setVarietyMinutes] = useState(String(Farmer.DEFAULT_VARIETY_MINUTES));
     const [streamTarget, setStreamTarget] = useState("1");
+    const [streamTouched, setStreamTouched] = useState(false);
     const [selectedSourceId, setSelectedSourceId] = useState("");
     const [lowPower, setLowPower] = useState(true);
     const [checkpoint, setCheckpoint] = useState(false);
     const [copiedAlt, setCopiedAlt] = useState(false);
 
     const busy = status.mode !== "IDLE";
+    const subtractExisting = goalMode === "delta";
     const personalization = isPersonalizationEnabled();
     const noTrackState = Farmer.getNoTrackStreamState();
     const voice = useVoiceReadiness(tab === "stream" || tab === "all");
     const streamSources = useStreamSources(tab === "stream");
+
+    // Advance default Stream target to the user's next unearned tier once progress syncs.
+    useEffect(() => {
+        if (streamTouched || progress.stream.current <= 0) return;
+        const nextAt = progress.stream.nextTier?.at ?? Farmer.ETERNAL_HOURS;
+        setStreamTarget(String(nextAt));
+    }, [progress.stream.current, progress.stream.nextTier, streamTouched]);
 
     useEffect(() => {
         if (selectedSourceId === "" || streamSources.loading || streamSources.sources.length === 0) return;
@@ -969,15 +1191,37 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
     const activeSource = streamSources.sources.find(item => item.id === selectedSourceId) ?? null;
     const sharingFullScreen = activeSource == null || activeSource.kind === "screen";
 
-    const spreadGamesCount = spreadHours != null && perGame != null
-        ? Math.min(apps?.length ?? Infinity, Math.max(1, Math.ceil(spreadHours / perGame)))
-        : null;
-    const spreadBatches = spreadGamesCount != null ? Math.ceil(spreadGamesCount / Farmer.BATCH_SIZE) : null;
+    const spreadNeededHours = spreadHours == null
+        ? null
+        : subtractExisting ? Math.max(0, spreadHours - progress.time.current) : spreadHours;
+    const spreadGamesCount = spreadNeededHours != null && perGame != null && spreadNeededHours > 0
+        ? Math.min(apps?.length ?? Infinity, Math.max(1, Math.ceil(spreadNeededHours / perGame)))
+        : 0;
+    const spreadBatches = spreadGamesCount > 0 ? Math.ceil(spreadGamesCount / Farmer.BATCH_SIZE) : 0;
+
     const singleBatches = singleHours != null && chunk != null
         ? Math.ceil(Math.ceil(singleHours / chunk) / Farmer.BATCH_SIZE)
         : null;
-    const varietyBatches = games != null ? Math.ceil(games / Farmer.BATCH_SIZE) : null;
-    const allBatches = Math.ceil(Math.ceil(Farmer.ETERNAL_HOURS / Farmer.DEFAULT_HOURS_PER_GAME) / Farmer.BATCH_SIZE);
+    const todaySingleSent = selected != null ? Farmer.getTodaySingleGameHours(selected.id) : 0;
+
+    const varietyNeeded = games == null
+        ? null
+        : subtractExisting ? Math.max(0, games - progress.variety.current) : games;
+    const varietyBatches = varietyNeeded != null && varietyNeeded > 0
+        ? Math.ceil(varietyNeeded / Farmer.BATCH_SIZE)
+        : 0;
+
+    const streamNeeded = streamHours == null
+        ? null
+        : subtractExisting ? Math.max(0, streamHours - progress.stream.current) : streamHours;
+
+    const allMissingHours = Math.max(0, Farmer.ETERNAL_HOURS - progress.time.current);
+    const allMissingGames = Math.max(0, Farmer.UNIVERSALIST_GAMES - progress.variety.current);
+    const allMissingStream = Math.max(0, Farmer.ETERNAL_HOURS - progress.stream.current);
+    const allStepOneGames = allMissingHours > 0
+        ? Math.max(Math.ceil(allMissingHours / Farmer.DEFAULT_HOURS_PER_GAME), allMissingGames)
+        : allMissingGames;
+    const allBatches = allStepOneGames > 0 ? Math.ceil(allStepOneGames / Farmer.BATCH_SIZE) : 0;
 
     function copyAltScript() {
         copyToClipboard(Farmer.ALT_WATCH_SNIPPET)
@@ -1004,7 +1248,14 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
             ? `Connected to ${voice.channelName} · ${voice.peersInChannel} other ${voice.peersInChannel === 1 ? "person" : "people"} in call`
             : `Connected to ${voice.channelName} · alone in call (bring an alt so hours count)`;
 
-    const activeTimeValue = timeStrategy === "spread" ? spreadHours : singleHours;
+    const activeTimeValue = timeStrategy === "spread"
+        ? (spreadHours != null && !subtractExisting ? progress.time.current + spreadHours : spreadHours)
+        : (singleHours != null ? progress.time.current + singleHours : null);
+
+    const spreadAlreadyMet = spreadNeededHours != null && spreadNeededHours * 3_600_000 < 60_000;
+    const varietyAlreadyMet = varietyNeeded != null && varietyNeeded <= 0;
+    const streamAlreadyMet = streamNeeded != null && streamNeeded * 3_600_000 < 30_000;
+    const allAlreadyMet = allMissingHours < 1 && allMissingGames <= 0 && allMissingStream < 0.1;
 
     return (
         <div className={cl("root", { "root-modal": isModal })}>
@@ -1018,28 +1269,12 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                 </header>
             )}
 
-            <div className={cl("badges-bar")}>
-                <div className={cl("badges-list")}>
-                    <span className={cl("badges-label")}>Equipped badges:</span>
-                    {profileBadges.badges.length === 0 ? (
-                        <span className={cl("badges-empty")}>None shown yet</span>
-                    ) : (
-                        profileBadges.badges.map(badge => (
-                            <span key={badge.id} className={cl("badge-chip")} title={badge.id}>
-                                {badge.description || badge.id}
-                            </span>
-                        ))
-                    )}
-                </div>
-                <button
-                    type="button"
-                    className={cl("ghost")}
-                    disabled={profileBadges.loading}
-                    onClick={profileBadges.refresh}
-                >
-                    {profileBadges.loading ? "..." : "Check"}
-                </button>
-            </div>
+            <ProgressOverview
+                progress={progress}
+                activeTab={tab}
+                busy={busy}
+                onSelectTab={setTab}
+            />
 
             {personalization === false && (
                 <div className={cl("callout", "callout-danger")}>
@@ -1064,27 +1299,29 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                     key="time"
                     intro={
                         timeStrategy === "spread"
-                            ? "Discord caps playtime per single game at 24 hours a day and sums across titles. Spreading hours across unique Windows games reaches 5,000 hours in one sync."
+                            ? "Discord caps playtime per single game at 24 hours a day and sums across titles. BadgeFarmer subtracts your existing hours and spreads the remainder across unused Windows games."
                             : "Logs sessions on one chosen game. Discord caps credit per game at about 24 hours per day."
                     }
                     action={
                         timeStrategy === "spread" ? (
                             <StartButton
-                                label="Start Game Time"
+                                label={spreadAlreadyMet ? "Target reached" : "Start Game Time"}
                                 eta={
-                                    spreadBatches != null && spreadGamesCount != null
-                                        ? `${spreadGamesCount.toLocaleString()} games · ${formatDuration(spreadBatches * SECONDS_PER_BATCH)}`
-                                        : null
+                                    spreadAlreadyMet
+                                        ? `At ${formatCount(progress.time.current)}h · switch Goal mode to add more`
+                                        : spreadNeededHours != null && spreadGamesCount > 0
+                                            ? `+${formatCount(spreadNeededHours)}h across ${spreadGamesCount.toLocaleString()} games · ${formatDuration(spreadBatches * SECONDS_PER_BATCH)}`
+                                            : null
                                 }
-                                disabled={busy || apps == null || spreadHours == null || perGame == null}
-                                onClick={() => void Farmer.startSpreadGameTime(apps!, spreadHours!, perGame!)}
+                                disabled={busy || apps == null || spreadHours == null || perGame == null || spreadAlreadyMet}
+                                onClick={() => void Farmer.startSpreadGameTime(apps!, spreadHours!, perGame!, subtractExisting)}
                             />
                         ) : (
                             <StartButton
                                 label={selected == null ? "Pick a game" : `Start ${selected.name}`}
-                                eta={singleBatches != null ? formatDuration(singleBatches * SECONDS_PER_BATCH) : null}
+                                eta={singleBatches != null ? `+${singleHours}h · ${formatDuration(singleBatches * SECONDS_PER_BATCH)}` : null}
                                 disabled={busy || selected == null || singleHours == null || chunk == null}
-                                onClick={() => void Farmer.startSingleGameTime(selected!, singleHours!, chunk!)}
+                                onClick={() => void Farmer.startSingleGameTime(selected!, singleHours!, chunk!, false)}
                             />
                         )
                     }
@@ -1100,41 +1337,59 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                     />
 
                     {timeStrategy === "spread" ? (
-                        <div className={cl("row")}>
-                            <Field
-                                label="Total target"
-                                suffix="hours"
-                                value={spreadTarget}
+                        <>
+                            <ModePills
+                                options={[
+                                    { id: "delta", label: `Reach target (subtracts ${formatCount(progress.time.current)}h)` },
+                                    { id: "add", label: "Add full amount on top" }
+                                ]}
+                                value={goalMode}
                                 disabled={busy}
-                                onChange={setSpreadTarget}
-                                hint={
-                                    spreadGamesCount != null
-                                        ? `Uses ${spreadGamesCount.toLocaleString()} unique Windows games`
-                                        : undefined
-                                }
-                                error={spreadHours == null ? `Use 1 to ${maxSpreadHours.toLocaleString()}` : null}
+                                onChange={setGoalMode}
                             />
-                            <Field
-                                label="Hours per game"
-                                suffix="hours"
-                                value={hoursPerGame}
-                                disabled={busy}
-                                onChange={setHoursPerGame}
-                                hint="Keep at 24 or under so every hour counts"
-                                error={perGame == null ? `Whole number, 1 to ${Farmer.MAX_CHUNK_HOURS}` : null}
-                            />
-                        </div>
+                            <div className={cl("row")}>
+                                <Field
+                                    label={subtractExisting ? "Target milestone" : "Hours to add"}
+                                    suffix="hours"
+                                    value={spreadTarget}
+                                    disabled={busy}
+                                    onChange={setSpreadTarget}
+                                    hint={
+                                        spreadNeededHours != null
+                                            ? (spreadAlreadyMet
+                                                ? `Already at ${formatCount(progress.time.current)} hours`
+                                                : `Sends ${formatCount(spreadNeededHours)}h across ${spreadGamesCount.toLocaleString()} fresh games`)
+                                            : undefined
+                                    }
+                                    error={spreadHours == null ? `Use 1 to ${maxSpreadHours.toLocaleString()}` : null}
+                                />
+                                <Field
+                                    label="Hours per game"
+                                    suffix="hours"
+                                    value={hoursPerGame}
+                                    disabled={busy}
+                                    onChange={setHoursPerGame}
+                                    hint="Keep at 24 or under so each hour counts"
+                                    error={perGame == null ? `Whole number, 1 to ${Farmer.MAX_CHUNK_HOURS}` : null}
+                                />
+                            </div>
+                        </>
                     ) : (
                         <>
                             <GamePicker apps={apps} error={catalogueError} selected={selected} onSelect={setSelected} disabled={busy} />
+                            {selected != null && todaySingleSent > 0 && (
+                                <div className={cl("callout", "callout-warn")}>
+                                    Already sent {todaySingleSent}h on {selected.name} today (UTC). Discord caps single-game credit around 24 hours per day.
+                                </div>
+                            )}
                             {singleHours != null && singleHours > 24 && (
                                 <div className={cl("callout", "callout-warn")}>
-                                    Discord discards extra overlapping hours past ~24 hours per game per day. Switch to "Spread across catalog" above to unlock Eternal in one night.
+                                    Discord discards extra overlapping hours past ~24 hours per game per day. Switch to "Spread across catalog" above to unlock Eternal in one run.
                                 </div>
                             )}
                             <div className={cl("row")}>
                                 <Field
-                                    label="Target"
+                                    label="Hours to send today"
                                     suffix="hours"
                                     value={singleTarget}
                                     disabled={busy}
@@ -1157,12 +1412,17 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
 
                     <TierMeter
                         value={activeTimeValue}
+                        current={progress.time.current}
                         tiers={TIME_TIERS}
                         unit="hours"
                         disabled={busy}
                         onPick={target => {
-                            if (timeStrategy === "spread") setSpreadTarget(String(target));
-                            else setSingleTarget(String(target));
+                            if (timeStrategy === "spread") {
+                                setGoalMode("delta");
+                                setSpreadTarget(String(target));
+                            } else {
+                                setSingleTarget(String(Math.min(24, Math.max(1, Math.ceil(target - progress.time.current)))));
+                            }
                         }}
                     />
                 </Panel>
@@ -1171,23 +1431,44 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
             {tab === "variety" && (
                 <Panel
                     key="variety"
-                    intro="Posts one session each for fresh, verified Windows games from Discord's catalog. Universalist needs 100."
+                    intro="Posts one session per unused Windows game, skipping games Discord already saw you play on this PC and titles claimed in prior runs."
                     action={
                         <StartButton
-                            label="Start Variety"
-                            eta={varietyBatches != null ? formatDuration(varietyBatches * SECONDS_PER_BATCH) : null}
-                            disabled={busy || apps == null || games == null || minutes == null}
-                            onClick={() => void Farmer.startVariety(apps!, games!, minutes!)}
+                            label={varietyAlreadyMet ? "Target reached" : "Start Variety"}
+                            eta={
+                                varietyAlreadyMet
+                                    ? `At ${progress.variety.current} games · switch Goal mode to claim more`
+                                    : varietyNeeded != null
+                                        ? `+${varietyNeeded.toLocaleString()} new games · ${formatDuration(varietyBatches * SECONDS_PER_BATCH)}`
+                                        : null
+                            }
+                            disabled={busy || apps == null || games == null || minutes == null || varietyAlreadyMet}
+                            onClick={() => void Farmer.startVariety(apps!, games!, minutes!, subtractExisting)}
                         />
                     }
                 >
+                    <ModePills
+                        options={[
+                            { id: "delta", label: `Reach target (subtracts ${progress.variety.current} games)` },
+                            { id: "add", label: "Add full amount on top" }
+                        ]}
+                        value={goalMode}
+                        disabled={busy}
+                        onChange={setGoalMode}
+                    />
                     <div className={cl("row")}>
                         <Field
-                            label="Games"
+                            label={subtractExisting ? "Target milestone" : "New games to add"}
                             value={varietyCount}
                             disabled={busy}
                             onChange={setVarietyCount}
-                            hint="Prefers games you have not claimed yet"
+                            hint={
+                                varietyNeeded != null
+                                    ? (varietyAlreadyMet
+                                        ? `Already at ${progress.variety.current} unique games`
+                                        : `Claims ${varietyNeeded.toLocaleString()} unused games (${progress.variety.clientSeenGames} seen on this PC)`)
+                                    : undefined
+                            }
                             error={games == null ? `Whole number, 1 to ${(apps?.length ?? 1_000).toLocaleString()}` : null}
                         />
                         <Field
@@ -1196,16 +1477,20 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                             value={varietyMinutes}
                             disabled={busy}
                             onChange={setVarietyMinutes}
-                            hint="Five minutes is plenty"
+                            hint="Five minutes per game is plenty"
                             error={minutes == null ? "Use 1 to 1,440" : null}
                         />
                     </div>
                     <TierMeter
-                        value={games}
+                        value={games != null && !subtractExisting ? progress.variety.current + games : games}
+                        current={progress.variety.current}
                         tiers={VARIETY_TIERS}
                         unit="games"
                         disabled={busy}
-                        onPick={target => setVarietyCount(String(target))}
+                        onPick={target => {
+                            setGoalMode("delta");
+                            setVarietyCount(String(target));
+                        }}
                     />
                 </Panel>
             )}
@@ -1213,16 +1498,23 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
             {tab === "stream" && (
                 <Panel
                     key="stream"
-                    intro="Discord verifies streaming hours against live media servers and an active viewer, so fake telemetry earns nothing. BadgeFarmer keeps Go Live unpaused at low GPU cost so real hours count."
+                    intro="Discord verifies streaming hours against live media servers and an active viewer. BadgeFarmer resumes from your saved hours and keeps Go Live unpaused at low GPU cost."
                     action={
                         <StartButton
-                            label="Go live"
-                            eta={streamHours != null ? `Takes ${formatDuration(streamHours * 3_600)}` : null}
-                            disabled={busy || streamHours == null || voice.problem != null || noTrackState !== "ok"}
+                            label={streamAlreadyMet ? "Target reached" : "Go live"}
+                            eta={
+                                streamAlreadyMet
+                                    ? `At ${formatCount(progress.stream.current)}h · pick a higher tier`
+                                    : streamNeeded != null
+                                        ? `${formatCount(streamNeeded)}h remaining · ${formatDuration(streamNeeded * 3_600)}`
+                                        : null
+                            }
+                            disabled={busy || streamHours == null || voice.problem != null || noTrackState !== "ok" || streamAlreadyMet}
                             onClick={() => void Farmer.startStreamFarm(streamHours!, {
                                 sourceId: selectedSourceId || undefined,
                                 lowPower,
-                                checkpoint
+                                checkpoint,
+                                subtractExisting
                             })}
                         />
                     }
@@ -1237,7 +1529,7 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
 
                     {noTrackState === "disabled_in_settings" && (
                         <div className={cl("callout", "callout-danger", "callout-row")}>
-                            <span>NoTrack has badge tracking off, which blocks Discord's stream badge events.</span>
+                            <span>NoTrack has badge tracking off, blocking Discord's stream badge events.</span>
                             <button type="button" className={cl("ghost")} onClick={fixNoTrack}>Enable in NoTrack</button>
                         </div>
                     )}
@@ -1255,14 +1547,27 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                         </div>
                     )}
 
+                    <ModePills
+                        options={[
+                            { id: "delta", label: `Reach target (resumes from ${formatCount(progress.stream.current)}h)` },
+                            { id: "add", label: "Stream full duration on top" }
+                        ]}
+                        value={goalMode}
+                        disabled={busy}
+                        onChange={setGoalMode}
+                    />
+
                     <div className={cl("row")}>
                         <Field
-                            label="Target"
+                            label={subtractExisting ? "Target milestone" : "Hours to stream"}
                             suffix="hours"
                             value={streamTarget}
                             disabled={busy}
-                            onChange={setStreamTarget}
-                            hint="Counts while at least one viewer watches"
+                            onChange={val => {
+                                setStreamTouched(true);
+                                setStreamTarget(val);
+                            }}
+                            hint="Saves live progress across restarts while a viewer watches"
                             error={streamHours == null ? `Use 0.1 to ${Farmer.MAX_TARGET_HOURS.toLocaleString()}` : null}
                         />
                         <div className={cl("field")}>
@@ -1332,11 +1637,16 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                     </div>
 
                     <TierMeter
-                        value={streamHours}
+                        value={streamHours != null && !subtractExisting ? progress.stream.current + streamHours : streamHours}
+                        current={progress.stream.current}
                         tiers={STREAM_TIERS}
                         unit="hours"
                         disabled={busy}
-                        onPick={target => setStreamTarget(String(target))}
+                        onPick={target => {
+                            setStreamTouched(true);
+                            setGoalMode("delta");
+                            setStreamTarget(String(target));
+                        }}
                     />
                 </Panel>
             )}
@@ -1344,12 +1654,18 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
             {tab === "all" && (
                 <Panel
                     key="all"
-                    intro="Unlocks Eternal and Universalist in one pass, then starts Streaming if you sit in a voice channel."
+                    intro="Calculates the missing hours and games from your current progress, completes Eternal and Universalist first, and transitions into Streaming."
                     action={
                         <StartButton
-                            label="Start all three"
-                            eta={`First two take ${formatDuration(allBatches * SECONDS_PER_BATCH)}`}
-                            disabled={busy || apps == null}
+                            label={allAlreadyMet ? "All three reached" : "Start all three"}
+                            eta={
+                                allAlreadyMet
+                                    ? "Max tier reached on each track"
+                                    : allBatches > 0
+                                        ? `Step 1 takes ${formatDuration(allBatches * SECONDS_PER_BATCH)}`
+                                        : "Step 1 done · starts Streaming"
+                            }
+                            disabled={busy || apps == null || allAlreadyMet}
                             onClick={() => void Farmer.maxAll(apps!, {
                                 sourceId: selectedSourceId || undefined,
                                 lowPower,
@@ -1362,15 +1678,19 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
                         <li className={cl("flow-step")}>
                             <span className={cl("flow-name")}>Game Time + Variety</span>
                             <span className={cl("flow-note")}>
-                                250 unique Windows games at 20 hours each (5,000 total hours + Universalist in one run)
+                                {allMissingHours <= 0 && allMissingGames <= 0
+                                    ? "Eternal (5,000h) and Universalist (100 games) are already reached; step skipped"
+                                    : `Sends +${Math.ceil(allMissingHours).toLocaleString()}h and claims ${allStepOneGames.toLocaleString()} unused Windows games to reach 5,000h + 100 games`}
                             </span>
                         </li>
                         <li className={cl("flow-step")}>
                             <span className={cl("flow-name")}>Streaming</span>
                             <span className={cl("flow-note")}>
-                                {voice.problem == null && noTrackState === "ok"
-                                    ? `Goes live in ${voice.channelName} right after step one`
-                                    : "Skipped unless you join a voice channel (with NoTrack badge tracking on) before step one finishes"}
+                                {allMissingStream <= 0
+                                    ? "Phenomenon (5,000h) is already reached"
+                                    : voice.problem == null && noTrackState === "ok"
+                                        ? `Goes live in ${voice.channelName} for the remaining ${Math.ceil(allMissingStream).toLocaleString()} hours`
+                                        : `Skipped unless you join a voice channel (with NoTrack badge tracking on) for the remaining ${Math.ceil(allMissingStream).toLocaleString()} hours`}
                             </span>
                         </li>
                     </ol>
@@ -1378,7 +1698,7 @@ export function BadgeFarmerDashboard({ isModal = false }: { isModal?: boolean; }
             )}
 
             <p className={cl("footnote")}>
-                Discord syncs Game Time and Variety badges within 24 to 48 hours, and Streaming within 48 hours. Keep "Use data to personalize my Discord experience" on under Data &amp; Privacy.
+                Discord syncs Game Time and Variety badges within 24 to 48 hours, and Streaming within 48 hours. Runs stay hidden from your public status unless enabled in plugin settings.
             </p>
         </div>
     );

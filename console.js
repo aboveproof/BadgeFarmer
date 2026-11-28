@@ -8,16 +8,16 @@
  * BadgeFarmer Console Edition (desktop and browser DevTools)
  *
  * Commands:
- *   BadgeFarmer.gameTime(5000, 20)        // Spread 5,000h across 250 Windows games (~9s)
+ *   BadgeFarmer.progress()                // Sync and display current tiers, hours, and remaining milestones
+ *   BadgeFarmer.gameTime(5000, 20)        // Farm remaining hours up to 5,000h across unused Windows games
  *   BadgeFarmer.gameTime("Dota 2", 24)    // Single game (Discord caps ~24h/day per title)
- *   BadgeFarmer.variety(5, 100)           // 100 fresh Windows games, 5 min each
- *   BadgeFarmer.stream(1)                 // Low-power Go Live farm on desktop
+ *   BadgeFarmer.variety(5, 100)           // Claim remaining unique Windows games up to 100
+ *   BadgeFarmer.stream(20)                // Low-power Go Live farm up to target hours
  *   BadgeFarmer.watch()                   // Alt viewer auto-watch & unpause keepalive
- *   BadgeFarmer.maxAll()                  // Unlocks Eternal + Universalist in one pass
- *   BadgeFarmer.badges()                  // Inspect equipped profile badges
- *   BadgeFarmer.search("counter")
+ *   BadgeFarmer.maxAll()                  // Complete remaining Eternal + Universalist milestones
+ *   BadgeFarmer.setBaseline({ time: 500, variety: 25, stream: 12 })
+ *   BadgeFarmer.resetProgress()
  *   BadgeFarmer.stop()
- *   BadgeFarmer.status
  */
 (() => {
     function apiOrigin() {
@@ -48,7 +48,52 @@
     const VIEWER_TICK_MS = 4_000;
     const STREAM_CHECKPOINT_MS = 2 * 60 * 60 * 1_000;
     const MAX_TICK_DELTA_MS = STREAM_TICK_MS * 3;
-    const STORAGE_USED_KEY = "bf_used_games_v1";
+    const STORAGE_LEDGER_PREFIX = "bf_ledger_v2_";
+
+    const TIME_TIERS = [
+        { level: 1, name: "Casual", at: 1, hash: "b75fcc4dd1c65dfd4169a203e21023453fd6fe853c9b5c1fd839781fda98e80d" },
+        { level: 2, name: "Recreational", at: 5, hash: "f0f32cb2a0003475e443b76a7a2baf454356953ecb84195c7a08c3ce2fd95b70" },
+        { level: 3, name: "Dedicated", at: 20, hash: "e0c82f41bcad94a2a52713800fbef7687d0d2c6a6066b09d5e5876156d086e1a" },
+        { level: 4, name: "Committed", at: 75, hash: "16f2aeb7465c99efce4d67d9333e3ddcf7435d6e60d2f5f93dc0c07bc7c5a69b" },
+        { level: 5, name: "Serious", at: 150, hash: "ba26e83fa68189b41837184e38706f41c288dd29ffba266035d1a5ad9adbae22" },
+        { level: 6, name: "Devoted", at: 300, hash: "851b194288f1913ece6c8d99976519e48210580d6f42d994f21e37801611ad54" },
+        { level: 7, name: "Seasoned", at: 500, hash: "8b10f5c0c30abbd521be5afc2e0dd4ec6da18bfbc689f06d93a51d06577cd84a" },
+        { level: 8, name: "Ironclad", at: 1_000, hash: "d705628490898f2cc22d669cf8b415bc03fed1ddaf98a2a8cbd97442a509293c" },
+        { level: 9, name: "Unshakeable", aliases: ["unshakable"], at: 2_000, hash: "2bddcbc9f9959dab805eb7196c8112ce9dc68b09766c8193ab499b1870e44ac7" },
+        { level: 10, name: "Eternal", at: 5_000, hash: "457ce4e657f0ced23197891cc3d75b7de29cafa065cdb8cbb81060ac0e63b07f" }
+    ];
+
+    const VARIETY_TIERS = [
+        { level: 1, name: "Sampler", at: 2, hash: "ed18d5976c01a4ea19f5a13af08f0547582405cbe48b098b0822e352b8e0a822" },
+        { level: 2, name: "Dabbler", at: 5, hash: "e450d5279537db06ee47a104af520b884adaa7ffc3ef2627157526bf1c58e840" },
+        { level: 3, name: "Enthusiast", at: 10, hash: "158a9d91b8ca9e96d4afeee38cd640fc51483a8196edb9af0c26e44727acafae" },
+        { level: 4, name: "Ranger", at: 15, hash: "9e491942070007f64011ae4fc478926b96433698c07621fc43bafdd5efe83912" },
+        { level: 5, name: "Explorer", at: 20, hash: "e25fc55814262150e154ddb1a2b55fc5ed8ed5ba2ff1a22a33d4a41e651e370a" },
+        { level: 6, name: "Adventurer", at: 30, hash: "542d5277e0001ea738d5eb57b247dcab9ce6e0c29493d5892203f6258fde55b9" },
+        { level: 7, name: "Voyager", at: 40, hash: "082e693cb9ce98b81af618978d449409efc6522b061bc0eac6e88a949fd888c6" },
+        { level: 8, name: "Maverick", at: 60, hash: "6fc242e9e8259c471a5e4599cd09af5476e622a572ff235883173913bf506103" },
+        { level: 9, name: "Polymath", at: 80, hash: "be9a4d119b8e0d7fc1df7e5a12081332637cb9c978a90377cb9c930500b2fbe6" },
+        { level: 10, name: "Universalist", at: 100, hash: "fcc34d343451505c642f3397cec2669a2de3a4a410fb968f794b3a1a0dcd1728" }
+    ];
+
+    const STREAM_TIERS = [
+        { level: 1, name: "Newcomer", at: 1, hash: "c56b451e3bf04181182c2529e9bd3659e569ea80f582858090007f0752401b38" },
+        { level: 2, name: "Fledgling", at: 5, hash: "2e25ba794f6f371ea0f52eb2d3c8fb2b04094a56f388515e13a9bd6d7949a018" },
+        { level: 3, name: "Breakout", at: 20, hash: "4e847b4dca20fbf1c56d3a47cac3c9204f02113c9d5a270ebebdf12909c75848" },
+        { level: 4, name: "Standout", at: 75, hash: "27d0e6939f13dcf113243fc9eac642b15e9764ad891e06c5ed78d45a17678582" },
+        { level: 5, name: "Trendsetter", at: 150, hash: "af681483be2035f14b0f2bfe2e25a8944c97149172938888ca1008edbe037aad" },
+        { level: 6, name: "Headliner", at: 300, hash: "e69a0c86a476c9782ea1d3e7b5ba308eec3d9d6a3eae6ab8af3180f67d16b468" },
+        { level: 7, name: "Star", at: 500, hash: "06b6206db966635cf626651bdb94eacce5a23ab05dc7f600f7d31aa482b2058c" },
+        { level: 8, name: "Sensation", at: 1_000, hash: "1a3b9120ecd64c342083c37980b225d29ebf4544da6ab546c9268f87904c9dfe" },
+        { level: 9, name: "Visionary", at: 2_000, hash: "85f714b90ed3ceb1e00e1f2069bf3ebd564962fa940c92540061537a045e54ab" },
+        { level: 10, name: "Phenomenon", at: 5_000, hash: "61331d04b7a9542b38bfa59583360c0b9b93c6496a04f99c0ab37fa1d83ec58a" }
+    ];
+
+    const TRACK_TIERS = { time: TIME_TIERS, variety: VARIETY_TIERS, stream: STREAM_TIERS };
+    const HASH_MAP = new Map();
+    for (const [track, tiers] of Object.entries(TRACK_TIERS)) {
+        tiers.forEach((tier, idx) => HASH_MAP.set(tier.hash, { track, idx, tier }));
+    }
 
     const USER_AGENT =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -193,7 +238,7 @@
 
     async function ensureAnalyticsToken() {
         const fresh = state.analyticsToken && (Date.now() - state.analyticsFetchedAt < 12 * 3_600_000);
-        if (fresh) return state.analyticsToken;
+        if (fresh && state.userId) return state.analyticsToken;
 
         const res = await fetch(`${API}/users/@me?with_analytics_token=true`, { headers: headers() });
         if (!res.ok) throw new Error(`HTTP ${res.status} fetching analytics token`);
@@ -205,6 +250,149 @@
         state.analyticsToken = body.analytics_token;
         state.analyticsFetchedAt = Date.now();
         return state.analyticsToken;
+    }
+
+    function emptyLedger() {
+        return {
+            gameHours: 0,
+            varietyGames: 0,
+            streamMs: 0,
+            claimedIds: [],
+            manualTime: null,
+            manualVariety: null,
+            manualStream: null
+        };
+    }
+
+    function readLedger(userId) {
+        const key = `${STORAGE_LEDGER_PREFIX}${userId || "anon"}`;
+        try {
+            const raw = localStorage.getItem(key);
+            if (!raw) return emptyLedger();
+            const parsed = JSON.parse(raw);
+            return { ...emptyLedger(), ...parsed, claimedIds: Array.isArray(parsed?.claimedIds) ? parsed.claimedIds : [] };
+        } catch {
+            return emptyLedger();
+        }
+    }
+
+    function writeLedger(userId, ledger) {
+        const key = `${STORAGE_LEDGER_PREFIX}${userId || "anon"}`;
+        ledger.claimedIds = (ledger.claimedIds || []).slice(-15_000);
+        try {
+            localStorage.setItem(key, JSON.stringify(ledger));
+        } catch { /* ignore */ }
+    }
+
+    function getClientSeenIds() {
+        const ids = new Set();
+        try {
+            const rgStore = findStore("RunningGameStore");
+            const seen = rgStore?.getGamesSeen?.(true) ?? [];
+            for (const g of seen) {
+                if (g && !g.isLauncher && typeof g.id === "string" && /^\d+$/.test(g.id)) ids.add(g.id);
+            }
+        } catch { /* ignore */ }
+        return ids;
+    }
+
+    function reachedTierIdx(val, tiers) {
+        let idx = -1;
+        for (let i = 0; i < tiers.length; i++) {
+            if (val >= tiers[i].at) idx = i;
+        }
+        return idx;
+    }
+
+    function parseBadgesProgress(badges) {
+        const out = { time: null, variety: null, stream: null };
+        if (!Array.isArray(badges)) return out;
+
+        for (const b of badges) {
+            if (!b || typeof b !== "object") continue;
+            const iconText = [b.icon, b.icon_asset, b.asset].filter(Boolean).join(" ").toLowerCase();
+            let hit = null;
+            for (const [hash, info] of HASH_MAP) {
+                if (iconText.includes(hash)) {
+                    hit = { track: info.track, idx: info.idx, floor: info.tier.at, tier: info.tier };
+                    break;
+                }
+            }
+            if (!hit) {
+                const id = String(b.id || "").toLowerCase();
+                const desc = String(b.description || "");
+                const idMatch = id.match(/(?:^|_)(game_time|game_variety|streaming)[_-](\d{1,2})(?:$|_)/);
+                if (idMatch) {
+                    const track = idMatch[1] === "game_time" ? "time" : idMatch[1] === "game_variety" ? "variety" : "stream";
+                    const lvl = Number(idMatch[2]);
+                    if (lvl >= 1 && lvl <= 10) hit = { track, idx: lvl - 1, floor: TRACK_TIERS[track][lvl - 1].at, tier: TRACK_TIERS[track][lvl - 1] };
+                } else {
+                    const sm = desc.match(/stream(?:ed|ing)?(?:\s+to\s+other\s+users)?\s+(?:for\s+)?(\d[\d,]*)\+?\s*(?:hours?|hrs?)/i);
+                    const tm = desc.match(/play(?:ed)?\s+(\d[\d,]*)\+?\s*(?:hours?|hrs?)\s+of\s+(?:detectable\s+)?(?:pc\s+)?games/i);
+                    const vm = desc.match(/play(?:ed)?\s+(\d[\d,]*)\+?\s*(?:unique\s+|different\s+)?(?:detectable\s+)?(?:pc\s+)?games/i);
+                    if (sm) {
+                        const hrs = Number(sm[1].replace(/,/g, ""));
+                        const idx = Math.max(0, reachedTierIdx(hrs, STREAM_TIERS));
+                        hit = { track: "stream", idx, floor: hrs, tier: STREAM_TIERS[idx] };
+                    } else if (tm) {
+                        const hrs = Number(tm[1].replace(/,/g, ""));
+                        const idx = Math.max(0, reachedTierIdx(hrs, TIME_TIERS));
+                        hit = { track: "time", idx, floor: hrs, tier: TIME_TIERS[idx] };
+                    } else if (vm && !/hours?|hrs?/i.test(vm[0])) {
+                        const gms = Number(vm[1].replace(/,/g, ""));
+                        const idx = Math.max(0, reachedTierIdx(gms, VARIETY_TIERS));
+                        hit = { track: "variety", idx, floor: gms, tier: VARIETY_TIERS[idx] };
+                    }
+                }
+            }
+            if (hit && (!out[hit.track] || hit.floor > out[hit.track].floor)) {
+                out[hit.track] = hit;
+            }
+        }
+        return out;
+    }
+
+    async function fetchProgressSummary() {
+        ensureAuth();
+        await ensureAnalyticsToken();
+        let badges = [];
+        try {
+            const res = await fetch(`${API}/users/${state.userId}/profile?with_mutual_guilds=false&with_mutual_friends_count=false`, {
+                headers: headers()
+            });
+            if (res.ok) {
+                const data = await res.json();
+                if (Array.isArray(data?.badges)) badges = data.badges;
+            }
+        } catch { /* ignore */ }
+
+        const parsed = parseBadgesProgress(badges);
+        const ledger = readLedger(state.userId);
+        const seenIds = getClientSeenIds();
+        const allClaimed = new Set([...seenIds, ...(ledger.claimedIds || [])]);
+
+        const timeCurrent = Math.round(Math.max(parsed.time?.floor ?? 0, ledger.gameHours || 0, ledger.manualTime ?? 0) * 10) / 10;
+        const varietyCurrent = Math.floor(Math.max(parsed.variety?.floor ?? 0, allClaimed.size, ledger.varietyGames || 0, ledger.manualVariety ?? 0));
+        const streamCurrent = Math.round(Math.max(parsed.stream?.floor ?? 0, (ledger.streamMs || 0) / 3_600_000, ledger.manualStream ?? 0) * 10) / 10;
+
+        const describeTrack = (val, tiers, maxAt) => {
+            const idx = reachedTierIdx(val, tiers);
+            const curTier = idx >= 0 ? `${tiers[idx].name} (T${tiers[idx].level}/10)` : "Unranked (T0/10)";
+            const next = tiers.find(t => val < t.at) || null;
+            return {
+                current: val,
+                tier: curTier,
+                nextTier: next ? `${next.name} at ${next.at}` : "Max tier",
+                remainingToMax: Math.max(0, Math.round((maxAt - val) * 10) / 10)
+            };
+        };
+
+        return {
+            rawBadges: badges,
+            time: describeTrack(timeCurrent, TIME_TIERS, 5_000),
+            variety: describeTrack(varietyCurrent, VARIETY_TIERS, 100),
+            stream: describeTrack(streamCurrent, STREAM_TIERS, 5_000)
+        };
     }
 
     async function postScience(events) {
@@ -291,22 +479,6 @@
         throw lastErr ?? new Error("Discord returned an empty game catalog.");
     }
 
-    function readUsedIds() {
-        try {
-            const raw = localStorage.getItem(STORAGE_USED_KEY);
-            const parsed = raw ? JSON.parse(raw) : [];
-            return Array.isArray(parsed) ? parsed : [];
-        } catch {
-            return [];
-        }
-    }
-
-    function writeUsedIds(ids) {
-        try {
-            localStorage.setItem(STORAGE_USED_KEY, JSON.stringify(ids.slice(-15_000)));
-        } catch { /* ignore */ }
-    }
-
     function shuffled(items) {
         const pool = [...items];
         for (let i = pool.length - 1; i > 0; i--) {
@@ -318,16 +490,17 @@
 
     function selectFreshGames(apps, count) {
         const desired = Math.min(Math.max(1, Math.floor(count)), apps.length);
-        const usedList = readUsedIds();
-        const usedSet = new Set(usedList);
+        const ledger = readLedger(state.userId);
+        const seenIds = getClientSeenIds();
+        const usedSet = new Set([...seenIds, ...(ledger.claimedIds || [])]);
         const chosen = shuffled(apps.filter(a => !usedSet.has(a.id))).slice(0, desired);
 
         if (chosen.length < desired) {
             const byId = new Map(apps.map(a => [a.id, a]));
             const chosenIds = new Set(chosen.map(a => a.id));
-            for (const gid of usedList) {
+            for (const gid of ledger.claimedIds || []) {
                 const found = byId.get(gid);
-                if (found && !chosenIds.has(found.id)) {
+                if (found && !chosenIds.has(found.id) && !seenIds.has(found.id)) {
                     chosen.push(found);
                     chosenIds.add(found.id);
                     if (chosen.length >= desired) break;
@@ -338,11 +511,22 @@
         return chosen;
     }
 
-    function recordUsedIds(gameIds) {
-        if (!gameIds.length) return;
-        const usedList = readUsedIds();
-        const pickedSet = new Set(gameIds);
-        writeUsedIds([...usedList.filter(id => !pickedSet.has(id)), ...gameIds]);
+    function recordBatch(baseTime, baseVariety, addedHours, gameIds) {
+        const ledger = readLedger(state.userId);
+        if (addedHours > 0) {
+            ledger.gameHours = Math.round((Math.max(ledger.gameHours || 0, baseTime) + addedHours) * 100) / 100;
+        }
+        if (gameIds.length > 0) {
+            const pickedSet = new Set(gameIds);
+            const existing = new Set(ledger.claimedIds || []);
+            let newCount = 0;
+            for (const id of gameIds) {
+                if (!existing.has(id)) newCount++;
+            }
+            ledger.claimedIds = [...(ledger.claimedIds || []).filter(id => !pickedSet.has(id)), ...gameIds];
+            ledger.varietyGames = Math.max(ledger.claimedIds.length, Math.max(ledger.varietyGames || 0, baseVariety) + newCount);
+        }
+        writeLedger(state.userId, ledger);
     }
 
     function buildSessionEvents(game, durationMs, startedAt, now, index) {
@@ -509,29 +693,35 @@
         state.abort = null;
     }
 
-    async function runSpreadGameTime(apps, totalHours, hoursPerGame, signal) {
+    async function runSpreadGameTime(apps, startHours, startVariety, neededHours, hoursPerGame, signal, minGames = 1) {
         const perGame = Math.min(Math.max(1, Math.floor(hoursPerGame)), 24);
-        const perGameMs = perGame * 3_600_000;
-        const effectiveHours = Math.min(Math.max(1, totalHours), apps.length * perGame);
-        const targetMs = Math.round(effectiveHours * 3_600_000);
-        const needed = Math.min(apps.length, Math.max(1, Math.ceil(targetMs / perGameMs)));
-        const pool = selectFreshGames(apps, needed);
+        const effectiveNeeded = Math.min(Math.max(0.1, neededHours), apps.length * perGame);
+        const neededMs = Math.round(effectiveNeeded * 3_600_000);
+        const byHours = Math.max(1, Math.ceil(neededMs / (perGame * 3_600_000)));
+        const count = Math.min(apps.length, Math.max(byHours, minGames));
+        const perGameMs = Math.min(MAX_SESSION_MS, Math.max(MIN_DURATION_MS, Math.ceil(neededMs / count)));
+        const pool = selectFreshGames(apps, count);
 
-        let creditedMs = 0;
+        let sentMs = 0;
         let failures = 0;
-        state.creditedHours = 0;
+        let curTime = startHours;
+        let curVariety = startVariety;
+        state.creditedHours = startHours;
         state.gamesCredited = 0;
 
-        log(`Game Time (spread): ${effectiveHours}h across ${pool.length} Windows games (${perGame}h each)`);
+        log(`Game Time (spread): starting at ${startHours}h, adding +${Math.round(effectiveNeeded)}h across ${pool.length} unused games`);
 
-        for (let i = 0; i < pool.length && !signal.aborted && targetMs - creditedMs >= MIN_DURATION_MS; i += BATCH_SIZE) {
+        for (let i = 0; i < pool.length && !signal.aborted; i += BATCH_SIZE) {
             const batch = [];
-            let planned = creditedMs;
-            for (const game of pool.slice(i, i + BATCH_SIZE)) {
-                const rem = targetMs - planned;
-                if (rem < MIN_DURATION_MS) break;
-                const dur = Math.max(MIN_DURATION_MS, Math.min(perGameMs, rem));
-                batch.push({ game, durationMs: dur });
+            let planned = sentMs;
+            const slice = pool.slice(i, i + BATCH_SIZE);
+            for (let idx = 0; idx < slice.length; idx++) {
+                const remGames = pool.length - (i + idx);
+                const rem = neededMs - planned;
+                if (rem < MIN_DURATION_MS && i + idx >= minGames) break;
+                const share = remGames > 0 ? Math.ceil(rem / remGames) : perGameMs;
+                const dur = Math.min(MAX_SESSION_MS, Math.max(MIN_DURATION_MS, Math.min(perGameMs, share)));
+                batch.push({ game: slice[idx], durationMs: dur });
                 planned += dur;
             }
             if (batch.length === 0) break;
@@ -548,37 +738,41 @@
                 continue;
             }
             failures = 0;
-            recordUsedIds(batch.map(entry => entry.game.id));
-            creditedMs += result.creditedMs;
+            sentMs += result.creditedMs;
             state.gamesCredited += result.count;
-            state.creditedHours = Math.round((Math.min(creditedMs, targetMs) / 3_600_000) * 10) / 10;
-            log(`${state.creditedHours}/${effectiveHours}h sent (${state.gamesCredited}/${pool.length} games)`);
-            if (i + BATCH_SIZE < pool.length && targetMs - creditedMs >= MIN_DURATION_MS) {
+            const batchHrs = result.creditedMs / 3_600_000;
+            recordBatch(curTime, curVariety, batchHrs, batch.map(entry => entry.game.id));
+            curTime += batchHrs;
+            curVariety += result.count;
+            state.creditedHours = Math.round((startHours + Math.min(sentMs, neededMs) / 3_600_000) * 10) / 10;
+            log(`${state.creditedHours}/${Math.round(startHours + effectiveNeeded)}h (${state.gamesCredited}/${pool.length} batch games)`);
+            if (i + BATCH_SIZE < pool.length && (neededMs - sentMs >= MIN_DURATION_MS || state.gamesCredited < minGames)) {
                 await wait(REQUEST_DELAY_MS, signal);
             }
         }
 
-        const done = !signal.aborted && targetMs - creditedMs < MIN_DURATION_MS;
-        if (done) log(`Done: ${state.creditedHours}h across ${state.gamesCredited} games. Discord syncs badges in 24 to 48 hours.`);
+        const done = !signal.aborted && neededMs - sentMs < MIN_DURATION_MS;
+        if (done) log(`Done: reached ${state.creditedHours}h across ${state.gamesCredited} games. Discord syncs badges in 24 to 48 hours.`);
         return done;
     }
 
-    async function runSingleGameTime(app, hours, chunkHours, signal) {
+    async function runSingleGameTime(app, startHours, startVariety, hours, chunkHours, signal) {
         const targetMs = Math.round(Math.max(0.1, hours) * 3_600_000);
         const chunkMs = Math.min(Math.max(1, Math.floor(chunkHours)), 24) * 3_600_000;
         const cursorRef = { value: Date.now() };
-        let creditedMs = 0;
+        let sentMs = 0;
         let failures = 0;
-        state.creditedHours = 0;
+        let curTime = startHours;
+        state.creditedHours = startHours;
 
         if (hours > 24) {
             log("Note: Discord caps playtime per single game at ~24h/day. Use BadgeFarmer.gameTime(5000) to spread across games.", false);
         }
-        log(`Game Time (single): ${hours}h on ${app.name}`);
+        log(`Game Time (single): +${hours}h on ${app.name}`);
 
-        while (!signal.aborted && targetMs - creditedMs >= MIN_DURATION_MS) {
+        while (!signal.aborted && targetMs - sentMs >= MIN_DURATION_MS) {
             const batch = [];
-            let planned = creditedMs;
+            let planned = sentMs;
             while (batch.length < BATCH_SIZE && targetMs - planned >= MIN_DURATION_MS) {
                 const slice = Math.min(chunkMs, targetMs - planned);
                 if (slice < MIN_DURATION_MS) break;
@@ -598,24 +792,30 @@
                 continue;
             }
             failures = 0;
-            creditedMs += result.creditedMs;
-            state.creditedHours = Math.round((Math.min(creditedMs, targetMs) / 3_600_000) * 10) / 10;
-            log(`${state.creditedHours}/${hours}h sent`);
-            if (targetMs - creditedMs >= MIN_DURATION_MS) await wait(REQUEST_DELAY_MS, signal);
+            sentMs += result.creditedMs;
+            const batchHrs = result.creditedMs / 3_600_000;
+            recordBatch(curTime, startVariety, batchHrs, [app.id]);
+            curTime += batchHrs;
+            state.creditedHours = Math.round((startHours + Math.min(sentMs, targetMs) / 3_600_000) * 10) / 10;
+            log(`${state.creditedHours}h total (+${Math.round((sentMs / 3_600_000) * 10) / 10}/${hours}h on ${app.name})`);
+            if (targetMs - sentMs >= MIN_DURATION_MS) await wait(REQUEST_DELAY_MS, signal);
         }
 
-        const done = !signal.aborted && targetMs - creditedMs < MIN_DURATION_MS;
-        if (done) log(`Done: ${state.creditedHours}h sent on ${app.name}.`);
+        const done = !signal.aborted && targetMs - sentMs < MIN_DURATION_MS;
+        if (done) log(`Done: +${hours}h sent on ${app.name}.`);
         return done;
     }
 
-    async function runVariety(games, minutesPerGame, signal) {
+    async function runVariety(games, startGames, startHours, minutesPerGame, signal) {
         const sessionMs = Math.min(MAX_SESSION_MS, Math.max(MIN_DURATION_MS, Math.floor(minutesPerGame * 60_000)));
         const cursorRef = { value: Date.now() };
         let failures = 0;
-        state.gamesCredited = 0;
+        let sentGames = 0;
+        let curTime = startHours;
+        let curVariety = startGames;
+        state.gamesCredited = startGames;
 
-        log(`Variety: ${games.length} Windows games, ${minutesPerGame} min each (${BATCH_SIZE} per batch)`);
+        log(`Variety: starting at ${startGames} games, claiming +${games.length} unused Windows games`);
 
         for (let i = 0; i < games.length; i += BATCH_SIZE) {
             if (signal.aborted) return false;
@@ -637,14 +837,18 @@
                 continue;
             }
             failures = 0;
-            recordUsedIds(batch.map(entry => entry.game.id));
-            state.gamesCredited += result.count;
-            log(`${state.gamesCredited}/${games.length} games sent`);
+            sentGames += result.count;
+            state.gamesCredited = startGames + sentGames;
+            const batchHrs = result.creditedMs / 3_600_000;
+            recordBatch(curTime, curVariety, batchHrs, batch.map(entry => entry.game.id));
+            curTime += batchHrs;
+            curVariety += result.count;
+            log(`${state.gamesCredited}/${startGames + games.length} unique games`);
             if (i + BATCH_SIZE < games.length) await wait(REQUEST_DELAY_MS, signal);
         }
 
-        const done = !signal.aborted && state.gamesCredited >= games.length;
-        if (done) log(`Variety done: ${state.gamesCredited} games sent. Discord syncs badges in 24 to 48 hours.`);
+        const done = !signal.aborted && sentGames >= games.length;
+        if (done) log(`Variety done: reached ${state.gamesCredited} unique games. Discord syncs badges in 24 to 48 hours.`);
         return done;
     }
 
@@ -654,7 +858,7 @@
             : `call:${s.channelId}:${s.ownerId}`;
     }
 
-    async function runStreamFarm(hours, opts, signal) {
+    async function runStreamFarm(startHours, neededHours, opts, signal) {
         const dispatcher = findDispatcher();
         const streamingStore = findStore("ApplicationStreamingStore");
         const streamSettingsStore = findStore("ApplicationStreamingSettingsStore");
@@ -673,13 +877,15 @@
 
         const lowPower = opts?.lowPower !== false;
         const checkpoint = opts?.checkpoint === true;
-        const targetMs = Math.round(Math.max(0.1, hours) * 3_600_000);
+        const startMs = Math.round(startHours * 3_600_000);
+        const neededMs = Math.round(Math.max(0.1, neededHours) * 3_600_000);
         let liveMs = 0;
+        let unsavedMs = 0;
         let lastTick = Date.now();
         let segmentStart = Date.now();
         let warnedNoViewers = false;
         let owns = false;
-        state.streamHours = 0;
+        state.streamHours = startHours;
 
         if (lowPower && streamSettingsStore?.getState) {
             const cur = streamSettingsStore.getState();
@@ -687,7 +893,16 @@
             dispatcher.dispatch({ type: "STREAM_UPDATE_SETTINGS", preset: 3, resolution: 480, frameRate: 15 });
         }
 
+        function saveStreamProgress() {
+            if (unsavedMs <= 0 || !state.userId) return;
+            const ledger = readLedger(state.userId);
+            ledger.streamMs = Math.max(ledger.streamMs || 0, startMs + liveMs - unsavedMs) + unsavedMs;
+            writeLedger(state.userId, ledger);
+            unsavedMs = 0;
+        }
+
         function cleanupStream() {
+            saveStreamProgress();
             try {
                 if (owns && stopStreamFn) {
                     const active = streamingStore.getCurrentUserActiveStream();
@@ -705,9 +920,9 @@
         }
 
         try {
-            log(`Streaming: target ${hours}h. Keep at least one viewer watching (run BadgeFarmer.watch() on your alt).`);
+            log(`Streaming: resuming at ${startHours}h (+${Math.round(neededHours * 10) / 10}h remaining). Keep a viewer watching.`);
 
-            while (!signal.aborted && liveMs < targetMs) {
+            while (!signal.aborted && liveMs < neededMs) {
                 const channelId = selectedStore?.getVoiceChannelId?.();
                 const channel = channelId ? channelStore?.getChannel?.(channelId) : null;
                 if (!channel) {
@@ -766,13 +981,16 @@
                 if (viewers > 0) {
                     warnedNoViewers = false;
                     liveMs += delta;
-                    state.streamHours = Math.round((Math.min(liveMs, targetMs) / 3_600_000) * 100) / 100;
+                    unsavedMs += delta;
+                    state.streamHours = Math.round(((startMs + Math.min(liveMs, neededMs)) / 3_600_000) * 100) / 100;
+                    if (unsavedMs >= 24_000) saveStreamProgress();
                 } else if (!warnedNoViewers) {
                     log("Waiting for a viewer. Run BadgeFarmer.watch() in your alt's console.", false);
                     warnedNoViewers = true;
                 }
 
-                if (checkpoint && now - segmentStart >= STREAM_CHECKPOINT_MS && liveMs < targetMs) {
+                if (checkpoint && now - segmentStart >= STREAM_CHECKPOINT_MS && liveMs < neededMs) {
+                    saveStreamProgress();
                     if (stopStreamFn) stopStreamFn(key);
                     segmentStart = Date.now();
                     await wait(2_500, signal);
@@ -780,14 +998,14 @@
                     continue;
                 }
 
-                await wait(Math.min(STREAM_TICK_MS, Math.max(1_000, targetMs - liveMs)), signal);
+                await wait(Math.min(STREAM_TICK_MS, Math.max(1_000, neededMs - liveMs)), signal);
             }
         } finally {
             cleanupStream();
         }
 
-        const done = !signal.aborted && liveMs >= targetMs;
-        if (done) log(`Streaming done: ${hours}h tracked. Give Discord up to 48 hours to update the badge.`);
+        const done = !signal.aborted && liveMs >= neededMs;
+        if (done) log(`Streaming done: reached ${state.streamHours}h. Give Discord up to 48 hours to update the badge.`);
         return done;
     }
 
@@ -867,18 +1085,38 @@
             log("Stopping run...");
         },
 
+        async progress() {
+            const summary = await fetchProgressSummary();
+            console.table({
+                "Game Time": summary.time,
+                "Game Variety": summary.variety,
+                Streaming: summary.stream
+            });
+            return summary;
+        },
+
         async badges() {
+            return (await BadgeFarmer.progress()).rawBadges;
+        },
+
+        async setBaseline({ time, variety, stream } = {}) {
             ensureAuth();
             await ensureAnalyticsToken();
-            if (!state.userId) throw new Error("Could not resolve user ID.");
-            const res = await fetch(`${API}/users/${state.userId}/profile?with_mutual_guilds=false&with_mutual_friends_count=false`, {
-                headers: headers()
-            });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
-            const list = Array.isArray(data?.badges) ? data.badges : [];
-            log(list.length ? `Equipped badges: ${list.map(b => b.description || b.id).join(", ")}` : "No badges equipped yet.");
-            return list;
+            const ledger = readLedger(state.userId);
+            if (typeof time === "number" && time >= 0) ledger.manualTime = time;
+            if (typeof variety === "number" && variety >= 0) ledger.manualVariety = Math.floor(variety);
+            if (typeof stream === "number" && stream >= 0) ledger.manualStream = stream;
+            writeLedger(state.userId, ledger);
+            return BadgeFarmer.progress();
+        },
+
+        async resetProgress() {
+            ensureAuth();
+            await ensureAnalyticsToken();
+            try {
+                localStorage.removeItem(`${STORAGE_LEDGER_PREFIX}${state.userId || "anon"}`);
+            } catch { /* ignore */ }
+            log("Cleared local progress cache.");
         },
 
         async search(name) {
@@ -887,44 +1125,69 @@
             return rankSearch(apps, name);
         },
 
-        async gameTime(targetOrName = 5_000, hoursOrPerGame = 20, chunkHours = 24) {
-            ensureAuth();
+        async gameTime(targetOrName = 5_000, hoursOrPerGame = 20, opts = {}) {
+            const summary = await fetchProgressSummary();
             const apps = await loadCatalogue();
+
             if (typeof targetOrName === "number") {
+                const force = opts?.force === true;
+                const startHours = force ? summary.time.current : Math.min(targetOrName, summary.time.current);
+                const needed = force ? targetOrName : Math.max(0, targetOrName - startHours);
+                if (needed * 3_600_000 < MIN_DURATION_MS) {
+                    log(`Already at ${summary.time.current}h (${summary.time.tier}). Pass { force: true } as 3rd arg to add more.`);
+                    return;
+                }
                 const signal = begin("GAME_TIME");
                 try {
-                    await runSpreadGameTime(apps, targetOrName, hoursOrPerGame, signal);
+                    await runSpreadGameTime(apps, startHours, summary.variety.current, needed, hoursOrPerGame, signal);
                 } finally {
                     finish();
                 }
                 return;
             }
+
             const matches = rankSearch(apps, String(targetOrName));
             const app = matches[0];
             if (!app) throw new Error(`No Windows game matched "${targetOrName}".`);
+            const chunkHours = typeof opts === "number" ? opts : (opts?.chunkHours ?? 24);
             const signal = begin("GAME_TIME");
             try {
-                await runSingleGameTime(app, hoursOrPerGame, chunkHours, signal);
+                await runSingleGameTime(app, summary.time.current, summary.variety.current, hoursOrPerGame, chunkHours, signal);
             } finally {
                 finish();
             }
         },
 
-        async variety(minutesPerGame = 5, count = 100) {
-            ensureAuth();
+        async variety(minutesPerGame = 5, count = 100, opts = {}) {
+            const summary = await fetchProgressSummary();
             const apps = await loadCatalogue();
+            const force = opts?.force === true;
+            const startGames = force ? summary.variety.current : Math.min(count, summary.variety.current);
+            const needed = force ? count : Math.max(0, count - startGames);
+            if (needed <= 0) {
+                log(`Already at ${summary.variety.current} unique games (${summary.variety.tier}). Pass { force: true } as 3rd arg to add more.`);
+                return;
+            }
             const signal = begin("VARIETY");
             try {
-                await runVariety(selectFreshGames(apps, count), minutesPerGame, signal);
+                await runVariety(selectFreshGames(apps, needed), startGames, summary.time.current, minutesPerGame, signal);
             } finally {
                 finish();
             }
         },
 
-        async stream(hours = 1, opts = {}) {
+        async stream(hours = 20, opts = {}) {
+            const summary = await fetchProgressSummary();
+            const force = opts?.force === true;
+            const startHours = force ? summary.stream.current : Math.min(hours, summary.stream.current);
+            const needed = force ? hours : Math.max(0, hours - startHours);
+            if (needed * 3_600_000 < 30_000) {
+                log(`Already at ${summary.stream.current}h (${summary.stream.tier}). Pick a higher target or pass { force: true }.`);
+                return;
+            }
             const signal = begin("STREAM");
             try {
-                await runStreamFarm(hours, opts, signal);
+                await runStreamFarm(startHours, needed, opts, signal);
             } finally {
                 finish();
             }
@@ -940,11 +1203,23 @@
         },
 
         async maxAll() {
-            ensureAuth();
+            const summary = await fetchProgressSummary();
             const apps = await loadCatalogue();
+            const missingHours = Math.max(0, 5_000 - summary.time.current);
+            const missingGames = Math.max(0, 100 - summary.variety.current);
+
+            if (missingHours * 3_600_000 < MIN_DURATION_MS && missingGames <= 0) {
+                log("Eternal (5,000h) and Universalist (100 games) are already complete on this account.");
+                return;
+            }
+
             const signal = begin("MAX_ALL");
             try {
-                await runSpreadGameTime(apps, 5_000, 20, signal);
+                if (missingHours * 3_600_000 >= MIN_DURATION_MS) {
+                    await runSpreadGameTime(apps, summary.time.current, summary.variety.current, missingHours, 20, signal, Math.max(1, missingGames));
+                } else {
+                    await runVariety(selectFreshGames(apps, missingGames), summary.variety.current, summary.time.current, 5, signal);
+                }
             } finally {
                 finish();
             }
@@ -954,6 +1229,6 @@
     if (typeof window !== "undefined") window.BadgeFarmer = BadgeFarmer;
     else globalThis.BadgeFarmer = BadgeFarmer;
 
-    log("Loaded. Try BadgeFarmer.gameTime(5000), .variety(), .stream(1), .watch(), .badges(), .maxAll(), .stop()");
+    log("Loaded. Try BadgeFarmer.progress(), .gameTime(5000), .variety(), .stream(20), .watch(), .maxAll(), .stop()");
     return BadgeFarmer;
 })();

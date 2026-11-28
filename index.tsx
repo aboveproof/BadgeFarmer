@@ -14,7 +14,16 @@ import definePlugin, { OptionType } from "@utils/types";
 import { findCssClassesLazy, onceReady } from "@webpack";
 import { Clickable, FluxDispatcher, Tooltip, useEffect, UserStore } from "@webpack/common";
 
-import { endOwnedStream, getStatus, loadCatalogue, maxAll, stop as stopFarmer, subscribe } from "./farmer";
+import {
+    endOwnedStream,
+    getStatus,
+    loadCatalogue,
+    maxAll,
+    setShowSpoofedPresence,
+    stop as stopFarmer,
+    subscribe,
+    syncAccountProgress
+} from "./farmer";
 import { BadgeFarmerDashboard, BadgeIcon, closeBadgeFarmerModal, openBadgeFarmerModal } from "./ui";
 
 const logger = new Logger("BadgeFarmer");
@@ -38,6 +47,14 @@ const settings = definePluginSettings({
         description: "Show a badge button in the top right header bar (Equicord)",
         default: true
     },
+    showSpoofedPresence: {
+        type: OptionType.BOOLEAN,
+        description: "Show farmed games on your live Discord status during runs (off keeps runs silent)",
+        default: false,
+        onChange(value: boolean) {
+            setShowSpoofedPresence(value);
+        }
+    },
     autoStartMaxAll: {
         type: OptionType.BOOLEAN,
         description: "Run All three on Discord startup",
@@ -51,8 +68,10 @@ function detachConnectionWaiter(): void {
     pendingConnectionHandler = null;
 }
 
-function launchAutoMaxAll(): void {
+function onClientConnected(): void {
     if (!enabled) return;
+    void syncAccountProgress(false);
+    if (!settings.store.autoStartMaxAll) return;
     loadCatalogue()
         .then(apps => (enabled ? maxAll(apps) : undefined))
         .catch(error => logger.error("Could not start All three on launch", error));
@@ -108,7 +127,7 @@ export default definePlugin({
         id: 1361736124858630274n
     }],
     tags: ["Activity", "Customisation", "Utility"],
-    searchTerms: ["badges", "farm", "game time", "game variety", "streaming"],
+    searchTerms: ["badges", "farm", "game time", "game variety", "streaming", "progress"],
     settings,
 
     toolboxActions: {
@@ -121,20 +140,19 @@ export default definePlugin({
 
     start() {
         enabled = true;
+        setShowSpoofedPresence(Boolean(settings.store.showSpoofedPresence));
         window.addEventListener("beforeunload", handleBeforeUnload);
-
-        if (!settings.store.autoStartMaxAll) return;
 
         onceReady
             .then(() => {
                 if (!enabled) return;
                 if (UserStore?.getCurrentUser?.() != null) {
-                    launchAutoMaxAll();
+                    onClientConnected();
                     return;
                 }
                 pendingConnectionHandler = () => {
                     detachConnectionWaiter();
-                    launchAutoMaxAll();
+                    onClientConnected();
                 };
                 FluxDispatcher.subscribe("CONNECTION_OPEN", pendingConnectionHandler);
             })
